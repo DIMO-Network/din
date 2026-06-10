@@ -110,7 +110,7 @@ func New(cfg Config, consumer jetstream.Consumer, store ObjectPutter, log zerolo
 		store:    store,
 		log:      log.With().Str("component", "sink").Logger(),
 		buffers:  make(map[pqwrite.PartitionKey]*partitionBuffer),
-		jobs:     make(chan flushJob, cfg.Workers*2),
+		jobs:     make(chan flushJob, cfg.Workers*8),
 	}
 }
 
@@ -224,35 +224,58 @@ func (s *Sink) add(msg jetstream.Msg) {
 }
 
 // flushReady enqueues every buffer that hit a trigger (or all of them when
-// force is set). If the global cap is exceeded the largest buffer flushes.
+// force is set), then keeps evicting the largest remaining buffer while the
+// global cap is exceeded. Enqueues never block the Run goroutine: when the
+// workers are saturated the buffer stays in place and retries next tick —
+// blocking here would stall JetStream fetching behind a slow object store
+// and let buffered bytes grow without bound.
 func (s *Sink) flushReady(force bool) {
-	var largest pqwrite.PartitionKey
-	largestBytes := -1
-
 	for key, buf := range s.buffers {
 		if force ||
 			len(buf.events) >= s.cfg.MaxRowsPerFlush ||
 			buf.bytes >= s.cfg.MaxBytesPerFlush ||
 			time.Since(buf.firstAt) >= s.cfg.MaxAge {
-			s.enqueue(key, buf)
-			continue
-		}
-		if buf.bytes > largestBytes {
-			largest, largestBytes = key, buf.bytes
+			if !s.enqueue(key, buf, force) {
+				return // workers saturated; everything else retries next tick
+			}
 		}
 	}
 
-	if s.total > s.cfg.GlobalMaxBytes && largestBytes > 0 {
-		if buf, ok := s.buffers[largest]; ok {
-			s.enqueue(largest, buf)
+	for s.total > s.cfg.GlobalMaxBytes {
+		var largest pqwrite.PartitionKey
+		largestBytes := -1
+		for key, buf := range s.buffers {
+			if buf.bytes > largestBytes {
+				largest, largestBytes = key, buf.bytes
+			}
+		}
+		if largestBytes <= 0 || !s.enqueue(largest, s.buffers[largest], force) {
+			return
 		}
 	}
 }
 
-func (s *Sink) enqueue(key pqwrite.PartitionKey, buf *partitionBuffer) {
+// enqueue hands one buffer to the flush workers. Non-blocking by default;
+// the shutdown drain (block=true) waits up to DrainTimeout per buffer so a
+// wedged store can't hang exit — whatever doesn't flush redelivers.
+func (s *Sink) enqueue(key pqwrite.PartitionKey, buf *partitionBuffer, block bool) bool {
+	job := flushJob{partition: key, events: buf.events, msgs: buf.msgs}
+	if block {
+		select {
+		case s.jobs <- job:
+		case <-time.After(s.cfg.DrainTimeout):
+			return false
+		}
+	} else {
+		select {
+		case s.jobs <- job:
+		default:
+			return false
+		}
+	}
 	delete(s.buffers, key)
 	s.total -= buf.bytes
-	s.jobs <- flushJob{partition: key, events: buf.events, msgs: buf.msgs}
+	return true
 }
 
 func (s *Sink) worker(ctx context.Context) {

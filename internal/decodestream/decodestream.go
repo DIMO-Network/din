@@ -19,8 +19,8 @@ import (
 	"github.com/DIMO-Network/cloudevent"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/stream"
-	"github.com/DIMO-Network/model-garage/pkg/modules"
 	mgconvert "github.com/DIMO-Network/model-garage/pkg/convert"
+	"github.com/DIMO-Network/model-garage/pkg/modules"
 	"github.com/DIMO-Network/model-garage/pkg/vss"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/nats-io/nats.go/jetstream"
@@ -220,12 +220,18 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeSignals)
+	var futures []jetstream.PubAckFuture
 	var pubErrs error
 	for name, group := range groupSignalsByName(signals) {
 		signalCE := vss.PackSignals(header, group)
-		pubErrs = errors.Join(pubErrs, b.publishJSON(ctx, signalSubjectPrefix+"."+sanitize(name), signalCE))
+		fut, err := b.publishJSONAsync(signalSubjectPrefix+"."+sanitize(name), signalCE)
+		if err != nil {
+			pubErrs = errors.Join(pubErrs, err)
+			continue
+		}
+		futures = append(futures, fut)
 	}
-	return pubErrs
+	return errors.Join(pubErrs, b.awaitFutures(ctx, futures))
 }
 
 func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEvent) error {
@@ -247,19 +253,46 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 	for _, ev := range events {
 		byName[ev.Data.Name] = append(byName[ev.Data.Name], ev)
 	}
+	var futures []jetstream.PubAckFuture
 	var pubErrs error
 	for name, group := range byName {
 		eventCE := vss.PackEvents(header, group)
-		pubErrs = errors.Join(pubErrs, b.publishJSON(ctx, eventSubjectPrefix+"."+sanitize(name), eventCE))
+		fut, err := b.publishJSONAsync(eventSubjectPrefix+"."+sanitize(name), eventCE)
+		if err != nil {
+			pubErrs = errors.Join(pubErrs, err)
+			continue
+		}
+		futures = append(futures, fut)
 	}
-	return pubErrs
+	return errors.Join(pubErrs, b.awaitFutures(ctx, futures))
 }
 
-func (b *Bridge) publishJSON(ctx context.Context, subject string, payload any) error {
-	if _, err := b.js.Publish(ctx, subject, mustJSON(payload)); err != nil {
-		return fmt.Errorf("publishing to %s: %w", subject, err)
+// publishJSONAsync submits one publish without waiting for the ack; a raw
+// status event fans out to one publish per signal name, so awaiting each
+// ack serially would make per-name JetStream round-trips the bridge's
+// throughput ceiling.
+func (b *Bridge) publishJSONAsync(subject string, payload any) (jetstream.PubAckFuture, error) {
+	fut, err := b.js.PublishAsync(subject, mustJSON(payload))
+	if err != nil {
+		return nil, fmt.Errorf("publishing to %s: %w", subject, err)
 	}
-	return nil
+	return fut, nil
+}
+
+// awaitFutures waits for every pending ack; any failure fails the message
+// so JetStream redelivers it (publishes are idempotent per subject+body).
+func (b *Bridge) awaitFutures(ctx context.Context, futures []jetstream.PubAckFuture) error {
+	var errs error
+	for _, fut := range futures {
+		select {
+		case <-fut.Ok():
+		case err := <-fut.Err():
+			errs = errors.Join(errs, fmt.Errorf("async publish: %w", err))
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return errs
 }
 
 func decodedHeader(rawEvent *cloudevent.RawEvent, ceType string) cloudevent.CloudEventHeader {

@@ -17,6 +17,10 @@ import (
 // producer (rate-limited the same way DIS did with ratedlogger).
 const futureWarnInterval = time.Hour
 
+// maxFutureWarnProducers bounds the warn-dedup map (keys are
+// device-supplied producer strings).
+const maxFutureWarnProducers = 100_000
+
 // Converter converts raw connection payloads into validated, canonicalized
 // CloudEvents using the model-garage module registry.
 type Converter struct {
@@ -87,6 +91,12 @@ func (c *Converter) warnFutureTimestamp(hdr *cloudevent.CloudEventHeader) {
 	defer c.mu.Unlock()
 	if last, ok := c.lastFutureWarn[hdr.Producer]; ok && time.Since(last) < futureWarnInterval {
 		return
+	}
+	// Bound the dedup map: producer strings come from device payloads, so
+	// cardinality is attacker-influenced. Resetting just re-allows one
+	// warning per producer — harmless.
+	if len(c.lastFutureWarn) >= maxFutureWarnProducers {
+		clear(c.lastFutureWarn)
 	}
 	c.lastFutureWarn[hdr.Producer] = time.Now()
 	c.logger.Warn().Msgf("Cloud event time is in the future: now() = %v is before event.time = %v \n %+v", time.Now(), hdr.Time, hdr)

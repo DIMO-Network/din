@@ -71,7 +71,10 @@ func run(log zerolog.Logger) error {
 	}
 	defer conn.Close()
 
-	js, err := jetstream.New(conn)
+	// Bound in-flight async publishes: when JetStream stalls, publishers
+	// queue here instead of growing the client buffer without limit; the
+	// HTTP write timeout is the backstop that turns the stall into 503s.
+	js, err := jetstream.New(conn, jetstream.WithPublishAsyncMaxPending(4096))
 	if err != nil {
 		return err
 	}

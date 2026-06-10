@@ -10,12 +10,16 @@ import (
 func TestRemoteLimiter_BoundedKeys(t *testing.T) {
 	t.Parallel()
 	l := newRemoteLimiter(1000, 5)
-	for i := range limiterMaxKeys + 500 {
+	for i := range limiterMaxKeys + 5000 {
 		l.allow(fmt.Sprintf("key-%d", i))
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	require.LessOrEqual(t, len(l.limiters), limiterMaxKeys, "limiter map stays bounded")
+	total := 0
+	for i := range l.shards {
+		l.shards[i].mu.Lock()
+		total += len(l.shards[i].limiters)
+		l.shards[i].mu.Unlock()
+	}
+	require.LessOrEqual(t, total, limiterMaxKeys, "limiter map stays bounded")
 }
 
 func TestRemoteLimiter_EvictionKeepsHotBuckets(t *testing.T) {
@@ -26,10 +30,11 @@ func TestRemoteLimiter_EvictionKeepsHotBuckets(t *testing.T) {
 	require.True(t, l.allow("hot"))
 	require.False(t, l.allow("hot"))
 
-	l.mu.Lock()
-	l.evictLocked()
-	_, hotKept := l.limiters["hot"]
-	l.mu.Unlock()
+	s := l.shard("hot")
+	s.mu.Lock()
+	s.evictLocked(l.burst)
+	_, hotKept := s.limiters["hot"]
+	s.mu.Unlock()
 	require.True(t, hotKept, "non-refilled bucket survives idle eviction")
 	require.False(t, l.allow("hot"), "hot remote stays limited across eviction")
 }

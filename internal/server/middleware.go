@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"net"
 	"net/http"
@@ -93,61 +94,78 @@ func maxBytesMiddleware(limit int64) func(http.Handler) http.Handler {
 	}
 }
 
-// limiterMaxKeys bounds the per-remote bucket map. A device fleet churning
-// source IPs (or an adversary spraying keys) must not grow process memory
-// without bound.
+// limiterMaxKeys bounds the per-remote bucket map across all shards. A
+// device fleet churning source IPs (or an adversary spraying keys) must
+// not grow process memory without bound.
 const limiterMaxKeys = 100_000
 
-// remoteLimiter holds one token bucket per remote key, bounded at
-// limiterMaxKeys entries.
+// limiterShards splits the key space so eviction — an O(shard-size) walk
+// under that shard's lock — never stalls more than 1/64th of traffic, and
+// walks ~1.5k entries instead of 100k.
+const limiterShards = 64
+
+// remoteLimiter holds one token bucket per remote key, sharded by key
+// hash, bounded at limiterMaxKeys entries total.
 type remoteLimiter struct {
+	shards [limiterShards]limiterShard
+	rps    rate.Limit
+	burst  int
+}
+
+type limiterShard struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter
-	rps      rate.Limit
-	burst    int
 }
 
 func newRemoteLimiter(rps float64, burst int) *remoteLimiter {
-	return &remoteLimiter{
-		limiters: map[string]*rate.Limiter{},
-		rps:      rate.Limit(rps),
-		burst:    burst,
+	l := &remoteLimiter{rps: rate.Limit(rps), burst: burst}
+	for i := range l.shards {
+		l.shards[i].limiters = map[string]*rate.Limiter{}
 	}
+	return l
+}
+
+func (l *remoteLimiter) shard(key string) *limiterShard {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return &l.shards[h.Sum32()%limiterShards]
 }
 
 func (l *remoteLimiter) allow(key string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	lim, ok := l.limiters[key]
+	s := l.shard(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lim, ok := s.limiters[key]
 	if !ok {
-		if len(l.limiters) >= limiterMaxKeys {
-			l.evictLocked()
+		if len(s.limiters) >= limiterMaxKeys/limiterShards {
+			s.evictLocked(l.burst)
 		}
 		lim = rate.NewLimiter(l.rps, l.burst)
-		l.limiters[key] = lim
+		s.limiters[key] = lim
 	}
 	return lim.Allow()
 }
 
-// evictLocked drops idle entries. A bucket refilled to full burst behaves
-// identically to a brand-new limiter, so removing it changes nothing for
-// that remote. If every bucket is hot (pathological key cardinality),
-// arbitrary entries go anyway — bounded memory beats perfect fairness; the
-// affected remotes merely regain a fresh burst.
-func (l *remoteLimiter) evictLocked() {
-	for key, lim := range l.limiters {
-		if lim.Tokens() >= float64(l.burst) {
-			delete(l.limiters, key)
+// evictLocked drops idle entries from one shard. A bucket refilled to full
+// burst behaves identically to a brand-new limiter, so removing it changes
+// nothing for that remote. If every bucket is hot (pathological key
+// cardinality), arbitrary entries go anyway — bounded memory beats perfect
+// fairness; the affected remotes merely regain a fresh burst.
+func (s *limiterShard) evictLocked(burst int) {
+	for key, lim := range s.limiters {
+		if lim.Tokens() >= float64(burst) {
+			delete(s.limiters, key)
 		}
 	}
-	if len(l.limiters) < limiterMaxKeys {
+	max := limiterMaxKeys / limiterShards
+	if len(s.limiters) < max {
 		return
 	}
 	dropped := 0
-	for key := range l.limiters {
-		delete(l.limiters, key)
+	for key := range s.limiters {
+		delete(s.limiters, key)
 		dropped++
-		if dropped >= limiterMaxKeys/10 {
+		if dropped >= max/10 {
 			break
 		}
 	}

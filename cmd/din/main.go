@@ -115,7 +115,6 @@ func run(log zerolog.Logger) error {
 		AftermarketNFTAddress: settings.AftermarketNFTAddress,
 		SyntheticNFTAddress:   settings.SyntheticNFTAddress,
 	}
-	convert.RegisterModules(convertCfg)
 	converter := convert.NewConverter(log, convertCfg)
 	verifier, err := attest.NewVerifier(settings.RPCURL, log)
 	if err != nil {
@@ -178,7 +177,9 @@ func run(log zerolog.Logger) error {
 
 	if settings.CompactorEnabled {
 		compactStore := &compactStoreAdapter{client: store}
-		group.Go(func() error { return compact.New(compact.Config{}, compactStore, log).Run(gctx) })
+		group.Go(func() error {
+			return compact.New(compact.Config{DecodedPrefix: settings.DecodedPrefix}, compactStore, log).Run(gctx)
+		})
 	}
 	if settings.DecodeStreamEnabled {
 		bridge := decodestream.New(decodestream.Config{

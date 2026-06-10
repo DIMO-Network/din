@@ -163,7 +163,18 @@ func (c *coordinateStore) tryCreateLocation() {
 	var loc vss.Location
 	var create bool
 
+	// Inherit the header from the active triple itself: a batch can mix
+	// sources, and the synthesized coordinate signal must carry the
+	// Source/Producer of the location signals, not whatever came first.
 	template := c.signals[0]
+	switch {
+	case c.lastLat != -1:
+		template = c.signals[c.lastLat]
+	case c.lastLon != -1:
+		template = c.signals[c.lastLon]
+	case c.lastHDOP != -1:
+		template = c.signals[c.lastHDOP]
+	}
 
 	if c.lastLat != -1 && c.lastLon != -1 {
 		lat := c.signals[c.lastLat].Data.ValueNumber

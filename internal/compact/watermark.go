@@ -7,9 +7,18 @@ import (
 	"fmt"
 )
 
-// WatermarkKey is the dq materializer's published cursor: a JSON object
-// mapping "type=T/date=D" to the last raw object key it has decoded.
-const WatermarkKey = "decoded/v1/_state/watermark.json"
+// DefaultDecodedPrefix mirrors the dq materializer's default decoded layout
+// root. Both services must agree on this prefix or the compactor reads a
+// stale or missing cursor; override via Config.DecodedPrefix (DECODED_PREFIX)
+// in lockstep with dq.
+const DefaultDecodedPrefix = "decoded/v1/"
+
+// WatermarkKey is the dq materializer's published cursor under the default
+// prefix: a JSON object mapping "type=T/date=D" to the last raw object key
+// it has decoded.
+const WatermarkKey = DefaultDecodedPrefix + watermarkSuffix
+
+const watermarkSuffix = "_state/watermark.json"
 
 // ErrNoWatermark reports that the materializer has not published a cursor
 // yet; the compactor must not touch anything in that case.
@@ -18,10 +27,10 @@ var ErrNoWatermark = errors.New("materializer watermark not found")
 // Watermark answers "may this file be compacted?" per partition.
 type Watermark map[string]string
 
-// LoadWatermark fetches the materializer cursor. Missing object returns
-// ErrNoWatermark wrapped so callers can skip the cycle cleanly.
-func LoadWatermark(ctx context.Context, store ObjectStore) (Watermark, error) {
-	body, err := store.GetObject(ctx, WatermarkKey)
+// LoadWatermark fetches the materializer cursor at key. Missing object
+// returns ErrNoWatermark wrapped so callers can skip the cycle cleanly.
+func LoadWatermark(ctx context.Context, store ObjectStore, key string) (Watermark, error) {
+	body, err := store.GetObject(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrNoWatermark, err)
 	}

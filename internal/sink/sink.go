@@ -41,6 +41,9 @@ type Config struct {
 	Workers int
 	// FetchBatch is the max messages per JetStream fetch.
 	FetchBatch int
+	// DrainTimeout bounds the shutdown flush. Past it, in-flight PUTs are
+	// canceled and their messages redeliver (at-least-once holds).
+	DrainTimeout time.Duration
 }
 
 func (c *Config) applyDefaults() {
@@ -64,6 +67,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.FetchBatch == 0 {
 		c.FetchBatch = 1000
+	}
+	if c.DrainTimeout == 0 {
+		c.DrainTimeout = 30 * time.Second
 	}
 }
 
@@ -111,7 +117,9 @@ func New(cfg Config, consumer jetstream.Consumer, store ObjectPutter, log zerolo
 // Run processes messages until ctx is canceled, then flushes everything
 // still buffered and drains the workers.
 func (s *Sink) Run(ctx context.Context) error {
-	workerCtx, cancelWorkers := context.WithCancel(context.Background())
+	// Workers outlive ctx so the shutdown flush below can still PUT, but
+	// cancelWorkers bounds them: a hung S3 call must not block exit forever.
+	workerCtx, cancelWorkers := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWorkers()
 	for range s.cfg.Workers {
 		s.wg.Add(1)
@@ -142,10 +150,22 @@ loop:
 	fetchErr = <-fetchDone
 
 	// Shutdown: flush every remaining buffer, then wait for workers so all
-	// acks land before the process exits.
+	// acks land before the process exits — but only up to DrainTimeout, so
+	// a wedged PUT can't hang shutdown (unflushed messages just redeliver).
 	s.flushReady(true)
 	close(s.jobs)
-	s.wg.Wait()
+	workersDone := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-time.After(s.cfg.DrainTimeout):
+		s.log.Warn().Dur("timeout", s.cfg.DrainTimeout).Msg("drain timeout; canceling in-flight flushes")
+		cancelWorkers()
+		<-workersDone
+	}
 
 	if fetchErr != nil && !errors.Is(fetchErr, context.Canceled) {
 		return fmt.Errorf("sink fetch loop: %w", fetchErr)

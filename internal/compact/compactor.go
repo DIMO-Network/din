@@ -19,6 +19,11 @@ import (
 	"github.com/rs/zerolog"
 )
 
+// compactedPrefix names compaction outputs. It must sort lexicographically
+// before "ingest-" so compacted files always compare at-or-below any
+// materializer cursor in their partition.
+const compactedPrefix = "c1-"
+
 // Config tunes the compactor. Zero values take the plan defaults.
 type Config struct {
 	// Root is the partition root to compact, normally pqwrite.RawPrefix.
@@ -38,6 +43,15 @@ type Config struct {
 	// DeleteGrace delays source deletion after outputs land so in-flight
 	// readers finish. Readers tolerate the duplicate window via dedup.
 	DeleteGrace time.Duration
+	// DecodedPrefix is the decoded layout root the dq materializer writes
+	// under; the watermark cursor lives at <prefix>_state/watermark.json.
+	// Must match dq's DECODED_PREFIX exactly.
+	DecodedPrefix string
+}
+
+// watermarkKey locates the materializer cursor under the decoded prefix.
+func (c *Config) watermarkKey() string {
+	return c.DecodedPrefix + watermarkSuffix
 }
 
 func (c *Config) applyDefaults() {
@@ -64,6 +78,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.DeleteGrace == 0 {
 		c.DeleteGrace = 10 * time.Minute
+	}
+	if c.DecodedPrefix == "" {
+		c.DecodedPrefix = DefaultDecodedPrefix
+	}
+	if !strings.HasSuffix(c.DecodedPrefix, "/") {
+		c.DecodedPrefix += "/"
 	}
 	// A cycle that re-lists a partition while its sources await grace
 	// deletion would re-merge them (harmless via dedup, but it churns S3
@@ -132,7 +152,7 @@ func (c *Compactor) DrainDeletes() {
 
 // Cycle plans and executes one compaction pass across the lookback window.
 func (c *Compactor) Cycle(ctx context.Context) error {
-	watermark, err := LoadWatermark(ctx, c.store)
+	watermark, err := LoadWatermark(ctx, c.store, c.cfg.watermarkKey())
 	if err != nil {
 		if errors.Is(err, ErrNoWatermark) {
 			c.log.Info().Msg("no materializer watermark yet; skipping cycle")
@@ -195,6 +215,11 @@ func (c *Compactor) compactPartition(ctx context.Context, partition string, wate
 	for _, obj := range objects {
 		name := path.Base(obj.Key)
 		if !strings.HasSuffix(name, ".parquet") || obj.Size >= c.cfg.MaxSourceSize {
+			continue
+		}
+		// Skip prior compaction outputs; re-merging them is pure write
+		// amplification (dedup makes it harmless but never useful).
+		if strings.HasPrefix(name, compactedPrefix) {
 			continue
 		}
 		if !watermark.Covers(partition, obj.Key) {
@@ -261,7 +286,7 @@ func (c *Compactor) merge(ctx context.Context, partition string, sources []Objec
 	for start := 0; start < len(events); start += perChunk {
 		end := min(start+perChunk, len(events))
 		now := c.now()
-		key := fmt.Sprintf("%sc1-%013d-%s.parquet", dir, now.UnixMilli(), ulid.MustNew(ulid.Timestamp(now), rand.Reader))
+		key := fmt.Sprintf("%s%s%013d-%s.parquet", dir, compactedPrefix, now.UnixMilli(), ulid.MustNew(ulid.Timestamp(now), rand.Reader))
 		body, err := pqwrite.Encode(events[start:end], key)
 		if err != nil {
 			return fmt.Errorf("encoding compacted chunk: %w", err)

@@ -48,6 +48,7 @@ type Settings struct {
 	ParquetBucket     string
 	BlobBucket        string
 	BlobPrefix        string
+	DecodedPrefix     string // must match dq materializer's DECODED_PREFIX
 	DocumentSizeLimit int // DOCUMENT_SIZE_THRESHOLD
 	S3Region          string
 	S3AccessKeyID     string
@@ -83,6 +84,7 @@ func Load() (Settings, error) {
 		ParquetBucket:          os.Getenv("PARQUET_BUCKET"),
 		BlobBucket:             os.Getenv("BLOB_BUCKET"),
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
+		DecodedPrefix:          env("DECODED_PREFIX", "decoded/v1/"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
 		S3SecretAccessKey:      os.Getenv("S3_AWS_SECRET_ACCESS_KEY"),

@@ -6,6 +6,7 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 
@@ -70,22 +71,29 @@ func (h *Handlers) Connection() http.Handler {
 			return
 		}
 
+		// dis semantics: a fingerprint that fails validation is dropped (bad
+		// VIN) or 400s the request (conversion failure), but valid sibling
+		// events from the same payload are still persisted first.
+		var validationErr error
 		for i := range events {
 			if h.ValidateFingerprint {
 				if err := fpvalidate.Validate(r.Context(), events[i]); err != nil {
 					if errors.Is(err, fpvalidate.ErrInvalidVIN) {
-						// dis drops fingerprints with bad VINs silently.
 						h.Log.Warn().Str("source", source).Str("id", events[i].ID).Msg("dropping fingerprint with invalid VIN")
-						continue
+					} else {
+						validationErr = errors.Join(validationErr, fmt.Errorf("%w: validating fingerprint %s: %w", convert.ErrValidation, events[i].ID, err))
 					}
-					h.writeError(w, err)
-					return
+					continue
 				}
 			}
 			if err := h.publishOne(r.Context(), events[i], ""); err != nil {
 				h.writeError(w, err)
 				return
 			}
+		}
+		if validationErr != nil {
+			h.writeError(w, validationErr)
+			return
 		}
 		w.WriteHeader(http.StatusOK)
 	})

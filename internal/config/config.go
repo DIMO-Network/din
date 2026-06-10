@@ -46,6 +46,7 @@ type Settings struct {
 
 	// Storage.
 	ParquetBucket     string
+	BlobBucket        string
 	BlobPrefix        string
 	DocumentSizeLimit int // DOCUMENT_SIZE_THRESHOLD
 	S3Region          string
@@ -80,6 +81,7 @@ func Load() (Settings, error) {
 		NATSURL:                env("NATS_URL", "nats://localhost:4222"),
 		NATSStoreDir:           env("NATS_STORE_DIR", "/data/nats"),
 		ParquetBucket:          os.Getenv("PARQUET_BUCKET"),
+		BlobBucket:             os.Getenv("BLOB_BUCKET"),
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
@@ -91,9 +93,15 @@ func Load() (Settings, error) {
 	if s.ChainID, err = envUint("DIMO_REGISTRY_CHAIN_ID", 137); err != nil {
 		return s, err
 	}
-	s.VehicleNFTAddress = common.HexToAddress(os.Getenv("VEHICLE_NFT_ADDRESS"))
-	s.AftermarketNFTAddress = common.HexToAddress(os.Getenv("AFTERMARKET_NFT_ADDRESS"))
-	s.SyntheticNFTAddress = common.HexToAddress(os.Getenv("SYNTHETIC_NFT_ADDRESS"))
+	if s.VehicleNFTAddress, err = envAddress("VEHICLE_NFT_ADDRESS"); err != nil {
+		return s, err
+	}
+	if s.AftermarketNFTAddress, err = envAddress("AFTERMARKET_NFT_ADDRESS"); err != nil {
+		return s, err
+	}
+	if s.SyntheticNFTAddress, err = envAddress("SYNTHETIC_NFT_ADDRESS"); err != nil {
+		return s, err
+	}
 
 	docLimit, err := envUint("DOCUMENT_SIZE_THRESHOLD", 1<<20)
 	if err != nil {
@@ -133,6 +141,23 @@ func Load() (Settings, error) {
 		return s, fmt.Errorf("parsing ALLOWABLE_TIME_SKEW: %w", err)
 	}
 	return s, nil
+}
+
+// envAddress parses a required, non-zero Ethereum address. A zero address
+// would silently mint DIDs against 0x000...0 and corrupt every subject.
+func envAddress(key string) (common.Address, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return common.Address{}, fmt.Errorf("%s is required", key)
+	}
+	if !common.IsHexAddress(v) {
+		return common.Address{}, fmt.Errorf("%s is not a valid address: %q", key, v)
+	}
+	addr := common.HexToAddress(v)
+	if addr == (common.Address{}) {
+		return common.Address{}, fmt.Errorf("%s must not be the zero address", key)
+	}
+	return addr, nil
 }
 
 func env(key, def string) string {

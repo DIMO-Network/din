@@ -80,9 +80,25 @@ func run(log zerolog.Logger) error {
 		return err
 	}
 
-	// Storage.
+	// Storage. Blobs (externalized >1MB payloads) live in their own bucket
+	// like dis's BLOB_BUCKET; falling back to the parquet bucket would
+	// split durable documents across two locations.
 	store, err := s3client.New(ctx, s3client.Config{
 		Bucket:          settings.ParquetBucket,
+		Region:          settings.S3Region,
+		AccessKeyID:     settings.S3AccessKeyID,
+		SecretAccessKey: settings.S3SecretAccessKey,
+		Endpoint:        settings.S3Endpoint,
+	})
+	if err != nil {
+		return err
+	}
+	blobBucket := settings.BlobBucket
+	if blobBucket == "" {
+		return errors.New("BLOB_BUCKET is required")
+	}
+	blobStore, err := s3client.New(ctx, s3client.Config{
+		Bucket:          blobBucket,
 		Region:          settings.S3Region,
 		AccessKeyID:     settings.S3AccessKeyID,
 		SecretAccessKey: settings.S3SecretAccessKey,
@@ -109,7 +125,7 @@ func run(log zerolog.Logger) error {
 	handlers := &handler.Handlers{
 		Converter:           converter,
 		Attest:              verifier,
-		Splitter:            split.New(store, settings.BlobPrefix, settings.DocumentSizeLimit),
+		Splitter:            split.New(blobStore, settings.BlobPrefix, settings.DocumentSizeLimit),
 		Publisher:           stream.NewPublisher(js),
 		ValidateFingerprint: settings.FingerprintValidation,
 		Log:                 log,
@@ -124,7 +140,7 @@ func run(log zerolog.Logger) error {
 		RateLimitRPS:   settings.RateLimitRPS,
 		RateLimitBurst: settings.RateLimitBurst,
 		Logger:         log,
-	}, handlers.Connection())
+	}, postOnly(handlers.Connection()))
 	if err != nil {
 		return err
 	}
@@ -136,7 +152,7 @@ func run(log zerolog.Logger) error {
 		RateLimitRPS:           settings.RateLimitRPS,
 		RateLimitBurst:         settings.RateLimitBurst,
 		Logger:                 log,
-	}, handlers.Attestation())
+	}, postOnly(handlers.Attestation()))
 	if err != nil {
 		return err
 	}
@@ -179,6 +195,17 @@ func run(log zerolog.Logger) error {
 	log.Info().Str("connection", settings.ConnectionAddr).Str("attestation", settings.AttestationAddr).
 		Str("nats", settings.NATSMode).Msg("din started")
 	return group.Wait()
+}
+
+// postOnly rejects non-POST requests, mirroring dis's allowed_verbs: [POST].
+func postOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // compactStoreAdapter narrows s3client.Client to the compactor's surface.

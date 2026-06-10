@@ -73,25 +73,33 @@ func New(cfg Config, js jetstream.JetStream, log zerolog.Logger) *Bridge {
 	return &Bridge{cfg: cfg, js: js, log: log.With().Str("component", "decodestream").Logger()}
 }
 
-// EnsureStreams provisions the decoded streams with the same shape
-// vehicle-triggers-api expects.
+// EnsureStreams provisions the decoded streams BYTE-COMPATIBLE with
+// vehicle-triggers-api's own provisioning (internal/nats/provision.go):
+// both sides CreateOrUpdateStream the same names, so any config drift
+// makes the stream definition flap on every alternating restart.
 func (b *Bridge) EnsureStreams(ctx context.Context) error {
 	for _, sc := range []jetstream.StreamConfig{
 		{
-			Name:      SignalsStreamName,
-			Subjects:  []string{signalSubjectPrefix + ".>"},
-			Storage:   jetstream.FileStorage,
-			Retention: jetstream.LimitsPolicy,
-			MaxAge:    24 * time.Hour,
-			Replicas:  b.cfg.Replicas,
+			Name:        SignalsStreamName,
+			Subjects:    []string{signalSubjectPrefix + ".>"},
+			Storage:     jetstream.FileStorage,
+			Retention:   jetstream.LimitsPolicy,
+			Discard:     jetstream.DiscardOld,
+			MaxAge:      24 * time.Hour,
+			MaxBytes:    100 << 30, // vta SIGNALS_MAX_BYTES default
+			Replicas:    b.cfg.Replicas,
+			Description: "DIMO vehicle signal telemetry",
 		},
 		{
-			Name:      EventsStreamName,
-			Subjects:  []string{eventSubjectPrefix + ".>"},
-			Storage:   jetstream.FileStorage,
-			Retention: jetstream.LimitsPolicy,
-			MaxAge:    24 * time.Hour,
-			Replicas:  b.cfg.Replicas,
+			Name:        EventsStreamName,
+			Subjects:    []string{eventSubjectPrefix + ".>"},
+			Storage:     jetstream.FileStorage,
+			Retention:   jetstream.LimitsPolicy,
+			Discard:     jetstream.DiscardOld,
+			MaxAge:      24 * time.Hour,
+			MaxBytes:    10 << 30, // vta EVENTS_MAX_BYTES default
+			Replicas:    b.cfg.Replicas,
+			Description: "DIMO vehicle events",
 		},
 	} {
 		if _, err := b.js.CreateOrUpdateStream(ctx, sc); err != nil {
@@ -223,6 +231,11 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEvent) error {
 	events, err := modules.ConvertToEvents(ctx, rawEvent.Source, *rawEvent)
 	if err != nil {
+		// Salvage partial decodes exactly like dis eventconvert did.
+		var convertErr *mgconvert.ConversionError
+		if errors.As(err, &convertErr) {
+			events = convertErr.DecodedEvents
+		}
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("event conversion errors")
 	}
 	if len(events) == 0 {

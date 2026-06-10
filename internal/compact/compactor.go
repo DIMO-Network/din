@@ -65,6 +65,12 @@ func (c *Config) applyDefaults() {
 	if c.DeleteGrace == 0 {
 		c.DeleteGrace = 10 * time.Minute
 	}
+	// A cycle that re-lists a partition while its sources await grace
+	// deletion would re-merge them (harmless via dedup, but it churns S3
+	// and manifests). Keep the planning cadence behind the grace window.
+	if c.Interval <= c.DeleteGrace {
+		c.Interval = c.DeleteGrace + 5*time.Minute
+	}
 }
 
 // Compactor plans and executes partition merges.

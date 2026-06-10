@@ -1,0 +1,176 @@
+// Package tests exercises the full ingest path in-process: HTTP handler →
+// convert → split → JetStream → parquet sink → bundle on the object store,
+// plus the decodestream bridge feeding triggers-compatible subjects.
+package tests
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/DIMO-Network/cloudevent"
+	ceparquet "github.com/DIMO-Network/cloudevent/parquet"
+	"github.com/DIMO-Network/din/internal/convert"
+	"github.com/DIMO-Network/din/internal/decodestream"
+	"github.com/DIMO-Network/din/internal/handler"
+	"github.com/DIMO-Network/din/internal/natsembed"
+	"github.com/DIMO-Network/din/internal/server"
+	"github.com/DIMO-Network/din/internal/sink"
+	"github.com/DIMO-Network/din/internal/split"
+	"github.com/DIMO-Network/din/internal/stream"
+	"github.com/DIMO-Network/model-garage/pkg/vss"
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/rs/zerolog"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+var vehicleNFT = common.HexToAddress("0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF")
+
+type memStore struct {
+	mu      sync.Mutex
+	objects map[string][]byte
+}
+
+func newMemStore() *memStore { return &memStore{objects: map[string][]byte{}} }
+
+func (m *memStore) PutObject(_ context.Context, key string, body []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.objects[key] = append([]byte(nil), body...)
+	return nil
+}
+
+func (m *memStore) keys(prefix string) []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var out []string
+	for k := range m.objects {
+		if strings.HasPrefix(k, prefix) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+func (m *memStore) get(key string) []byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.objects[key]
+}
+
+// sourceInjector simulates the mTLS middleware: every request carries the
+// connection license address the cert CN would provide.
+func sourceInjector(source string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		next.ServeHTTP(w, r.WithContext(server.WithSource(r.Context(), source)))
+	})
+}
+
+func TestEndToEnd_DeviceToParquetAndTriggers(t *testing.T) {
+	srv, err := natsembed.Run(natsembed.Config{StoreDir: t.TempDir()})
+	require.NoError(t, err)
+	t.Cleanup(srv.Shutdown)
+	conn, err := natsembed.Connect(srv)
+	require.NoError(t, err)
+	t.Cleanup(conn.Close)
+	js, err := jetstream.New(conn)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rawStream, err := stream.EnsureStream(ctx, js, stream.DefaultConfig())
+	require.NoError(t, err)
+
+	store := newMemStore()
+	cfg := convert.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}
+	convert.RegisterModules(cfg)
+
+	handlers := &handler.Handlers{
+		Converter: convert.NewConverter(zerolog.Nop(), cfg),
+		Splitter:  split.New(store, "cloudevent/blobs/", 1<<20),
+		Publisher: stream.NewPublisher(js),
+		Log:       zerolog.Nop(),
+	}
+	httpSrv := httptest.NewServer(sourceInjector("0xConnLicense", handlers.Connection()))
+	t.Cleanup(httpSrv.Close)
+
+	// Sink.
+	sinkConsumer, err := rawStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+		Durable: "parquet-sink", AckPolicy: jetstream.AckExplicitPolicy, AckWait: 5 * time.Minute,
+	})
+	require.NoError(t, err)
+	go func() {
+		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, sinkConsumer, store, zerolog.Nop()).Run(ctx)
+	}()
+
+	// Decodestream bridge.
+	bridge := decodestream.New(decodestream.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}, js, zerolog.Nop())
+	require.NoError(t, bridge.EnsureStreams(ctx))
+	go func() { _ = bridge.Run(ctx) }()
+
+	// POST a default-module status payload as a device would.
+	subject := fmt.Sprintf("did:erc721:137:%s:42", vehicleNFT.Hex())
+	ts := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	payload, _ := json.Marshal(map[string]any{
+		"type":        cloudevent.TypeStatus,
+		"subject":     subject,
+		"source":      "0xConnLicense",
+		"producer":    subject,
+		"id":          "device-msg-1",
+		"specversion": cloudevent.SpecVersion,
+		"time":        ts.Format(time.RFC3339Nano),
+		"dataversion": "default/v1.0",
+		"data": map[string]any{
+			"signals": []map[string]any{
+				{"name": "speed", "timestamp": ts.Format(time.RFC3339Nano), "value": 72.5},
+			},
+		},
+	})
+
+	resp, err := http.Post(httpSrv.URL, "application/json", bytes.NewReader(payload))
+	require.NoError(t, err)
+	defer resp.Body.Close() //nolint:errcheck
+	require.Equal(t, http.StatusOK, resp.StatusCode, "device gets 200 only after JetStream ack")
+
+	// Raw parquet bundle lands in the right hive partition.
+	wantPrefix := "raw/type=dimo.status/date=" + ts.Format("2006-01-02") + "/"
+	require.Eventually(t, func() bool { return len(store.keys(wantPrefix)) == 1 }, 10*time.Second, 100*time.Millisecond)
+
+	bundleKey := store.keys(wantPrefix)[0]
+	body := store.get(bundleKey)
+	events, err := ceparquet.Decode(bytes.NewReader(body), int64(len(body)))
+	require.NoError(t, err)
+	require.Len(t, events, 1)
+	assert.Equal(t, subject, events[0].Subject)
+	assert.Equal(t, "device-msg-1", events[0].ID)
+	assert.JSONEq(t, `{"signals":[{"name":"speed","timestamp":"`+ts.Format(time.RFC3339Nano)+`","value":72.5}]}`,
+		string(events[0].Data), "raw payload stored verbatim — parse-on-read source of truth")
+
+	// Decoded signal reaches the triggers-compatible subject.
+	sigStream, err := js.Stream(ctx, decodestream.SignalsStreamName)
+	require.NoError(t, err)
+	cons, err := sigStream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		AckPolicy: jetstream.AckExplicitPolicy, FilterSubject: "dimo.signals.speed",
+	})
+	require.NoError(t, err)
+	msg, err := cons.Next(jetstream.FetchMaxWait(10 * time.Second))
+	require.NoError(t, err)
+
+	var signalCE vss.SignalCloudEvent
+	require.NoError(t, json.Unmarshal(msg.Data(), &signalCE))
+	signals := vss.UnpackSignals(signalCE)
+	require.Len(t, signals, 1)
+	assert.Equal(t, "speed", signals[0].Data.Name)
+	assert.Equal(t, 72.5, signals[0].Data.ValueNumber)
+	assert.Equal(t, subject, signalCE.Subject)
+}

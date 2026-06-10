@@ -10,14 +10,18 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Header names carried on every published message so header-only consumers
-// can route without unmarshaling the body.
+// Header names carried on every published message. ce-* duplicate body
+// fields so header-only consumers can route without unmarshaling; the
+// din-* headers carry StoredEvent fields that the RawEvent body cannot
+// (RawEvent's custom MarshalJSON knows nothing of storage metadata).
 const (
 	HeaderCEType    = "ce-type"
 	HeaderCESubject = "ce-subject"
 	HeaderCESource  = "ce-source"
 	HeaderCEID      = "ce-id"
-	HeaderVoidsID   = "din-voids-id"
+
+	HeaderVoidsID      = "din-voids-id"
+	HeaderDataIndexKey = "din-data-index-key"
 )
 
 // ErrUnavailable reports that JetStream did not acknowledge the publish in
@@ -36,10 +40,10 @@ func NewPublisher(js jetstream.JetStream) *Publisher {
 }
 
 // Publish sends one validated event and blocks until JetStream acks it or
-// ctx expires. voidsID may be empty; when set it is carried as a header for
-// tombstone-aware consumers.
-func (p *Publisher) Publish(ctx context.Context, event *cloudevent.RawEvent, voidsID string) error {
-	body, err := event.MarshalJSON()
+// ctx expires. DataIndexKey and VoidsID travel as headers; the body is the
+// RawEvent wire format.
+func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) error {
+	body, err := event.RawEvent.MarshalJSON()
 	if err != nil {
 		return fmt.Errorf("marshaling event %s: %w", event.ID, err)
 	}
@@ -55,8 +59,11 @@ func (p *Publisher) Publish(ctx context.Context, event *cloudevent.RawEvent, voi
 			HeaderCEID:      []string{event.ID},
 		},
 	}
-	if voidsID != "" {
-		msg.Header.Set(HeaderVoidsID, voidsID)
+	if event.VoidsID != "" {
+		msg.Header.Set(HeaderVoidsID, event.VoidsID)
+	}
+	if event.DataIndexKey != "" {
+		msg.Header.Set(HeaderDataIndexKey, event.DataIndexKey)
 	}
 
 	future, err := p.js.PublishMsgAsync(msg)
@@ -72,4 +79,17 @@ func (p *Publisher) Publish(ctx context.Context, event *cloudevent.RawEvent, voi
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %w", ErrUnavailable, ctx.Err())
 	}
+}
+
+// ParseMsg reconstructs a StoredEvent from a consumed JetStream message.
+func ParseMsg(headers nats.Header, body []byte) (cloudevent.StoredEvent, error) {
+	var raw cloudevent.RawEvent
+	if err := raw.UnmarshalJSON(body); err != nil {
+		return cloudevent.StoredEvent{}, fmt.Errorf("unmarshaling raw event: %w", err)
+	}
+	return cloudevent.StoredEvent{
+		RawEvent:     raw,
+		DataIndexKey: headers.Get(HeaderDataIndexKey),
+		VoidsID:      headers.Get(HeaderVoidsID),
+	}, nil
 }

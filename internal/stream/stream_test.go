@@ -30,18 +30,20 @@ func newJetStream(t *testing.T) jetstream.JetStream {
 	return js
 }
 
-func rawEvent(id, ceType, subject string) *cloudevent.RawEvent {
-	return &cloudevent.RawEvent{
-		CloudEventHeader: cloudevent.CloudEventHeader{
-			SpecVersion: cloudevent.SpecVersion,
-			Type:        ceType,
-			Subject:     subject,
-			Source:      "0xConnLicense",
-			Producer:    "0xDevice",
-			ID:          id,
-			Time:        time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC),
+func storedEvent(id, ceType, subject string) *cloudevent.StoredEvent {
+	return &cloudevent.StoredEvent{
+		RawEvent: cloudevent.RawEvent{
+			CloudEventHeader: cloudevent.CloudEventHeader{
+				SpecVersion: cloudevent.SpecVersion,
+				Type:        ceType,
+				Subject:     subject,
+				Source:      "0xConnLicense",
+				Producer:    "0xDevice",
+				ID:          id,
+				Time:        time.Date(2026, 6, 9, 12, 0, 0, 0, time.UTC),
+			},
+			Data: json.RawMessage(`{"speed":42}`),
 		},
-		Data: json.RawMessage(`{"speed":42}`),
 	}
 }
 
@@ -72,8 +74,8 @@ func TestPublisher_PublishAndConsume(t *testing.T) {
 	require.NoError(t, err)
 
 	pub := stream.NewPublisher(js)
-	ev := rawEvent("evt-1", "dimo.status", "did:erc721:137:0xA:1")
-	require.NoError(t, pub.Publish(ctx, ev, ""))
+	ev := storedEvent("evt-1", "dimo.status", "did:erc721:137:0xA:1")
+	require.NoError(t, pub.Publish(ctx, ev))
 
 	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{AckPolicy: jetstream.AckExplicitPolicy})
 	require.NoError(t, err)
@@ -99,9 +101,9 @@ func TestPublisher_DuplicateMsgIDCollapses(t *testing.T) {
 	require.NoError(t, err)
 
 	pub := stream.NewPublisher(js)
-	ev := rawEvent("evt-dup", "dimo.status", "did:erc721:137:0xA:1")
-	require.NoError(t, pub.Publish(ctx, ev, ""))
-	require.NoError(t, pub.Publish(ctx, ev, ""), "duplicate publish succeeds (idempotent ack)")
+	ev := storedEvent("evt-dup", "dimo.status", "did:erc721:137:0xA:1")
+	require.NoError(t, pub.Publish(ctx, ev))
+	require.NoError(t, pub.Publish(ctx, ev), "duplicate publish succeeds (idempotent ack)")
 
 	info, err := s.Info(ctx)
 	require.NoError(t, err)
@@ -117,12 +119,22 @@ func TestPublisher_VoidsIDHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	pub := stream.NewPublisher(js)
-	ev := rawEvent("evt-tomb", "dimo.tombstone", "did:erc721:137:0xA:1")
-	require.NoError(t, pub.Publish(ctx, ev, "voided-event-id"))
+	ev := storedEvent("evt-tomb", "dimo.tombstone", "did:erc721:137:0xA:1")
+	ev.VoidsID = "voided-event-id"
+	ev.DataIndexKey = "blobs/did:erc721:137:0xA:1/2026/06/09/abc"
+	require.NoError(t, pub.Publish(ctx, ev))
 
 	cons, err := s.CreateConsumer(ctx, jetstream.ConsumerConfig{AckPolicy: jetstream.AckExplicitPolicy})
 	require.NoError(t, err)
 	msg, err := cons.Next(jetstream.FetchMaxWait(5 * time.Second))
 	require.NoError(t, err)
 	assert.Equal(t, "voided-event-id", msg.Headers().Get(stream.HeaderVoidsID))
+
+	// ParseMsg reconstructs the StoredEvent, including storage metadata that
+	// the RawEvent body cannot carry.
+	got, err := stream.ParseMsg(msg.Headers(), msg.Data())
+	require.NoError(t, err)
+	assert.Equal(t, ev.Key(), got.Key())
+	assert.Equal(t, "voided-event-id", got.VoidsID)
+	assert.Equal(t, "blobs/did:erc721:137:0xA:1/2026/06/09/abc", got.DataIndexKey)
 }

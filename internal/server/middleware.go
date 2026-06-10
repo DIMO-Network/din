@@ -93,7 +93,13 @@ func maxBytesMiddleware(limit int64) func(http.Handler) http.Handler {
 	}
 }
 
-// remoteLimiter holds one token bucket per remote key.
+// limiterMaxKeys bounds the per-remote bucket map. A device fleet churning
+// source IPs (or an adversary spraying keys) must not grow process memory
+// without bound.
+const limiterMaxKeys = 100_000
+
+// remoteLimiter holds one token bucket per remote key, bounded at
+// limiterMaxKeys entries.
 type remoteLimiter struct {
 	mu       sync.Mutex
 	limiters map[string]*rate.Limiter
@@ -114,10 +120,37 @@ func (l *remoteLimiter) allow(key string) bool {
 	defer l.mu.Unlock()
 	lim, ok := l.limiters[key]
 	if !ok {
+		if len(l.limiters) >= limiterMaxKeys {
+			l.evictLocked()
+		}
 		lim = rate.NewLimiter(l.rps, l.burst)
 		l.limiters[key] = lim
 	}
 	return lim.Allow()
+}
+
+// evictLocked drops idle entries. A bucket refilled to full burst behaves
+// identically to a brand-new limiter, so removing it changes nothing for
+// that remote. If every bucket is hot (pathological key cardinality),
+// arbitrary entries go anyway — bounded memory beats perfect fairness; the
+// affected remotes merely regain a fresh burst.
+func (l *remoteLimiter) evictLocked() {
+	for key, lim := range l.limiters {
+		if lim.Tokens() >= float64(l.burst) {
+			delete(l.limiters, key)
+		}
+	}
+	if len(l.limiters) < limiterMaxKeys {
+		return
+	}
+	dropped := 0
+	for key := range l.limiters {
+		delete(l.limiters, key)
+		dropped++
+		if dropped >= limiterMaxKeys/10 {
+			break
+		}
+	}
 }
 
 // rateLimitMiddleware enforces a per-remote token bucket keyed by keyFn,

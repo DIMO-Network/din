@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +17,7 @@ import (
 	ceparquet "github.com/DIMO-Network/cloudevent/parquet"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/decodestream"
+	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
 	"github.com/DIMO-Network/din/internal/natsembed"
 	"github.com/DIMO-Network/din/internal/server"
@@ -35,36 +34,38 @@ import (
 
 var vehicleNFT = common.HexToAddress("0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF")
 
-type memStore struct {
-	mu      sync.Mutex
-	objects map[string][]byte
+// e2eStore backs the test with the production filesystem store so the e2e
+// proves the sink → fsstore → parquet decode round trip on the real
+// single-node backend.
+type e2eStore struct {
+	*fsstore.Client
 }
 
-func newMemStore() *memStore { return &memStore{objects: map[string][]byte{}} }
-
-func (m *memStore) PutObject(_ context.Context, key string, body []byte) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.objects[key] = append([]byte(nil), body...)
-	return nil
+func newE2EStore(t *testing.T) e2eStore {
+	t.Helper()
+	c, err := fsstore.New(t.TempDir())
+	require.NoError(t, err)
+	return e2eStore{Client: c}
 }
 
-func (m *memStore) keys(prefix string) []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	var out []string
-	for k := range m.objects {
-		if strings.HasPrefix(k, prefix) {
-			out = append(out, k)
-		}
+func (s e2eStore) keys(prefix string) []string {
+	objects, err := s.ListObjectsV2(context.Background(), prefix)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, len(objects))
+	for i, obj := range objects {
+		out[i] = obj.Key
 	}
 	return out
 }
 
-func (m *memStore) get(key string) []byte {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.objects[key]
+func (s e2eStore) get(key string) []byte {
+	body, err := s.GetObject(context.Background(), key, 0)
+	if err != nil {
+		return nil
+	}
+	return body
 }
 
 // sourceInjector simulates the mTLS middleware: every request carries the
@@ -91,7 +92,7 @@ func TestEndToEnd_DeviceToParquetAndTriggers(t *testing.T) {
 	rawStream, err := stream.EnsureStream(ctx, js, stream.DefaultConfig())
 	require.NoError(t, err)
 
-	store := newMemStore()
+	store := newE2EStore(t)
 	cfg := convert.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}
 	convert.RegisterModules(cfg)
 

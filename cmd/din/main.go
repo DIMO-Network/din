@@ -18,8 +18,10 @@ import (
 	"github.com/DIMO-Network/din/internal/config"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/decodestream"
+	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
 	"github.com/DIMO-Network/din/internal/natsembed"
+	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/DIMO-Network/din/internal/s3client"
 	"github.com/DIMO-Network/din/internal/server"
 	"github.com/DIMO-Network/din/internal/sink"
@@ -82,28 +84,17 @@ func run(log zerolog.Logger) error {
 
 	// Storage. Blobs (externalized >1MB payloads) live in their own bucket
 	// like dis's BLOB_BUCKET; falling back to the parquet bucket would
-	// split durable documents across two locations.
-	store, err := s3client.New(ctx, s3client.Config{
-		Bucket:          settings.ParquetBucket,
-		Region:          settings.S3Region,
-		AccessKeyID:     settings.S3AccessKeyID,
-		SecretAccessKey: settings.S3SecretAccessKey,
-		Endpoint:        settings.S3Endpoint,
-	})
+	// split durable documents across two locations. Each bucket value picks
+	// its backend independently: absolute path or file:// → local
+	// filesystem, anything else → S3.
+	store, err := newObjectStore(ctx, settings, settings.ParquetBucket)
 	if err != nil {
 		return err
 	}
-	blobBucket := settings.BlobBucket
-	if blobBucket == "" {
+	if settings.BlobBucket == "" {
 		return errors.New("BLOB_BUCKET is required")
 	}
-	blobStore, err := s3client.New(ctx, s3client.Config{
-		Bucket:          blobBucket,
-		Region:          settings.S3Region,
-		AccessKeyID:     settings.S3AccessKeyID,
-		SecretAccessKey: settings.S3SecretAccessKey,
-		Endpoint:        settings.S3Endpoint,
-	})
+	blobStore, err := newObjectStore(ctx, settings, settings.BlobBucket)
 	if err != nil {
 		return err
 	}
@@ -209,9 +200,24 @@ func postOnly(next http.Handler) http.Handler {
 	})
 }
 
-// compactStoreAdapter narrows s3client.Client to the compactor's surface.
+// newObjectStore picks the storage backend from the bucket value: local
+// filesystem for path-like values, S3 otherwise.
+func newObjectStore(ctx context.Context, settings config.Settings, bucket string) (objstore.Store, error) {
+	if objstore.IsLocalPath(bucket) {
+		return fsstore.New(objstore.LocalRoot(bucket))
+	}
+	return s3client.New(ctx, s3client.Config{
+		Bucket:          bucket,
+		Region:          settings.S3Region,
+		AccessKeyID:     settings.S3AccessKeyID,
+		SecretAccessKey: settings.S3SecretAccessKey,
+		Endpoint:        settings.S3Endpoint,
+	})
+}
+
+// compactStoreAdapter narrows a Store to the compactor's surface.
 type compactStoreAdapter struct {
-	client *s3client.Client
+	client objstore.Store
 }
 
 func (a *compactStoreAdapter) List(ctx context.Context, prefix string) ([]compact.ObjectInfo, error) {

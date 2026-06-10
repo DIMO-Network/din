@@ -3,9 +3,11 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -141,6 +143,18 @@ func Load() (Settings, error) {
 	skew := env("ALLOWABLE_TIME_SKEW", "5m")
 	if s.AllowableTimeSkew, err = time.ParseDuration(skew); err != nil {
 		return s, fmt.Errorf("parsing ALLOWABLE_TIME_SKEW: %w", err)
+	}
+
+	if s.ParquetBucket == "" {
+		return s, errors.New("PARQUET_BUCKET is required (S3 bucket name or absolute local path)")
+	}
+	// Buckets are either S3 names or absolute local paths; relative paths
+	// would silently resolve against the working directory (and dq's local
+	// detection would miss them), so reject them here.
+	for name, v := range map[string]string{"PARQUET_BUCKET": s.ParquetBucket, "BLOB_BUCKET": s.BlobBucket} {
+		if strings.HasPrefix(v, ".") {
+			return s, fmt.Errorf("%s must be an S3 bucket name or absolute path, got relative path %q", name, v)
+		}
 	}
 	return s, nil
 }

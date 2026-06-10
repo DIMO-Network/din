@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -34,11 +35,9 @@ type Config struct {
 	Endpoint string
 }
 
-// ObjectInfo describes a listed object.
-type ObjectInfo struct {
-	Key  string
-	Size int64
-}
+// ObjectInfo describes a listed object. Alias of objstore.ObjectInfo so
+// s3client and fsstore satisfy one objstore.Store interface.
+type ObjectInfo = objstore.ObjectInfo
 
 // api is the subset of the AWS S3 client the wrapper uses.
 type api interface {

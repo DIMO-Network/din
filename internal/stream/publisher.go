@@ -43,7 +43,7 @@ func NewPublisher(js jetstream.JetStream) *Publisher {
 // ctx expires. DataIndexKey and VoidsID travel as headers; the body is the
 // RawEvent wire format.
 func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) error {
-	body, err := event.RawEvent.MarshalJSON()
+	body, err := event.MarshalJSON()
 	if err != nil {
 		return fmt.Errorf("marshaling event %s: %w", event.ID, err)
 	}

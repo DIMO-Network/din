@@ -9,6 +9,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
@@ -73,6 +74,11 @@ type Compactor struct {
 	log   zerolog.Logger
 	now   func() time.Time
 	sleep func(context.Context, time.Duration)
+
+	// deletes tracks in-flight grace-period source deletions so Run can
+	// drain them on shutdown. Deletions left pending at a crash are
+	// finished by the recovery pass (the manifest is already durable).
+	deletes sync.WaitGroup
 }
 
 // New constructs a Compactor.
@@ -106,9 +112,16 @@ func (c *Compactor) Run(ctx context.Context) error {
 		select {
 		case <-ticker.C:
 		case <-ctx.Done():
+			c.DrainDeletes()
 			return nil
 		}
 	}
+}
+
+// DrainDeletes blocks until all in-flight grace-period deletions finish.
+// Run calls it on shutdown; tests use it to observe post-grace state.
+func (c *Compactor) DrainDeletes() {
+	c.deletes.Wait()
 }
 
 // Cycle plans and executes one compaction pass across the lookback window.
@@ -263,10 +276,20 @@ func (c *Compactor) merge(ctx context.Context, partition string, sources []Objec
 		return err
 	}
 
-	c.sleep(ctx, c.cfg.DeleteGrace)
-	if err := c.finishManifest(ctx, manifestID, m); err != nil {
-		return err
-	}
+	// Grace-delete asynchronously so one merge's 10-minute window does not
+	// serialize the rest of the cycle. If we shut down or crash first, the
+	// durable manifest lets Recover finish the deletes.
+	c.deletes.Add(1)
+	go func() {
+		defer c.deletes.Done()
+		c.sleep(ctx, c.cfg.DeleteGrace)
+		if ctx.Err() != nil {
+			return // recovery will finish this unit
+		}
+		if err := c.finishManifest(ctx, manifestID, m); err != nil {
+			c.log.Error().Err(err).Str("manifest", manifestID).Msg("grace delete failed; recovery will retry")
+		}
+	}()
 
 	c.log.Info().Str("partition", partition).Int("sources", len(sourceKeys)).
 		Int("outputs", len(outputs)).Int("rows", len(events)).Msg("partition compacted")

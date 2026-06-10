@@ -127,7 +127,9 @@ func TestCycle_MergesCoveredFilesAndDedups(t *testing.T) {
 	k3 := writeBundle(t, store, partition, 3, storedEvent("e2", ts.Add(time.Minute)), storedEvent("e3", ts.Add(2*time.Minute))) // e2 duplicated
 	setWatermark(t, store, map[string]string{partition: k3})
 
-	require.NoError(t, newCompactor(store).Cycle(context.Background()))
+	comp := newCompactor(store)
+	require.NoError(t, comp.Cycle(context.Background()))
+	comp.DrainDeletes()
 
 	keys := store.keys("raw/" + partition + "/")
 	require.Len(t, keys, 1, "three sources merged to one output")
@@ -156,7 +158,9 @@ func TestCycle_RespectsWatermark(t *testing.T) {
 	// Watermark covers only the first file: nothing may compact (need >=2 covered).
 	setWatermark(t, store, map[string]string{partition: k1})
 
-	require.NoError(t, newCompactor(store).Cycle(context.Background()))
+	comp := newCompactor(store)
+	require.NoError(t, comp.Cycle(context.Background()))
+	comp.DrainDeletes()
 
 	keys := store.keys("raw/" + partition + "/")
 	assert.Len(t, keys, 3, "files above watermark untouched")
@@ -174,7 +178,9 @@ func TestCycle_NoWatermarkSkips(t *testing.T) {
 		writeBundle(t, store, partition, i, storedEvent(fmt.Sprintf("e%d", i), ts))
 	}
 
-	require.NoError(t, newCompactor(store).Cycle(context.Background()))
+	comp := newCompactor(store)
+	require.NoError(t, comp.Cycle(context.Background()))
+	comp.DrainDeletes()
 	assert.Len(t, store.keys("raw/"+partition+"/"), 4, "no watermark -> no compaction")
 }
 

@@ -137,29 +137,42 @@ func (b *Bridge) Run(ctx context.Context) error {
 	}
 }
 
-// handle decodes one raw message and publishes its signals/events. The raw
-// message is always acked: decode failures are terminal for this payload
-// and the raw bytes remain in parquet for parse-on-read recovery.
+// handle decodes one raw message and publishes its signals/events.
+// Conversion failures are terminal for the payload (raw bytes remain in
+// parquet for parse-on-read recovery) and ack. Publish failures are
+// transient — the message is Nak'd so JetStream redelivers instead of
+// silently dropping decoded signals on the floor.
 func (b *Bridge) handle(ctx context.Context, msg jetstream.Msg) {
-	defer func() {
-		if err := msg.Ack(); err != nil {
-			b.log.Warn().Err(err).Msg("acking raw message failed")
-		}
-	}()
-
 	event, err := stream.ParseMsg(msg.Headers(), msg.Data())
 	if err != nil {
 		b.log.Error().Err(err).Str("subject", msg.Subject()).Msg("undecodable raw message")
+		b.ack(msg)
 		return
 	}
 
+	var pubErr error
 	switch event.Type {
 	case cloudevent.TypeStatus:
 		if b.isVehicleSignalMessage(&event.RawEvent) {
-			b.publishSignals(ctx, &event.RawEvent)
+			pubErr = b.publishSignals(ctx, &event.RawEvent)
 		}
 	case cloudevent.TypeEvents:
-		b.publishEvents(ctx, &event.RawEvent)
+		pubErr = b.publishEvents(ctx, &event.RawEvent)
+	}
+
+	if pubErr != nil {
+		b.log.Error().Err(pubErr).Str("subject", msg.Subject()).Msg("publishing decoded message failed; nak for redelivery")
+		if err := msg.Nak(); err != nil {
+			b.log.Warn().Err(err).Msg("nak failed")
+		}
+		return
+	}
+	b.ack(msg)
+}
+
+func (b *Bridge) ack(msg jetstream.Msg) {
+	if err := msg.Ack(); err != nil {
+		b.log.Warn().Err(err).Msg("acking raw message failed")
 	}
 }
 
@@ -174,8 +187,9 @@ func (b *Bridge) isVehicleSignalMessage(rawEvent *cloudevent.RawEvent) bool {
 // publishSignals mirrors dis signalconvert: convert, salvage partial
 // decodes, prune future/duplicate signals, merge coordinate pairs into
 // location signals, then publish one packed SignalCloudEvent per signal
-// name so per-name subject filters stay exact.
-func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEvent) {
+// name so per-name subject filters stay exact. The returned error covers
+// only publish failures — conversion problems are logged and final.
+func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEvent) error {
 	signals, err := modules.ConvertToSignals(ctx, rawEvent.Source, *rawEvent)
 	if err != nil {
 		var convertErr *mgconvert.ConversionError
@@ -185,7 +199,7 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("signal conversion errors")
 	}
 	if len(signals) == 0 {
-		return
+		return nil
 	}
 
 	signals, pruneErr := pruneFutureAndDuplicateSignals(signals)
@@ -194,23 +208,25 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("signal pruning errors")
 	}
 	if len(signals) == 0 {
-		return
+		return nil
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeSignals)
+	var pubErrs error
 	for name, group := range groupSignalsByName(signals) {
 		signalCE := vss.PackSignals(header, group)
-		b.publishJSON(ctx, signalSubjectPrefix+"."+sanitize(name), signalCE)
+		pubErrs = errors.Join(pubErrs, b.publishJSON(ctx, signalSubjectPrefix+"."+sanitize(name), signalCE))
 	}
+	return pubErrs
 }
 
-func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEvent) {
+func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEvent) error {
 	events, err := modules.ConvertToEvents(ctx, rawEvent.Source, *rawEvent)
 	if err != nil {
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("event conversion errors")
 	}
 	if len(events) == 0 {
-		return
+		return nil
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeEvents)
@@ -218,16 +234,19 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 	for _, ev := range events {
 		byName[ev.Data.Name] = append(byName[ev.Data.Name], ev)
 	}
+	var pubErrs error
 	for name, group := range byName {
 		eventCE := vss.PackEvents(header, group)
-		b.publishJSON(ctx, eventSubjectPrefix+"."+sanitize(name), eventCE)
+		pubErrs = errors.Join(pubErrs, b.publishJSON(ctx, eventSubjectPrefix+"."+sanitize(name), eventCE))
 	}
+	return pubErrs
 }
 
-func (b *Bridge) publishJSON(ctx context.Context, subject string, payload any) {
+func (b *Bridge) publishJSON(ctx context.Context, subject string, payload any) error {
 	if _, err := b.js.Publish(ctx, subject, mustJSON(payload)); err != nil {
-		b.log.Error().Err(err).Str("subject", subject).Msg("publishing decoded message failed")
+		return fmt.Errorf("publishing to %s: %w", subject, err)
 	}
+	return nil
 }
 
 func decodedHeader(rawEvent *cloudevent.RawEvent, ceType string) cloudevent.CloudEventHeader {

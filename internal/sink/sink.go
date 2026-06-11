@@ -86,6 +86,9 @@ type Sink struct {
 
 	jobs chan flushJob
 	wg   sync.WaitGroup
+
+	// drainDeadline bounds the whole shutdown flush; set once by Run.
+	drainDeadline time.Time
 }
 
 type partitionBuffer struct {
@@ -150,8 +153,10 @@ loop:
 	fetchErr = <-fetchDone
 
 	// Shutdown: flush every remaining buffer, then wait for workers so all
-	// acks land before the process exits — but only up to DrainTimeout, so
-	// a wedged PUT can't hang shutdown (unflushed messages just redeliver).
+	// acks land before the process exits — but only up to DrainTimeout
+	// TOTAL (one shared deadline, not per buffer), so a wedged PUT can't
+	// hang shutdown (unflushed messages just redeliver).
+	s.drainDeadline = time.Now().Add(s.cfg.DrainTimeout)
 	s.flushReady(true)
 	close(s.jobs)
 	workersDone := make(chan struct{})
@@ -261,9 +266,15 @@ func (s *Sink) flushReady(force bool) {
 func (s *Sink) enqueue(key pqwrite.PartitionKey, buf *partitionBuffer, block bool) bool {
 	job := flushJob{partition: key, events: buf.events, msgs: buf.msgs}
 	if block {
+		wait := time.Until(s.drainDeadline)
+		if wait <= 0 {
+			return false
+		}
+		t := time.NewTimer(wait)
+		defer t.Stop()
 		select {
 		case s.jobs <- job:
-		case <-time.After(s.cfg.DrainTimeout):
+		case <-t.C:
 			return false
 		}
 	} else {

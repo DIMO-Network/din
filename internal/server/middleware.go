@@ -65,7 +65,11 @@ func newAttestationAuth(issuer, jwksURL string) (func(*http.Request) (string, er
 
 	return func(r *http.Request) (string, error) {
 		authStr := r.Header.Get("Authorization")
-		tokenStr := strings.TrimSpace(strings.Replace(authStr, "Bearer ", "", 1))
+		tokenStr, ok := strings.CutPrefix(authStr, "Bearer ")
+		if !ok {
+			return "", errors.New("authorization header must use the Bearer scheme")
+		}
+		tokenStr = strings.TrimSpace(tokenStr)
 
 		var claims Claims
 		if _, err := parser.ParseWithClaims(tokenStr, &claims, jwksResource.Keyfunc); err != nil {

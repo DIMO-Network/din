@@ -96,6 +96,12 @@ func (c *Client) PutObject(_ context.Context, key string, body []byte) error {
 		_ = os.Remove(tmpName)
 		return fmt.Errorf("publishing %s: %w", key, err)
 	}
+	// fsync the directory: the rename itself is not durable until the
+	// directory entry is, and PutObject returning is the sink's ack gate.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 

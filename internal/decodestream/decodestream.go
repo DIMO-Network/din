@@ -9,6 +9,8 @@ package decodestream
 import (
 	"cmp"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +25,7 @@ import (
 	"github.com/DIMO-Network/model-garage/pkg/modules"
 	"github.com/DIMO-Network/model-garage/pkg/vss"
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/rs/zerolog"
 )
@@ -224,7 +227,7 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 	var pubErrs error
 	for name, group := range groupSignalsByName(signals) {
 		signalCE := vss.PackSignals(header, group)
-		fut, err := b.publishJSONAsync(signalSubjectPrefix+"."+sanitize(name), signalCE)
+		fut, err := b.publishJSONAsync(signalSubjectPrefix+"."+sanitize(name), signalCE, dedupID(rawEvent, name))
 		if err != nil {
 			pubErrs = errors.Join(pubErrs, err)
 			continue
@@ -257,7 +260,7 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 	var pubErrs error
 	for name, group := range byName {
 		eventCE := vss.PackEvents(header, group)
-		fut, err := b.publishJSONAsync(eventSubjectPrefix+"."+sanitize(name), eventCE)
+		fut, err := b.publishJSONAsync(eventSubjectPrefix+"."+sanitize(name), eventCE, dedupID(rawEvent, name))
 		if err != nil {
 			pubErrs = errors.Join(pubErrs, err)
 			continue
@@ -270,13 +273,27 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 // publishJSONAsync submits one publish without waiting for the ack; a raw
 // status event fans out to one publish per signal name, so awaiting each
 // ack serially would make per-name JetStream round-trips the bridge's
-// throughput ceiling.
-func (b *Bridge) publishJSONAsync(subject string, payload any) (jetstream.PubAckFuture, error) {
-	fut, err := b.js.PublishAsync(subject, mustJSON(payload))
+// throughput ceiling. The Nats-Msg-Id header makes redelivery replays
+// (Nak after a partial publish failure) collapse inside the stream's
+// duplicate window instead of double-delivering to vehicle-triggers.
+func (b *Bridge) publishJSONAsync(subject string, payload any, dedup string) (jetstream.PubAckFuture, error) {
+	msg := &nats.Msg{
+		Subject: subject,
+		Data:    mustJSON(payload),
+		Header:  nats.Header{nats.MsgIdHdr: []string{dedup}},
+	}
+	fut, err := b.js.PublishMsgAsync(msg)
 	if err != nil {
 		return nil, fmt.Errorf("publishing to %s: %w", subject, err)
 	}
 	return fut, nil
+}
+
+// dedupID is deterministic per (raw event, decoded name): replays of the
+// same raw message produce the same id.
+func dedupID(rawEvent *cloudevent.RawEvent, name string) string {
+	sum := sha256.Sum256([]byte(rawEvent.Key() + "|" + name))
+	return hex.EncodeToString(sum[:16])
 }
 
 // awaitFutures waits for every pending ack; any failure fails the message

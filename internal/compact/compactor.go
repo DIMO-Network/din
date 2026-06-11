@@ -351,7 +351,21 @@ func (c *Compactor) Recover(ctx context.Context) error {
 	for id, m := range manifests {
 		complete := true
 		for _, out := range m.Outputs {
-			if _, err := c.store.GetObject(ctx, out); err != nil {
+			// Existence check via List: no full download, and a transient
+			// store error aborts recovery instead of masquerading as a
+			// missing output and rolling back a finished compaction.
+			objs, err := c.store.List(ctx, out)
+			if err != nil {
+				return fmt.Errorf("recovery: checking output %s: %w", out, err)
+			}
+			found := false
+			for _, obj := range objs {
+				if obj.Key == out {
+					found = true
+					break
+				}
+			}
+			if !found {
 				complete = false
 				break
 			}

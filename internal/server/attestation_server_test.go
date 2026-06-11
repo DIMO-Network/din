@@ -29,6 +29,7 @@ func TestAttestationAuth(t *testing.T) {
 		expectedSource string
 		expectedError  bool
 		errorIs        error
+		errorContains  string
 	}{
 		{
 			name: "valid token with custom claims",
@@ -53,7 +54,7 @@ func TestAttestationAuth(t *testing.T) {
 				return req
 			},
 			expectedError: true,
-			errorIs:       jwt.ErrTokenMalformed,
+			errorContains: "Bearer scheme",
 		},
 		{
 			name: "invalid bearer format",
@@ -63,7 +64,7 @@ func TestAttestationAuth(t *testing.T) {
 				return req
 			},
 			expectedError: true,
-			errorIs:       jwt.ErrTokenMalformed,
+			errorContains: "Bearer scheme",
 		},
 		{
 			name: "empty bearer token",
@@ -187,6 +188,9 @@ func TestAttestationAuth(t *testing.T) {
 				require.Error(t, err)
 				if tt.errorIs != nil {
 					assert.ErrorIs(t, err, tt.errorIs)
+				}
+				if tt.errorContains != "" {
+					assert.ErrorContains(t, err, tt.errorContains)
 				}
 			} else {
 				require.NoError(t, err)

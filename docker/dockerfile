@@ -1,0 +1,16 @@
+# Requires the cloudevent repo checked out as a sibling until its parquet
+# options branch is released: build context must be the parent directory.
+#   docker build -f din/docker/dockerfile <parent-dir>
+FROM golang:1.26 AS build
+RUN useradd -u 10001 dimo
+WORKDIR /src
+COPY cloudevent/ ./cloudevent/
+COPY din/ ./din/
+WORKDIR /src/din
+RUN CGO_ENABLED=0 go build -o /din ./cmd/din
+
+FROM gcr.io/distroless/static AS final
+LABEL maintainer="DIMO <hello@dimo.zone>"
+USER nonroot:nonroot
+COPY --from=build --chown=nonroot:nonroot /din /
+ENTRYPOINT ["/din"]

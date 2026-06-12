@@ -1,0 +1,35 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "din.fullname" . }}-tls
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "din.name" . }}
+    helm.sh/chart: {{ include "din.chart" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+spec:
+  secretName: {{ include "din.fullname" . }}-tls
+  duration: 8760h 
+  renewBefore: 1024h
+  subject:
+    organizations:
+      - dimo
+  commonName: {{ .Values.certificate.commonName }}
+  isCA: false
+  privateKey:
+    algorithm: ECDSA
+    encoding: PKCS1
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - server auth
+    - client auth
+  dnsNames:
+    - {{ .Values.certificate.commonName }}
+  uris:
+    - https://dimo.zone
+  issuerRef:
+    name: {{ .Values.certificate.issuer }}
+    kind: StepIssuer
+    group: certmanager.step.sm

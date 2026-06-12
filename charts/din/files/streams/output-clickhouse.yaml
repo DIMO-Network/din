@@ -1,0 +1,57 @@
+input:
+  inproc: "dimo_clickhouse"
+
+buffer:
+  memory:
+    limit: 10485760
+
+output:
+  switch:
+    retry_until_success: true
+    strict_mode: true
+    cases:
+      - check: 'metadata("dimo_message_content").or("") == "dimo_valid_signal"'
+        output:
+          label: "clickhouse_signals"
+          processors:
+            - label: "signal_to_slice"
+              dimo_signal_to_slice: {}
+          retry:
+            output:
+              sql_insert:
+                driver: clickhouse
+                dsn: clickhouse://${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}/${CLICKHOUSE_DIMO_DATABASE}?username=${CLICKHOUSE_USER}&password=${CLICKHOUSE_PASSWORD}&secure=${CLICKHOUSE_SECURE:true}&max_execution_time=600
+                table: signal
+                columns: []
+                args_mapping: root = this
+                batching:
+                  count: 500000
+                  period: "2s"
+            backoff:
+              initial_interval: 1s
+              max_interval: 30s
+
+      - check: 'metadata("dimo_message_content").or("") == "dimo_valid_event"'
+        output:
+          label: "clickhouse_events"
+          processors:
+            - label: "event_to_slice"
+              dimo_event_to_slice: {}
+          retry:
+            output:
+              sql_insert:
+                driver: clickhouse
+                dsn: clickhouse://${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}/${CLICKHOUSE_DIMO_DATABASE}?username=${CLICKHOUSE_USER}&password=${CLICKHOUSE_PASSWORD}&secure=${CLICKHOUSE_SECURE:true}&max_execution_time=600
+                table: event
+                columns: []
+                args_mapping: "root = this"
+                batching:
+                  count: 500000
+                  period: 2s
+            backoff:
+              initial_interval: 1s
+              max_interval: 30s
+
+      - check: ''
+        output:
+          drop: {}

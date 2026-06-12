@@ -1,0 +1,82 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "din.fullname" . }}
+  labels:
+    {{- include "din.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "din.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/env: {{ include (print $.Template.BasePath "/configenv.yaml" ) . | sha256sum }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "din.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "din.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+          {{  range .Values.image.command -}}
+            - {{ . }}
+          {{ end }}
+          envFrom:
+          - configMapRef:
+              name: {{ include "din.fullname" . }}-config
+          - secretRef:
+              name: {{ include "din.fullname" . }}-secret
+          env:
+          - name: CONTAINER_NAME
+            valueFrom:
+              fieldRef:
+                fieldPath: metadata.name
+          - name: CONTAINER_IP
+            valueFrom:
+              fieldRef:
+                fieldPath: status.podIP
+          ports:
+{{ toYaml .Values.ports | indent 12 }}
+          livenessProbe:
+{{ toYaml .Values.livenessProbe | indent 12 }}
+          readinessProbe:
+{{ toYaml .Values.readinessProbe | indent 12 }}
+          resources:
+{{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: external-http-server-tls
+              mountPath: /etc/ssl/certs/din
+              readOnly: true
+      volumes:
+        - name: external-http-server-tls
+          projected:
+            sources:
+              - secret:
+                  name: {{ include "din.fullname" . }}-tls
+                  items:
+                    - key: tls.crt
+                      path: tls.crt
+                    - key: tls.key
+                      path: tls.key
+              - configMap:
+                  name: {{ .Values.certificate.caConfigMap }}
+                  items:
+                    - key: root_ca.crt
+                      path: root_ca.crt

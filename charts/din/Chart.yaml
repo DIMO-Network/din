@@ -1,0 +1,6 @@
+apiVersion: v2
+name: din
+description: DIMO Ingest Node — device cloudevents to raw parquet via NATS JetStream
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

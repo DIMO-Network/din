@@ -1,0 +1,33 @@
+input:
+  inproc: "dimo_blobs"
+
+buffer:
+  memory:
+    limit: 52428800
+
+output:
+  label: "insert_blob_s3"
+  fallback:
+    - label: "blob_s3"
+      switch:
+        cases:
+          - check: 'metadata("dimo_s3_upload_key").or("") != ""'
+            output:
+              aws_s3:
+                bucket: "${BLOB_BUCKET}"
+                region: "${S3_AWS_REGION}"
+                content_type: ${! metadata("dimo_s3_content_type").or("application/octet-stream") }
+                path: ${!metadata("dimo_s3_upload_key")}
+                credentials:
+                  id: "${S3_AWS_ACCESS_KEY_ID}"
+                  secret: "${S3_AWS_SECRET_ACCESS_KEY}"
+          - check: ''
+            output:
+              drop: {}
+    - label: "s3_blob_failure"
+      drop: {}
+      processors:
+        - label: "insert_blob_s3_failure"
+          log:
+            level: ERROR
+            message: 'failed to store blob: ${!metadata("fallback_error").or("unknown")}'

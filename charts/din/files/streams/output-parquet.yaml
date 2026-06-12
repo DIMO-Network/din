@@ -1,0 +1,96 @@
+input:
+  inproc: "dimo_cloudevents"
+
+buffer:
+  memory:
+    limit: 10485760
+    batch_policy:
+      enabled: true
+      count: 5000
+      period: "5s"
+
+pipeline:
+  processors:
+    - label: "convert_cloudevent_to_parquet"
+      dimo_raw_parquet:
+        prefix: "cloudevent/valid/"
+
+output:
+  label: "insert_valid_cloudevent"
+  fallback:
+    - broker:
+        pattern: fan_out_sequential_fail_fast
+        outputs:
+          # First: write parquet to S3
+          - fallback:
+              - label: "insert_valid_cloudevent_parquet_s3"
+                switch:
+                  cases:
+                    - check: 'metadata("dimo_s3_upload_key").or("") != ""'
+                      output:
+                        aws_s3:
+                          bucket: "${PARQUET_BUCKET}"
+                          region: "${S3_AWS_REGION}"
+                          content_type: application/octet-stream
+                          path: ${!metadata("dimo_s3_upload_key")}
+                          credentials:
+                            id: "${S3_AWS_ACCESS_KEY_ID}"
+                            secret: "${S3_AWS_SECRET_ACCESS_KEY}"
+                    - check: ''
+                      output:
+                        drop: {}
+              - label: "s3_parquet_failure"
+                drop: {}
+                processors:
+                  - label: "insert_valid_cloudevent_parquet_s3_failure"
+                    log:
+                      level: ERROR
+                      message: 'failed to store parquet file: ${!metadata("fallback_error").or("unknown")}'
+
+          # Second: insert CE index rows into ClickHouse
+          - fallback:
+              - label: "clickhouse_cloudevent"
+                switch:
+                  cases:
+                    - check: 'metadata("dimo_message_content").or("") == "dimo_clickhouse_cloudevent"'
+                      output:
+                        sql_insert:
+                          driver: clickhouse
+                          dsn: clickhouse://${CLICKHOUSE_HOST}:${CLICKHOUSE_PORT}/${CLICKHOUSE_INDEX_DATABASE}?username=${CLICKHOUSE_USER}&password=${CLICKHOUSE_PASSWORD}&secure=${CLICKHOUSE_SECURE:true}&dial_timeout=5s&max_execution_time=300
+                          table: cloud_event
+                          columns: []
+                          args_mapping: root = this
+                          batching:
+                            count: 500000
+                            byte_size: 0
+                            period: "2s"
+                            check: ""
+                        processors:
+                          - label: "handle_clickhouse_ce_error"
+                            catch:
+                              - label: "set_clickhouse_ce_component"
+                                mutation: |
+                                   meta dimo_component = "clickhouse_cloudevent"
+                              - resource: "handle_db_error"
+                              - label: "delete_clickhouse_ce_error"
+                                mapping: root = deleted()
+                    - check: ''
+                      output:
+                        drop: {}
+              - label: 'insert_valid_cloudevent_clickhouse_failure'
+                switch:
+                  cases:
+                    - check: 'metadata("fallback_error").or("").contains("bad connection")'
+                      output:
+                        reject: metadata("fallback_error")
+                        processors:
+                          - resource: "handle_db_connection_error"
+                    - check: ''
+                      output:
+                        drop: {}
+                        processors:
+                          - label: "set_ch_failure_component"
+                            mutation: |
+                              meta dimo_component = "insert_valid_cloudevent_clickhouse"
+                          - resource: "handle_db_error"
+    - drop: {}

@@ -1,0 +1,46 @@
+replicaCount: 2
+podAnnotations:
+  config.linkerd.io/proxy-cpu-limit: 2000m
+  config.linkerd.io/proxy-cpu-request: 500m
+isDev: false
+env:
+  ENVIRONMENT: prod
+  NATS_URL: nats://nats-prod:4222
+  NATS_REPLICAS: '3'
+  DIMO_REGISTRY_CHAIN_ID: 137
+  VEHICLE_NFT_ADDRESS: '0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF'
+  AFTERMARKET_NFT_ADDRESS: '0x9c94C395cBcBDe662235E0A9d3bB87Ad708561BA'
+  SYNTHETIC_NFT_ADDRESS: '0x4804e8D1661cd1a1e5dDdE1ff458A7f878c0aC6D'
+  TOKEN_EXCHANGE_KEY_SET_URL: https://auth.dimo.zone/keys
+  TOKEN_EXCHANGE_ISSUER: https://auth.dimo.zone
+  PARQUET_BUCKET: dimo-storage-prod
+  BLOB_BUCKET: dimo-blob-storage-prod
+ingress:
+  enabled: true
+  className: nginx-direct
+  annotations:
+    nginx.ingress.kubernetes.io/limit-rps: '50'
+  hosts:
+    - host: din.dimo.zone
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+          backend:
+            service:
+              suffix: ''
+              port:
+                number: 443
+  tls: []
+certificate:
+  commonName: din.dimo.zone
+  issuer: cas-prod-dimo-ca-issuer
+  caConfigMap: cae-prod-dimo-ca-certs
+resources:
+  limits:
+    cpu: '2'
+    memory: 2Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+autoscaling:
+  enabled: false

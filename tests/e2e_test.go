@@ -20,6 +20,7 @@ import (
 	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
 	"github.com/DIMO-Network/din/internal/natsembed"
+	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/DIMO-Network/din/internal/server"
 	"github.com/DIMO-Network/din/internal/sink"
 	"github.com/DIMO-Network/din/internal/split"
@@ -34,18 +35,18 @@ import (
 
 var vehicleNFT = common.HexToAddress("0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF")
 
-// e2eStore backs the test with the production filesystem store so the e2e
-// proves the sink → fsstore → parquet decode round trip on the real
-// single-node backend.
+// e2eStore wraps a production object store (fsstore here, s3client in the
+// MinIO suite) with the listing/fetch helpers the e2e assertions use, so the
+// e2e proves the sink → store → parquet decode round trip on a real backend.
 type e2eStore struct {
-	*fsstore.Client
+	objstore.Store
 }
 
 func newE2EStore(t *testing.T) e2eStore {
 	t.Helper()
 	c, err := fsstore.New(t.TempDir())
 	require.NoError(t, err)
-	return e2eStore{Client: c}
+	return e2eStore{Store: c}
 }
 
 func (s e2eStore) keys(prefix string) []string {

@@ -222,6 +222,18 @@ func TestWriter_PartitionedDataLayout(t *testing.T) {
 	require.NoError(t, l.DB().QueryRowContext(ctx,
 		`SELECT count(*) FROM lake.raw_events WHERE type = 'dimo.status' AND "time"::DATE = DATE '2026-06-09'`).Scan(&n))
 	assert.Equal(t, 20, n)
+
+	// Written files keep the old pqwrite bundles' pruning traits: zstd
+	// compression and a usable subject bloom filter.
+	file := filepath.Join(dataPath, partitioned[0])
+	var compression string
+	var hasBloom bool
+	require.NoError(t, l.DB().QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT compression, bloom_filter_offset IS NOT NULL FROM parquet_metadata(%s)
+		 WHERE path_in_schema = 'subject' AND row_group_id = 0`, sqlString(file))).
+		Scan(&compression, &hasBloom))
+	assert.Equal(t, "ZSTD", compression)
+	assert.True(t, hasBloom, "subject column must carry a bloom filter")
 }
 
 func TestWriter_TinyBundleInlines(t *testing.T) {

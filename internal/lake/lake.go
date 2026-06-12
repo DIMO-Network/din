@@ -166,6 +166,10 @@ func (l *Lake) tryEnsureSchema(ctx context.Context, cfg Config) error {
 		return nil
 	}
 	ddl := append([]string{}, rawEventsDDL...)
+	// zstd matches the old pqwrite encoder; DuckDB's writer also emits
+	// bloom filters on dictionary-encoded columns (subject included), so
+	// lake files keep the old bundles' pruning characteristics.
+	ddl = append(ddl, "CALL lake.set_option('parquet_compression', 'zstd')")
 	if cfg.TargetFileSize != "" {
 		ddl = append(ddl, fmt.Sprintf("CALL lake.set_option('target_file_size', %s)",
 			sqlString(cfg.TargetFileSize)))

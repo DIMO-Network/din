@@ -223,7 +223,7 @@ func TestMinIO_EndToEnd_DeviceToParquet(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	rawStream, err := stream.EnsureStream(ctx, js, stream.DefaultConfig())
+	rawStreams, err := stream.EnsureStreams(ctx, js, stream.DefaultConfig())
 	require.NoError(t, err)
 
 	cfg := convert.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}
@@ -232,13 +232,13 @@ func TestMinIO_EndToEnd_DeviceToParquet(t *testing.T) {
 	handlers := &handler.Handlers{
 		Converter: convert.NewConverter(zerolog.Nop(), cfg),
 		Splitter:  split.New(store, "cloudevent/blobs/", 1<<20),
-		Publisher: stream.NewPublisher(js),
+		Publisher: stream.NewPublisher(js, 1),
 		Log:       zerolog.Nop(),
 	}
 	httpSrv := httptest.NewServer(sourceInjector("0xConnLicense", handlers.Connection()))
 	t.Cleanup(httpSrv.Close)
 
-	sinkConsumer, err := rawStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+	sinkConsumer, err := rawStreams[0].CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable: "parquet-sink-minio", AckPolicy: jetstream.AckExplicitPolicy, AckWait: 5 * time.Minute,
 	})
 	require.NoError(t, err)

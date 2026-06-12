@@ -36,7 +36,7 @@ func setup(t *testing.T) jetstream.JetStream {
 	js, err := jetstream.New(conn)
 	require.NoError(t, err)
 
-	_, err = stream.EnsureStream(context.Background(), js, stream.DefaultConfig())
+	_, err = stream.EnsureStreams(context.Background(), js, stream.DefaultConfig())
 	require.NoError(t, err)
 	return js
 }
@@ -75,7 +75,7 @@ func TestBridge_StatusToPerNameSignalSubjects(t *testing.T) {
 	go func() { done <- bridge.Run(ctx) }()
 
 	ts := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
-	pub := stream.NewPublisher(js)
+	pub := stream.NewPublisher(js, 1)
 	require.NoError(t, pub.Publish(ctx, rawStatus("evt-1", vehicleDID(42), ts,
 		map[string]any{"name": "speed", "timestamp": ts.Format(time.RFC3339Nano), "value": 88.5},
 		map[string]any{"name": "speed", "timestamp": ts.Add(time.Second).Format(time.RFC3339Nano), "value": 90.0},
@@ -124,7 +124,7 @@ func TestBridge_IgnoresNonVehicleSubjects(t *testing.T) {
 	go func() { done <- bridge.Run(ctx) }()
 
 	ts := time.Now().UTC().Add(-time.Minute)
-	pub := stream.NewPublisher(js)
+	pub := stream.NewPublisher(js, 1)
 	// Wrong contract address: must not produce signals.
 	require.NoError(t, pub.Publish(ctx, rawStatus("evt-x", "did:erc721:137:0x0000000000000000000000000000000000000001:7", ts,
 		map[string]any{"name": "speed", "timestamp": ts.Format(time.RFC3339Nano), "value": 1.0},
@@ -154,7 +154,7 @@ func TestBridge_PrunesDuplicateSignals(t *testing.T) {
 
 	ts := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
 	dup := map[string]any{"name": "speed", "timestamp": ts.Format(time.RFC3339Nano), "value": 50.0}
-	pub := stream.NewPublisher(js)
+	pub := stream.NewPublisher(js, 1)
 	require.NoError(t, pub.Publish(ctx, rawStatus("evt-dup", vehicleDID(43), ts, dup, dup)))
 
 	sigStream, err := js.Stream(ctx, decodestream.SignalsStreamName)

@@ -28,6 +28,7 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/rs/zerolog"
+	"golang.org/x/sync/errgroup"
 )
 
 const (
@@ -58,6 +59,9 @@ type Config struct {
 	VehicleNFTAddress common.Address
 	// Replicas for the decoded streams.
 	Replicas int
+	// StreamPartitions is the WAL partition count to consume (must match
+	// the publisher's NATS_STREAM_PARTITIONS).
+	StreamPartitions int
 }
 
 // Bridge consumes raw status/event messages and republishes decoded
@@ -112,14 +116,33 @@ func (b *Bridge) EnsureStreams(ctx context.Context) error {
 	return nil
 }
 
-// Run consumes INGEST_RAW status/event messages until ctx is canceled.
+// Run consumes status/event messages from every WAL partition until ctx is
+// canceled.
 func (b *Bridge) Run(ctx context.Context) error {
-	raw, err := b.js.Stream(ctx, stream.StreamName)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", stream.StreamName, err)
+	partitions := b.cfg.StreamPartitions
+	if partitions <= 0 {
+		partitions = 1
 	}
+	g, gctx := errgroup.WithContext(ctx)
+	for i := range partitions {
+		g.Go(func() error { return b.runPartition(gctx, i, partitions) })
+	}
+	return g.Wait()
+}
+
+func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) error {
+	streamName := stream.StreamNameFor(partition, partitions)
+	raw, err := b.js.Stream(ctx, streamName)
+	if err != nil {
+		return fmt.Errorf("opening %s: %w", streamName, err)
+	}
+	durable := consumerName
+	if partitions > 1 {
+		durable = fmt.Sprintf("%s-p%03d", consumerName, partition)
+	}
+	// Filters match any partition suffix: type/subject tokens come first.
 	cons, err := raw.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:   consumerName,
+		Durable:   durable,
 		AckPolicy: jetstream.AckExplicitPolicy,
 		AckWait:   time.Minute,
 		FilterSubjects: []string{
@@ -128,7 +151,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("creating %s consumer: %w", consumerName, err)
+		return fmt.Errorf("creating %s consumer: %w", durable, err)
 	}
 
 	for {

@@ -56,9 +56,9 @@ func setup(t *testing.T) (jetstream.JetStream, jetstream.Consumer) {
 	require.NoError(t, err)
 
 	ctx := context.Background()
-	s, err := stream.EnsureStream(ctx, js, stream.DefaultConfig())
+	streams, err := stream.EnsureStreams(ctx, js, stream.DefaultConfig())
 	require.NoError(t, err)
-	cons, err := s.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+	cons, err := streams[0].CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 		Durable:       "parquet-sink",
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       5 * time.Minute,
@@ -91,7 +91,7 @@ func TestSink_WritesPartitionedBundlesAndAcks(t *testing.T) {
 	store := newMemStore()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pub := stream.NewPublisher(js)
+	pub := stream.NewPublisher(js, 1)
 	day1 := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
 	day2 := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
 	require.NoError(t, pub.Publish(ctx, event("e1", "dimo.status", "did:erc721:137:0xA:1", day1)))
@@ -130,7 +130,7 @@ func TestSink_RowCountTriggerFlushesEarly(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	pub := stream.NewPublisher(js)
+	pub := stream.NewPublisher(js, 1)
 	ts := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
 	for i := range 10 {
 		ev := event("evt-"+string(rune('a'+i)), "dimo.status", "did:erc721:137:0xA:1", ts.Add(time.Duration(i)*time.Second))
@@ -158,7 +158,7 @@ func TestSink_ShutdownFlushesBuffered(t *testing.T) {
 	store := newMemStore()
 	ctx, cancel := context.WithCancel(context.Background())
 
-	pub := stream.NewPublisher(js)
+	pub := stream.NewPublisher(js, 1)
 	ts := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
 	require.NoError(t, pub.Publish(ctx, event("e-shutdown", "dimo.status", "did:erc721:137:0xA:1", ts)))
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // DefaultDecodedPrefix mirrors the dq materializer's default decoded layout
@@ -27,18 +28,43 @@ var ErrNoWatermark = errors.New("materializer watermark not found")
 // Watermark answers "may this file be compacted?" per partition.
 type Watermark map[string]string
 
-// LoadWatermark fetches the materializer cursor at key. Missing object
-// returns ErrNoWatermark wrapped so callers can skip the cycle cleanly.
-func LoadWatermark(ctx context.Context, store ObjectStore, key string) (Watermark, error) {
-	body, err := store.GetObject(ctx, key)
+// LoadWatermark merges every materializer cursor under
+// <decodedPrefix>_state/ (watermark.json for a single replica,
+// watermark-pNNNofMMM.json per shard when the materializer is sharded —
+// shards own disjoint partitions, so the maps never conflict; if they ever
+// do, the LOWER cursor wins, which only delays compaction). No cursor file
+// at all returns ErrNoWatermark so callers skip the cycle cleanly.
+func LoadWatermark(ctx context.Context, store ObjectStore, decodedPrefix string) (Watermark, error) {
+	statePrefix := decodedPrefix + "_state/watermark"
+	objects, err := store.List(ctx, statePrefix)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrNoWatermark, err)
+		return nil, fmt.Errorf("listing watermarks: %w", err)
 	}
-	var w Watermark
-	if err := json.Unmarshal(body, &w); err != nil {
-		return nil, fmt.Errorf("decoding watermark: %w", err)
+	merged := Watermark{}
+	found := false
+	for _, obj := range objects {
+		if !strings.HasSuffix(obj.Key, ".json") {
+			continue
+		}
+		body, err := store.GetObject(ctx, obj.Key)
+		if err != nil {
+			return nil, fmt.Errorf("reading watermark %s: %w", obj.Key, err)
+		}
+		var w Watermark
+		if err := json.Unmarshal(body, &w); err != nil {
+			return nil, fmt.Errorf("decoding watermark %s: %w", obj.Key, err)
+		}
+		found = true
+		for partition, cursor := range w {
+			if existing, ok := merged[partition]; !ok || cursor < existing {
+				merged[partition] = cursor
+			}
+		}
 	}
-	return w, nil
+	if !found {
+		return nil, fmt.Errorf("%w: no cursor files under %s", ErrNoWatermark, statePrefix)
+	}
+	return merged, nil
 }
 
 // Covers reports whether key (a full object key) is at or below the cursor

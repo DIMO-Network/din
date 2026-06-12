@@ -23,13 +23,13 @@ func TestSubject(t *testing.T) {
 	hdr := header("dimo.status", "did:erc721:137:0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF:42")
 	assert.Equal(t,
 		"in.raw.dimo_status.did:erc721:137:0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF:42",
-		Subject(hdr))
+		Subject(hdr, 1))
 }
 
 func TestSubject_SanitizesUnsafeRunes(t *testing.T) {
 	t.Parallel()
 	hdr := header("dimo.raw.v1/extra", "sub ject*with>stars")
-	got := Subject(hdr)
+	got := Subject(hdr, 1)
 	assert.Equal(t, "in.raw.dimo_raw_v1-extra.sub-ject-with-stars", got)
 	assert.NotContains(t, got[len("in.raw."):], "*")
 	assert.NotContains(t, got[len("in.raw."):], ">")
@@ -38,7 +38,7 @@ func TestSubject_SanitizesUnsafeRunes(t *testing.T) {
 func TestSubject_EmptySubject(t *testing.T) {
 	t.Parallel()
 	hdr := header("dimo.status", "")
-	assert.Equal(t, "in.raw.dimo_status.-", Subject(hdr))
+	assert.Equal(t, "in.raw.dimo_status.-", Subject(hdr, 1))
 }
 
 func TestSubjectFilters(t *testing.T) {

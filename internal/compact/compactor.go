@@ -49,10 +49,6 @@ type Config struct {
 	DecodedPrefix string
 }
 
-// watermarkKey locates the materializer cursor under the decoded prefix.
-func (c *Config) watermarkKey() string {
-	return c.DecodedPrefix + watermarkSuffix
-}
 
 func (c *Config) applyDefaults() {
 	if c.Root == "" {
@@ -152,7 +148,7 @@ func (c *Compactor) DrainDeletes() {
 
 // Cycle plans and executes one compaction pass across the lookback window.
 func (c *Compactor) Cycle(ctx context.Context) error {
-	watermark, err := LoadWatermark(ctx, c.store, c.cfg.watermarkKey())
+	watermark, err := LoadWatermark(ctx, c.store, c.cfg.DecodedPrefix)
 	if err != nil {
 		if errors.Is(err, ErrNoWatermark) {
 			c.log.Info().Msg("no materializer watermark yet; skipping cycle")

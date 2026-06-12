@@ -31,12 +31,17 @@ var ErrUnavailable = errors.New("jetstream publish not acknowledged")
 // Publisher writes raw cloudevents to the INGEST_RAW stream and waits for
 // the JetStream ack — the durability point of the ingest path.
 type Publisher struct {
-	js jetstream.JetStream
+	js         jetstream.JetStream
+	partitions int
 }
 
-// NewPublisher returns a Publisher on the given JetStream context.
-func NewPublisher(js jetstream.JetStream) *Publisher {
-	return &Publisher{js: js}
+// NewPublisher returns a Publisher routing to the given number of WAL
+// partitions (1 = the single historical stream).
+func NewPublisher(js jetstream.JetStream, partitions int) *Publisher {
+	if partitions <= 0 {
+		partitions = 1
+	}
+	return &Publisher{js: js, partitions: partitions}
 }
 
 // Publish sends one validated event and blocks until JetStream acks it or
@@ -49,7 +54,7 @@ func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) 
 	}
 
 	msg := &nats.Msg{
-		Subject: Subject(&event.CloudEventHeader),
+		Subject: Subject(&event.CloudEventHeader, p.partitions),
 		Data:    body,
 		Header: nats.Header{
 			nats.MsgIdHdr:   []string{MsgID(&event.CloudEventHeader)},

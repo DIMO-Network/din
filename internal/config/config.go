@@ -45,13 +45,16 @@ type Settings struct {
 	NATSURL      string
 	NATSStoreDir string
 	NATSReplicas int
+	// NATSStreamPartitions splits INGEST_RAW into N streams by subject
+	// hash. Changing it re-routes subjects; drain the old streams first.
+	NATSStreamPartitions int
 
 	// Storage.
 	ParquetBucket     string
 	BlobBucket        string
 	BlobPrefix        string
 	DecodedPrefix     string // must match dq materializer's DECODED_PREFIX
-	DocumentSizeLimit int // DOCUMENT_SIZE_THRESHOLD
+	DocumentSizeLimit int    // DOCUMENT_SIZE_THRESHOLD
 	S3Region          string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
@@ -135,6 +138,15 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	s.NATSReplicas = int(replicas)
+
+	parts, err := envUint("NATS_STREAM_PARTITIONS", 1)
+	if err != nil {
+		return s, err
+	}
+	if parts < 1 || parts > 256 {
+		return s, fmt.Errorf("NATS_STREAM_PARTITIONS must be 1..256, got %d", parts)
+	}
+	s.NATSStreamPartitions = int(parts)
 
 	s.DecodeStreamEnabled = envBool("DECODESTREAM_ENABLED", true)
 	s.CompactorEnabled = envBool("COMPACTOR_ENABLED", true)

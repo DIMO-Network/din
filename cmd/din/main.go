@@ -7,6 +7,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -80,7 +81,8 @@ func run(log zerolog.Logger) error {
 	}
 	streamCfg := stream.DefaultConfig()
 	streamCfg.Replicas = settings.NATSReplicas
-	rawStream, err := stream.EnsureStream(ctx, js, streamCfg)
+	streamCfg.Partitions = settings.NATSStreamPartitions
+	rawStreams, err := stream.EnsureStreams(ctx, js, streamCfg)
 	if err != nil {
 		return err
 	}
@@ -119,7 +121,7 @@ func run(log zerolog.Logger) error {
 		Converter:           converter,
 		Attest:              verifier,
 		Splitter:            split.New(blobStore, settings.BlobPrefix, settings.DocumentSizeLimit),
-		Publisher:           stream.NewPublisher(js),
+		Publisher:           stream.NewPublisher(js, settings.NATSStreamPartitions),
 		ValidateFingerprint: settings.FingerprintValidation,
 		Log:                 log,
 	}
@@ -151,23 +153,30 @@ func run(log zerolog.Logger) error {
 	}
 	opsSrv := server.NewOpsServer(server.OpsConfig{Addr: settings.OpsAddr})
 
-	// Sink consumer.
-	sinkConsumer, err := rawStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
-		Durable:       "parquet-sink",
-		AckPolicy:     jetstream.AckExplicitPolicy,
-		AckWait:       5 * time.Minute,
-		MaxAckPending: 250_000,
-	})
-	if err != nil {
-		return err
-	}
-
 	group, gctx := errgroup.WithContext(ctx)
 
 	group.Go(func() error { return serveHTTP(gctx, connectionSrv, true, log) })
 	group.Go(func() error { return serveHTTP(gctx, attestationSrv, false, log) })
 	group.Go(func() error { return serveHTTP(gctx, opsSrv, false, log) })
-	group.Go(func() error { return sink.New(sink.Config{}, sinkConsumer, store, log).Run(gctx) })
+
+	// One sink per WAL partition: disjoint subjects, independent flush
+	// pipelines — throughput scales with the partition count.
+	for i, rawStream := range rawStreams {
+		durable := "parquet-sink"
+		if len(rawStreams) > 1 {
+			durable = fmt.Sprintf("parquet-sink-p%03d", i)
+		}
+		sinkConsumer, err := rawStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
+			Durable:       durable,
+			AckPolicy:     jetstream.AckExplicitPolicy,
+			AckWait:       5 * time.Minute,
+			MaxAckPending: 250_000,
+		})
+		if err != nil {
+			return err
+		}
+		group.Go(func() error { return sink.New(sink.Config{}, sinkConsumer, store, log).Run(gctx) })
+	}
 
 	if settings.CompactorEnabled {
 		compactStore := &compactStoreAdapter{client: store}
@@ -180,6 +189,7 @@ func run(log zerolog.Logger) error {
 			ChainID:           settings.ChainID,
 			VehicleNFTAddress: settings.VehicleNFTAddress,
 			Replicas:          settings.NATSReplicas,
+			StreamPartitions:  settings.NATSStreamPartitions,
 		}, js, log)
 		if err := bridge.EnsureStreams(ctx); err != nil {
 			return err

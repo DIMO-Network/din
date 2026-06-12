@@ -1,31 +1,45 @@
 # din — DIMO Ingest Node
 
-Single Go binary replacing dis + dps + parquet-processor: HTTP ingest (mTLS + JWT) → NATS JetStream WAL → hive-partitioned raw cloudevent parquet on object storage, with self-compaction and an optional decoded-stream bridge for vehicle-triggers-api.
+Single Go binary replacing dis + dps + parquet-processor: HTTP ingest (mTLS + JWT) → NATS JetStream WAL → [DuckLake](https://ducklake.select) `raw_events` table (partitioned parquet on object storage, tracked by a SQL catalog), with built-in lake maintenance and an optional decoded-stream bridge for vehicle-triggers-api.
 
 ## Clone layout (required until cloudevent is released)
 
 din builds against a local cloudevent checkout via a `replace` directive. Clone them as siblings:
 
 ```bash
-git clone git@github.com:DIMO-Network/cloudevent.git && git -C cloudevent checkout feat/parquet-sort-zstd-bloom
+git clone git@github.com:DIMO-Network/cloudevent.git
 git clone git@github.com:DIMO-Network/din.git
 cd din && go build ./... && go test ./...
 ```
 
-## Storage backends
+Building needs CGO (the embedded DuckDB): a C/C++ toolchain must be present (`xcode-select --install` on macOS, `build-essential` on Debian). `duckdb-go` ships prebuilt static DuckDB bindings, so nothing else to install.
 
-The backend is inferred from the bucket settings — no separate switch:
+## Storage layout
 
-| Value | Backend |
-|---|---|
-| `my-bucket` | S3 (AWS credential chain or `S3_AWS_*` keys) |
-| `/data/pipeline` or `file:///data/pipeline` | Local filesystem |
+Raw events live in a DuckLake: parquet files under `LAKE_DATA_PATH`, tracked by the catalog database at `LAKE_CATALOG_DSN`. The catalog is the source of truth — which files exist, which snapshot they belong to, partition/sort metadata. Readers (dq) attach the same catalog read-only; never enumerate the data path directly.
 
-Relative paths are rejected at startup. Parquet and blob buckets pick their backends independently. Filesystem writes are crash-safe: temp file + fsync + atomic rename, so the durable-on-ack contract holds on disk like it does on S3.
+| Setting | Value | Meaning |
+|---|---|---|
+| `LAKE_CATALOG_DSN` | `postgres://…` | production: multi-process catalog |
+| | `/data/lake/meta.ducklake` | single-node/dev: local file catalog |
+| `LAKE_DATA_PATH` | `s3://bucket/lake/` or `/data/lake/data` | where parquet lands; **immutable once the catalog exists** |
+
+The table is partitioned by `(type, day(time))` and sorted by `(subject, time)`. Bundles smaller than DuckLake's inlining threshold are stored as catalog rows and materialized to parquet by maintenance.
+
+Blobs (>1MB payloads) keep their own bucket: `BLOB_BUCKET` is an S3 bucket name or absolute local path (filesystem writes are crash-safe: temp file + fsync + atomic rename).
+
+### Maintenance
+
+`ducklake_merge_adjacent_files` + snapshot expiry + file cleanup replace the old compactor, manifests, and watermark protocol. Merging preserves the snapshot change feed, so it needs no coordination with readers; the one contract left is `LAKE_SNAPSHOT_RETENTION` (default 72h), which must exceed the slowest consumer's lag.
+
+Run **exactly one** maintenance process per catalog:
+
+- single-node: `LAKE_MAINTENANCE_ENABLED=true` in the service (runs every `LAKE_MAINTENANCE_INTERVAL`, default 15m), or
+- multi-replica: the chart's `maintenance.enabled` CronJob runs `din maintain` (one cycle per invocation).
 
 ## Run it locally (verified single-node quickstart)
 
-No S3, no NATS cluster, no Kubernetes. You need a TLS keypair for the mTLS port (self-signed is fine locally — the cert CN plays the connection-license role):
+No S3, no Postgres, no NATS cluster, no Kubernetes. You need a TLS keypair for the mTLS port (self-signed is fine locally — the cert CN plays the connection-license role):
 
 ```bash
 D=$(mktemp -d)
@@ -33,7 +47,9 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 \
   -keyout $D/key.pem -out $D/cert.pem -days 365 -nodes -subj "/CN=0xYourConnLicense"
 
 NATS_MODE=embedded NATS_STORE_DIR=$D/nats \
-PARQUET_BUCKET=$D/pipeline BLOB_BUCKET=$D/pipeline-blobs \
+LAKE_CATALOG_DSN=$D/lake/meta.ducklake LAKE_DATA_PATH=$D/lake/data \
+LAKE_MAINTENANCE_ENABLED=true \
+BLOB_BUCKET=$D/pipeline-blobs \
 TLS_CERT_FILE=$D/cert.pem TLS_KEY_FILE=$D/key.pem TLS_CA_CERT_FILE=$D/cert.pem \
 RPC_URL=https://polygon-rpc.com \
 TOKEN_EXCHANGE_ISSUER=https://auth.dev.dimo.zone \
@@ -57,24 +73,39 @@ curl -sk --cert $D/cert.pem --key $D/key.pem https://localhost:9443 \
     "data":{"signals":[{"name":"speed","timestamp":"'$NOW'","value":42.5}]}}'
 ```
 
-A 200 means the event is JetStream-acked; within ~1 minute (sink `MaxAge`) the bundle lands at `$D/pipeline/raw/type=dimo.status/date=YYYY-MM-DD/ingest-*.parquet`. Point dq at the same root (`PARQUET_BUCKET=$D/pipeline`) for the query side.
+A 200 means the event is JetStream-acked; within ~1 minute (sink `MaxAge`) the row is committed to the lake. Query it with the DuckDB CLI:
 
-Scaling out is the same binary with S3 bucket names and an external NATS cluster (`NATS_MODE=external NATS_URL=...`) — object storage is the only shared state.
+```bash
+duckdb -c "INSTALL ducklake; ATTACH 'ducklake:$D/lake/meta.ducklake' AS lake (READ_ONLY); SELECT * FROM lake.raw_events;"
+```
+
+Scaling out is the same binary with a PostgreSQL `LAKE_CATALOG_DSN`, an S3 `LAKE_DATA_PATH`, and an external NATS cluster (`NATS_MODE=external NATS_URL=...`) — the catalog and object storage are the only shared state.
 
 ### Environment reference
 
 | Env | Required | Notes |
 |---|---|---|
-| `PARQUET_BUCKET` | yes | S3 bucket or absolute local path |
+| `LAKE_CATALOG_DSN` | yes | PostgreSQL DSN, or local catalog file path (single-node) |
+| `LAKE_DATA_PATH` | yes | `s3://bucket/prefix/` or absolute local path |
 | `BLOB_BUCKET` | yes | bucket/path for >1MB payloads |
 | `TLS_CERT_FILE` / `TLS_KEY_FILE` / `TLS_CA_CERT_FILE` | yes | mTLS device port :9443 |
 | `VEHICLE_NFT_ADDRESS` / `AFTERMARKET_NFT_ADDRESS` / `SYNTHETIC_NFT_ADDRESS` | yes | DID validation (values above = Polygon mainnet) |
 | `RPC_URL` | yes | attestation ERC-1271 checks |
 | `TOKEN_EXCHANGE_ISSUER` / `TOKEN_EXCHANGE_KEY_SET_URL` | yes | JWT auth on :9442 (dev dex shown above; prod: `https://auth.dimo.zone`) |
 | `NATS_MODE` | no | `embedded` (single-node) or `external` (default) + `NATS_URL` |
-| `COMPACTOR_ENABLED` / `DECODESTREAM_ENABLED` | no | both default true |
-| `DECODED_PREFIX` | no | default `decoded/v1/` — must match dq's |
+| `LAKE_MAINTENANCE_ENABLED` | no | default false; one maintenance process per catalog |
+| `LAKE_MAINTENANCE_INTERVAL` / `LAKE_SNAPSHOT_RETENTION` | no | defaults 15m / 72h; retention must exceed consumer lag |
+| `LAKE_MEMORY_LIMIT` / `LAKE_THREADS` / `LAKE_TARGET_FILE_SIZE` | no | DuckDB/DuckLake tuning (e.g. `1GB`, `4`, `512MB`) |
+| `LAKE_EXTENSION_DIR` | no | pre-baked DuckDB extensions (set in the container image) |
+| `DECODESTREAM_ENABLED` | no | default true |
 | `DIMO_REGISTRY_CHAIN_ID` | no | default 137 |
+
+### Subcommands
+
+```bash
+din maintain                          # one lake maintenance cycle (CronJob entrypoint)
+din install-duckdb-extensions <dir>   # bake extensions into the image at build time
+```
 
 ## Tests
 

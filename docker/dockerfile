@@ -7,10 +7,16 @@ WORKDIR /src
 COPY cloudevent/ ./cloudevent/
 COPY din/ ./din/
 WORKDIR /src/din
-RUN CGO_ENABLED=0 go build -o /din ./cmd/din
+# CGO for the embedded DuckDB (duckdb-go ships prebuilt static bindings).
+RUN CGO_ENABLED=1 go build -o /din ./cmd/din
+# Bake DuckDB extensions into the image so pods never download them.
+RUN /din install-duckdb-extensions /duckdb-extensions
 
-FROM gcr.io/distroless/static AS final
+# distroless/cc (not static): the DuckDB bindings link libstdc++.
+FROM gcr.io/distroless/cc AS final
 LABEL maintainer="DIMO <hello@dimo.zone>"
 USER nonroot:nonroot
 COPY --from=build --chown=nonroot:nonroot /din /
+COPY --from=build --chown=nonroot:nonroot /duckdb-extensions /duckdb-extensions
+ENV LAKE_EXTENSION_DIR=/duckdb-extensions
 ENTRYPOINT ["/din"]

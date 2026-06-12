@@ -1,8 +1,9 @@
-// perf_test.go measures din's write path on the filesystem backend: the
-// fsstore publish cost (fsync dominates small objects) and the full ingest
-// pipeline — HTTP POST → convert → JetStream ack → partition-batched sink →
-// durable parquet — in events per second. Local NVMe stands in for S3, so
-// these numbers are pipeline cost without network.
+// perf_test.go measures din's write path on local storage: the fsstore
+// publish cost (fsync dominates small objects) and the full ingest
+// pipeline — HTTP POST → convert → JetStream ack → batched sink → durable
+// DuckLake commit — in events per second. Local NVMe and a file catalog
+// stand in for S3 and Postgres, so these numbers are pipeline cost
+// without network.
 //
 // Run: go test ./tests/ -run TestIngestPerformance -v -perf
 package tests
@@ -21,10 +22,10 @@ import (
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
-	ceparquet "github.com/DIMO-Network/cloudevent/parquet"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/DIMO-Network/din/internal/natsembed"
 	"github.com/DIMO-Network/din/internal/sink"
 	"github.com/DIMO-Network/din/internal/split"
@@ -91,13 +92,14 @@ func TestIngestPerformance(t *testing.T) {
 	rawStreams, err := stream.EnsureStreams(ctx, js, stream.DefaultConfig())
 	require.NoError(t, err)
 
-	store, err := fsstore.New(t.TempDir())
+	lk := openTestLake(t)
+	blobStore, err := fsstore.New(t.TempDir())
 	require.NoError(t, err)
 	cfg := convert.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}
 
 	handlers := &handler.Handlers{
 		Converter: convert.NewConverter(zerolog.Nop(), cfg),
-		Splitter:  split.New(store, "cloudevent/blobs/", 1<<20),
+		Splitter:  split.New(blobStore, "cloudevent/blobs/", 1<<20),
 		Publisher: stream.NewPublisher(js, 1),
 		Log:       zerolog.Nop(),
 	}
@@ -109,10 +111,13 @@ func TestIngestPerformance(t *testing.T) {
 		AckWait: 5 * time.Minute, MaxAckPending: 250_000,
 	})
 	require.NoError(t, err)
+	writer, err := lk.NewWriter(ctx, lake.RawTable)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
 	sinkDone := make(chan struct{})
 	go func() {
 		defer close(sinkDone)
-		_ = sink.New(sink.Config{MaxAge: time.Second}, sinkConsumer, store, zerolog.Nop()).Run(ctx)
+		_ = sink.New(sink.Config{MaxAge: time.Second}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
 	}()
 
 	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: concurrency}}
@@ -162,27 +167,20 @@ func TestIngestPerformance(t *testing.T) {
 		posted.Load(), postDur.Round(time.Millisecond), rps, concurrency)
 
 	// Drain: cancel ctx so the sink flushes everything buffered, then count
-	// rows landed in parquet.
+	// rows committed to the lake.
 	cancel()
 	<-sinkDone
 	durableDur := time.Since(postStart)
 
-	objects, err := store.ListObjectsV2(context.Background(), "raw/type=dimo.status/")
-	require.NoError(t, err)
-	var rows int
-	var bytesTotal int64
-	for _, obj := range objects {
-		body, err := store.GetObject(context.Background(), obj.Key, 0)
-		require.NoError(t, err)
-		events, err := ceparquet.Decode(bytes.NewReader(body), int64(len(body)))
-		require.NoError(t, err)
-		rows += len(events)
-		bytesTotal += obj.Size
-	}
-	require.GreaterOrEqual(t, rows, totalEvents, "every acked event is durable (dedup may collapse, never lose)")
+	var rows, snapshots int
+	require.NoError(t, lk.DB().QueryRowContext(context.Background(),
+		"SELECT count(*) FROM lake.raw_events WHERE type = 'dimo.status'").Scan(&rows))
+	require.NoError(t, lk.DB().QueryRowContext(context.Background(),
+		"SELECT count(*) FROM lake.snapshots()").Scan(&snapshots))
+	require.GreaterOrEqual(t, rows, totalEvents, "every acked event is durable (redelivery may duplicate, never lose)")
 	eps := float64(totalEvents) / durableDur.Seconds()
-	t.Logf("durable: %d rows in %d bundles (%.1f MiB) %s after first POST — %.0f events/s end-to-end",
-		rows, len(objects), float64(bytesTotal)/(1<<20), durableDur.Round(time.Millisecond), eps)
+	t.Logf("durable: %d rows across %d snapshots %s after first POST — %.0f events/s end-to-end",
+		rows, snapshots, durableDur.Round(time.Millisecond), eps)
 
 	require.Greater(t, rps, 500.0, "perf gate: ingest must sustain >500 acked req/s")
 	require.Greater(t, eps, 500.0, "perf gate: end-to-end durable throughput must exceed 500 events/s")

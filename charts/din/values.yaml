@@ -35,7 +35,6 @@ env:
   NATS_MODE: external
   NATS_URL: nats://nats-dev:4222
   NATS_REPLICAS: '1'
-  COMPACTOR_ENABLED: 'true'
   DECODESTREAM_ENABLED: 'true'
   FINGERPRINT_VALIDATION: 'true'
   ALLOWABLE_TIME_SKEW: 5m
@@ -46,11 +45,20 @@ env:
   TOKEN_EXCHANGE_KEY_SET_URL: https://auth.dev.dimo.zone/keys
   TOKEN_EXCHANGE_ISSUER: https://auth.dev.dimo.zone
   DOCUMENT_SIZE_THRESHOLD: '1048576'
-  PARQUET_BUCKET: dimo-storage-dev
   BLOB_BUCKET: dimo-blob-storage-dev
   BLOB_PREFIX: cloudevent/blobs/
-  DECODED_PREFIX: decoded/v1/
   S3_AWS_REGION: us-east-2
+  # DuckLake: LAKE_CATALOG_DSN comes from the secret. DATA_PATH is
+  # immutable once the catalog exists — choose deliberately.
+  LAKE_DATA_PATH: s3://dimo-storage-dev/lake/
+  LAKE_MEMORY_LIMIT: 512MB
+  # Exactly one maintenance process per catalog: keep this on a single
+  # replica (or a dedicated deployment) — never with autoscaling > 1.
+  LAKE_MAINTENANCE_ENABLED: 'true'
+  LAKE_MAINTENANCE_INTERVAL: 15m
+  # Must exceed the slowest downstream consumer's lag (dq): expiring an
+  # unread snapshot truncates its change feed.
+  LAKE_SNAPSHOT_RETENTION: 72h
 service:
   type: ClusterIP
   ports:
@@ -127,6 +135,19 @@ tolerations: []
 affinity: {}
 podDisruptionBudget:
   minAvailable: 0
+# Lake maintenance CronJob (din maintain): use instead of
+# LAKE_MAINTENANCE_ENABLED whenever replicaCount > 1.
+maintenance:
+  enabled: false
+  schedule: '*/15 * * * *'
+  activeDeadlineSeconds: 840
+  resources:
+    limits:
+      cpu: '1'
+      memory: 1Gi
+    requests:
+      cpu: 100m
+      memory: 256Mi
 serviceMonitor:
   enabled: true
   path: /metrics

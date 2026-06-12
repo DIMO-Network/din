@@ -50,19 +50,34 @@ type Settings struct {
 	NATSStreamPartitions int
 
 	// Storage.
-	ParquetBucket     string
 	BlobBucket        string
 	BlobPrefix        string
-	DecodedPrefix     string // must match dq materializer's DECODED_PREFIX
-	DocumentSizeLimit int    // DOCUMENT_SIZE_THRESHOLD
+	DocumentSizeLimit int // DOCUMENT_SIZE_THRESHOLD
 	S3Region          string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3Endpoint        string
 
+	// DuckLake. The catalog database is PostgreSQL in production
+	// (multi-process writes) or a local file for dev/test; DataPath is
+	// where Parquet lands and is immutable once the catalog exists.
+	LakeCatalogDSN     string // LAKE_CATALOG_DSN
+	LakeDataPath       string // LAKE_DATA_PATH: s3://bucket/prefix/ or absolute path
+	LakeMemoryLimit    string // LAKE_MEMORY_LIMIT, e.g. "1GB"
+	LakeThreads        int    // LAKE_THREADS
+	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
+	LakeExtensionDir   string // LAKE_EXTENSION_DIR: pre-baked DuckDB extensions
+
+	// Lake maintenance (compaction, snapshot expiry, file cleanup).
+	// Run exactly one maintenance process per catalog. SnapshotKeep
+	// must exceed the slowest downstream consumer's lag: expiring a
+	// snapshot a consumer has not read truncates its change feed.
+	LakeMaintenanceEnabled bool          // LAKE_MAINTENANCE_ENABLED
+	LakeMaintInterval      time.Duration // LAKE_MAINTENANCE_INTERVAL
+	LakeSnapshotKeep       time.Duration // LAKE_SNAPSHOT_RETENTION
+
 	// Modules.
 	DecodeStreamEnabled bool
-	CompactorEnabled    bool
 
 	// Validation.
 	FingerprintValidation bool
@@ -86,10 +101,13 @@ func Load() (Settings, error) {
 		NATSMode:               env("NATS_MODE", "external"),
 		NATSURL:                env("NATS_URL", "nats://localhost:4222"),
 		NATSStoreDir:           env("NATS_STORE_DIR", "/data/nats"),
-		ParquetBucket:          os.Getenv("PARQUET_BUCKET"),
 		BlobBucket:             os.Getenv("BLOB_BUCKET"),
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
-		DecodedPrefix:          env("DECODED_PREFIX", "decoded/v1/"),
+		LakeCatalogDSN:         os.Getenv("LAKE_CATALOG_DSN"),
+		LakeDataPath:           os.Getenv("LAKE_DATA_PATH"),
+		LakeMemoryLimit:        os.Getenv("LAKE_MEMORY_LIMIT"),
+		LakeTargetFileSize:     os.Getenv("LAKE_TARGET_FILE_SIZE"),
+		LakeExtensionDir:       os.Getenv("LAKE_EXTENSION_DIR"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
 		S3SecretAccessKey:      os.Getenv("S3_AWS_SECRET_ACCESS_KEY"),
@@ -149,26 +167,52 @@ func Load() (Settings, error) {
 	s.NATSStreamPartitions = int(parts)
 
 	s.DecodeStreamEnabled = envBool("DECODESTREAM_ENABLED", true)
-	s.CompactorEnabled = envBool("COMPACTOR_ENABLED", true)
+	s.LakeMaintenanceEnabled = envBool("LAKE_MAINTENANCE_ENABLED", false)
 	s.FingerprintValidation = envBool("FINGERPRINT_VALIDATION", true)
+
+	threads, err := envUint("LAKE_THREADS", 0)
+	if err != nil {
+		return s, err
+	}
+	s.LakeThreads = int(threads)
+	if s.LakeMaintInterval, err = envDuration("LAKE_MAINTENANCE_INTERVAL", 15*time.Minute); err != nil {
+		return s, err
+	}
+	if s.LakeSnapshotKeep, err = envDuration("LAKE_SNAPSHOT_RETENTION", 72*time.Hour); err != nil {
+		return s, err
+	}
 
 	skew := env("ALLOWABLE_TIME_SKEW", "5m")
 	if s.AllowableTimeSkew, err = time.ParseDuration(skew); err != nil {
 		return s, fmt.Errorf("parsing ALLOWABLE_TIME_SKEW: %w", err)
 	}
 
-	if s.ParquetBucket == "" {
-		return s, errors.New("PARQUET_BUCKET is required (S3 bucket name or absolute local path)")
+	if s.LakeCatalogDSN == "" {
+		return s, errors.New("LAKE_CATALOG_DSN is required (PostgreSQL DSN, or a local catalog file path for single-node)")
 	}
-	// Buckets are either S3 names or absolute local paths; relative paths
-	// would silently resolve against the working directory (and dq's local
-	// detection would miss them), so reject them here.
-	for name, v := range map[string]string{"PARQUET_BUCKET": s.ParquetBucket, "BLOB_BUCKET": s.BlobBucket} {
+	if s.LakeDataPath == "" {
+		return s, errors.New("LAKE_DATA_PATH is required (s3://bucket/prefix/ or absolute local path)")
+	}
+	// Paths must be unambiguous: relative values would silently resolve
+	// against the working directory.
+	for name, v := range map[string]string{"LAKE_DATA_PATH": s.LakeDataPath, "BLOB_BUCKET": s.BlobBucket} {
 		if strings.HasPrefix(v, ".") {
-			return s, fmt.Errorf("%s must be an S3 bucket name or absolute path, got relative path %q", name, v)
+			return s, fmt.Errorf("%s must not be a relative path, got %q", name, v)
 		}
 	}
 	return s, nil
+}
+
+func envDuration(key string, def time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("parsing %s: %w", key, err)
+	}
+	return d, nil
 }
 
 // envAddress parses a required, non-zero Ethereum address. A zero address

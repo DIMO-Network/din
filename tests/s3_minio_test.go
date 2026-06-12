@@ -4,10 +4,12 @@
 //   - TestMinIO_S3ClientParity pins s3client semantics that the fsstore
 //     mirrors (lexicographic listing, key-prefix — not directory — list
 //     semantics, maxSize enforcement, quiet deletes of missing keys) on a
-//     real S3 implementation instead of the in-package fake.
-//   - TestMinIO_EndToEnd_DeviceToParquet runs the full ingest pipeline
-//     (device POST → JetStream → parquet sink) with the s3client store, so
-//     the bundle decode round trip is proven over the wire.
+//     real S3 implementation instead of the in-package fake. s3client
+//     serves the blob bucket.
+//   - TestMinIO_EndToEnd_DeviceToDuckLake runs the full ingest pipeline
+//     (device POST → JetStream → sink → DuckLake commit) with the lake's
+//     DATA_PATH on MinIO, then a maintenance cycle, proving the
+//     httpfs/secret wiring writes real parquet over the wire.
 //
 // Both skip when the minio binary is not on PATH or in -short mode, keeping
 // CI without MinIO green.
@@ -23,13 +25,16 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
-	ceparquet "github.com/DIMO-Network/cloudevent/parquet"
 	"github.com/DIMO-Network/din/internal/convert"
+	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/DIMO-Network/din/internal/natsembed"
 	"github.com/DIMO-Network/din/internal/s3client"
 	"github.com/DIMO-Network/din/internal/sink"
@@ -201,15 +206,29 @@ func TestMinIO_S3ClientParity(t *testing.T) {
 	require.Len(t, objects, 2, "only the two status objects remain")
 }
 
-// TestMinIO_EndToEnd_DeviceToParquet is the din e2e (device POST → convert →
-// split → JetStream → parquet sink) wired to the s3client store on MinIO
-// instead of fsstore: the raw bundle must land in the right hive partition
-// on real S3 and decode back to the original event.
-func TestMinIO_EndToEnd_DeviceToParquet(t *testing.T) {
+// TestMinIO_EndToEnd_DeviceToDuckLake is the din e2e (device POST → convert
+// → split → JetStream → sink → DuckLake commit) with the lake's DATA_PATH
+// on MinIO: the row must be queryable after ack, and a maintenance cycle
+// must materialize it to a parquet object on real S3 (small commits inline
+// into the catalog until maintenance flushes them).
+func TestMinIO_EndToEnd_DeviceToDuckLake(t *testing.T) {
 	endpoint := startMinIO(t)
 	const bucket = "din-e2e"
 	createMinIOBucket(t, endpoint, bucket)
-	store := e2eStore{Store: newMinIOClient(t, endpoint, bucket)}
+
+	lk, err := lake.Open(context.Background(), lake.Config{
+		CatalogDSN:        filepath.Join(t.TempDir(), "meta.ducklake"),
+		DataPath:          "s3://" + bucket + "/lake/",
+		S3Region:          minioRegion,
+		S3AccessKeyID:     minioCreds,
+		S3SecretAccessKey: minioCreds,
+		S3Endpoint:        endpoint,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lk.Close() })
+
+	blobStore, err := fsstore.New(t.TempDir())
+	require.NoError(t, err)
 
 	srv, err := natsembed.Run(natsembed.Config{StoreDir: t.TempDir()})
 	require.NoError(t, err)
@@ -231,7 +250,7 @@ func TestMinIO_EndToEnd_DeviceToParquet(t *testing.T) {
 
 	handlers := &handler.Handlers{
 		Converter: convert.NewConverter(zerolog.Nop(), cfg),
-		Splitter:  split.New(store, "cloudevent/blobs/", 1<<20),
+		Splitter:  split.New(blobStore, "cloudevent/blobs/", 1<<20),
 		Publisher: stream.NewPublisher(js, 1),
 		Log:       zerolog.Nop(),
 	}
@@ -242,8 +261,11 @@ func TestMinIO_EndToEnd_DeviceToParquet(t *testing.T) {
 		Durable: "parquet-sink-minio", AckPolicy: jetstream.AckExplicitPolicy, AckWait: 5 * time.Minute,
 	})
 	require.NoError(t, err)
+	writer, err := lk.NewWriter(ctx, lake.RawTable)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
 	go func() {
-		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, sinkConsumer, store, zerolog.Nop()).Run(ctx)
+		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
 	}()
 
 	// POST a default-module status payload as a device would.
@@ -270,19 +292,38 @@ func TestMinIO_EndToEnd_DeviceToParquet(t *testing.T) {
 	defer resp.Body.Close() //nolint:errcheck
 	require.Equal(t, http.StatusOK, resp.StatusCode, "device gets 200 only after JetStream ack")
 
-	// Raw parquet bundle lands in the right hive partition on MinIO.
-	wantPrefix := "raw/type=dimo.status/date=" + ts.Format("2006-01-02") + "/"
-	require.Eventually(t, func() bool { return len(store.keys(wantPrefix)) == 1 }, 10*time.Second, 100*time.Millisecond,
-		"sink must write exactly one bundle under %s", wantPrefix)
+	// The committed row is queryable through the lake.
+	require.Eventually(t, func() bool {
+		var n int
+		err := lk.DB().QueryRowContext(ctx, "SELECT count(*) FROM lake.raw_events").Scan(&n)
+		return err == nil && n == 1
+	}, 10*time.Second, 100*time.Millisecond)
 
-	bundleKey := store.keys(wantPrefix)[0]
-	body := store.get(bundleKey)
-	require.NotEmpty(t, body, "bundle %s must be fetchable from MinIO", bundleKey)
-	events, err := ceparquet.Decode(bytes.NewReader(body), int64(len(body)))
-	require.NoError(t, err, "bundle fetched from MinIO must decode")
-	require.Len(t, events, 1)
-	assert.Equal(t, subject, events[0].Subject)
-	assert.Equal(t, "device-msg-minio-1", events[0].ID)
+	var gotSubject, gotID, gotData string
+	require.NoError(t, lk.DB().QueryRowContext(ctx,
+		`SELECT subject, id, data FROM lake.raw_events WHERE type = 'dimo.status'`).
+		Scan(&gotSubject, &gotID, &gotData))
+	assert.Equal(t, subject, gotSubject)
+	assert.Equal(t, "device-msg-minio-1", gotID)
 	assert.JSONEq(t, `{"signals":[{"name":"speed","timestamp":"`+ts.Format(time.RFC3339Nano)+`","value":72.5}]}`,
-		string(events[0].Data), "raw payload stored verbatim on S3 — parse-on-read source of truth")
+		gotData, "raw payload stored verbatim — parse-on-read source of truth")
+
+	// Maintenance materializes the inlined row to parquet on MinIO.
+	require.NoError(t, lake.NewMaintainer(lk, lake.MaintConfig{}, zerolog.Nop()).Cycle(ctx))
+
+	s3Client := newMinIOClient(t, endpoint, bucket)
+	objects, err := s3Client.ListObjectsV2(ctx, "lake/")
+	require.NoError(t, err)
+	var parquetKeys []string
+	for _, obj := range objects {
+		if strings.HasSuffix(obj.Key, ".parquet") {
+			parquetKeys = append(parquetKeys, obj.Key)
+		}
+	}
+	require.NotEmpty(t, parquetKeys, "maintenance must write parquet to the lake DATA_PATH on MinIO")
+
+	var n int
+	require.NoError(t, lk.DB().QueryRowContext(ctx,
+		"SELECT count(*) FROM lake.raw_events").Scan(&n))
+	assert.Equal(t, 1, n, "row survives materialization")
 }

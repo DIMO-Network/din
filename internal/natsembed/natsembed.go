@@ -20,6 +20,10 @@ type Config struct {
 	Port int
 	// StartTimeout bounds how long to wait for the server to come up.
 	StartTimeout time.Duration
+	// MaxStore overrides JetStream's storage capacity. Zero keeps the
+	// server's disk-based default. Tests set this high so stream
+	// MaxBytes reservations don't fail on nearly-full dev disks.
+	MaxStore int64
 }
 
 // Run starts an embedded nats-server and blocks until it is ready.
@@ -39,6 +43,9 @@ func Run(cfg Config) (*natsserver.Server, error) {
 		Port:      cfg.Port,
 		// The embedded server is reached in-process; do not advertise.
 		NoSigs: true,
+	}
+	if cfg.MaxStore > 0 {
+		opts.JetStreamMaxStore = cfg.MaxStore
 	}
 	if cfg.Port == 0 {
 		opts.DontListen = true

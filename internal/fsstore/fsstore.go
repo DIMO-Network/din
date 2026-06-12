@@ -22,7 +22,6 @@ import (
 	"strings"
 
 	"github.com/DIMO-Network/din/internal/objstore"
-	"github.com/DIMO-Network/din/internal/sink"
 	"github.com/DIMO-Network/din/internal/split"
 )
 
@@ -31,7 +30,6 @@ import (
 var (
 	_ objstore.Store    = (*Client)(nil)
 	_ split.ObjectStore = (*Client)(nil)
-	_ sink.ObjectPutter = (*Client)(nil)
 )
 
 // tempPrefix marks in-flight writes; List hides any dot-named entry.

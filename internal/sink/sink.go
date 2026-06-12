@@ -1,7 +1,8 @@
 // Package sink consumes the INGEST_RAW stream and persists raw cloudevents
-// as hive-partitioned parquet bundles. Messages are acknowledged only after
-// the bundle containing them is durably stored, giving at-least-once
-// delivery end to end; duplicates die in compaction and in dq's dedup.
+// into the DuckLake raw_events table. Messages are acknowledged only after
+// the bundle containing them is durably committed, giving at-least-once
+// delivery end to end; duplicate rows from redelivery die in readers'
+// dedup (DuckLake compaction does not deduplicate).
 package sink
 
 import (
@@ -12,44 +13,49 @@ import (
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
-	"github.com/DIMO-Network/din/internal/pqwrite"
 	"github.com/DIMO-Network/din/internal/stream"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog"
 )
 
-// ObjectPutter stores one object. Implemented by s3client.
-type ObjectPutter interface {
-	PutObject(ctx context.Context, key string, body []byte) error
+// BundleWriter durably persists one batch of events; once it returns,
+// acking the batch's messages is safe. Implemented by lake.Writer.
+type BundleWriter interface {
+	WriteBundle(ctx context.Context, events []cloudevent.StoredEvent) error
 }
 
-// Config tunes batching. Zero values take the plan defaults.
+// redeliveries counts messages seen more than once. Redelivered rows can
+// land in two committed bundles and persist as duplicates, so this is the
+// observable bound on duplicate volume.
+var redeliveries = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "din_sink_redeliveries_total",
+	Help: "JetStream messages delivered to the sink more than once.",
+})
+
+// Config tunes batching. Zero values take the defaults.
 type Config struct {
-	// RootPrefix is the partition root, normally pqwrite.RawPrefix.
-	RootPrefix string
-	// MaxRowsPerFlush flushes a partition buffer at this row count.
+	// MaxRowsPerFlush flushes the buffer at this row count.
 	MaxRowsPerFlush int
-	// MaxBytesPerFlush flushes a partition buffer at this accumulated
-	// payload size (pre-compression estimate).
+	// MaxBytesPerFlush flushes the buffer at this accumulated payload
+	// size. DuckLake splits each bundle across partitions itself, so a
+	// single buffer needs no per-partition cap.
 	MaxBytesPerFlush int
-	// MaxAge flushes a partition buffer this long after its first event.
+	// MaxAge flushes the buffer this long after its first event.
 	MaxAge time.Duration
-	// GlobalMaxBytes caps memory across all partition buffers; exceeding it
-	// flushes the largest buffer immediately.
-	GlobalMaxBytes int
-	// Workers is the number of concurrent flush workers.
+	// Workers is the number of flush workers. Bundles serialize on the
+	// writer's connection; extra workers only deepen the queue between
+	// fetching and committing.
 	Workers int
 	// FetchBatch is the max messages per JetStream fetch.
 	FetchBatch int
-	// DrainTimeout bounds the shutdown flush. Past it, in-flight PUTs are
-	// canceled and their messages redeliver (at-least-once holds).
+	// DrainTimeout bounds the shutdown flush. Past it, in-flight commits
+	// are canceled and their messages redeliver (at-least-once holds).
 	DrainTimeout time.Duration
 }
 
 func (c *Config) applyDefaults() {
-	if c.RootPrefix == "" {
-		c.RootPrefix = pqwrite.RawPrefix
-	}
 	if c.MaxRowsPerFlush == 0 {
 		c.MaxRowsPerFlush = 100_000
 	}
@@ -59,11 +65,8 @@ func (c *Config) applyDefaults() {
 	if c.MaxAge == 0 {
 		c.MaxAge = time.Minute
 	}
-	if c.GlobalMaxBytes == 0 {
-		c.GlobalMaxBytes = 512 << 20
-	}
 	if c.Workers == 0 {
-		c.Workers = 4
+		c.Workers = 2
 	}
 	if c.FetchBatch == 0 {
 		c.FetchBatch = 1000
@@ -77,12 +80,11 @@ func (c *Config) applyDefaults() {
 type Sink struct {
 	cfg      Config
 	consumer jetstream.Consumer
-	store    ObjectPutter
+	writer   BundleWriter
 	log      zerolog.Logger
 
-	// buffers is owned by the Run goroutine; no locking needed.
-	buffers map[pqwrite.PartitionKey]*partitionBuffer
-	total   int
+	// buffer is owned by the Run goroutine; no locking needed.
+	buffer *eventBuffer
 
 	jobs chan flushJob
 	wg   sync.WaitGroup
@@ -91,7 +93,7 @@ type Sink struct {
 	drainDeadline time.Time
 }
 
-type partitionBuffer struct {
+type eventBuffer struct {
 	events  []cloudevent.StoredEvent
 	msgs    []jetstream.Msg
 	bytes   int
@@ -99,20 +101,18 @@ type partitionBuffer struct {
 }
 
 type flushJob struct {
-	partition pqwrite.PartitionKey
-	events    []cloudevent.StoredEvent
-	msgs      []jetstream.Msg
+	events []cloudevent.StoredEvent
+	msgs   []jetstream.Msg
 }
 
-// New constructs a Sink reading from consumer and writing via store.
-func New(cfg Config, consumer jetstream.Consumer, store ObjectPutter, log zerolog.Logger) *Sink {
+// New constructs a Sink reading from consumer and committing via writer.
+func New(cfg Config, consumer jetstream.Consumer, writer BundleWriter, log zerolog.Logger) *Sink {
 	cfg.applyDefaults()
 	return &Sink{
 		cfg:      cfg,
 		consumer: consumer,
-		store:    store,
+		writer:   writer,
 		log:      log.With().Str("component", "sink").Logger(),
-		buffers:  make(map[pqwrite.PartitionKey]*partitionBuffer),
 		jobs:     make(chan flushJob, cfg.Workers*8),
 	}
 }
@@ -120,8 +120,9 @@ func New(cfg Config, consumer jetstream.Consumer, store ObjectPutter, log zerolo
 // Run processes messages until ctx is canceled, then flushes everything
 // still buffered and drains the workers.
 func (s *Sink) Run(ctx context.Context) error {
-	// Workers outlive ctx so the shutdown flush below can still PUT, but
-	// cancelWorkers bounds them: a hung S3 call must not block exit forever.
+	// Workers outlive ctx so the shutdown flush below can still commit,
+	// but cancelWorkers bounds them: a hung commit must not block exit
+	// forever.
 	workerCtx, cancelWorkers := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelWorkers()
 	for range s.cfg.Workers {
@@ -152,10 +153,10 @@ loop:
 	}
 	fetchErr = <-fetchDone
 
-	// Shutdown: flush every remaining buffer, then wait for workers so all
+	// Shutdown: flush the remaining buffer, then wait for workers so all
 	// acks land before the process exits — but only up to DrainTimeout
-	// TOTAL (one shared deadline, not per buffer), so a wedged PUT can't
-	// hang shutdown (unflushed messages just redeliver).
+	// TOTAL (one shared deadline), so a wedged commit can't hang
+	// shutdown (unflushed messages just redeliver).
 	s.drainDeadline = time.Now().Add(s.cfg.DrainTimeout)
 	s.flushReady(true)
 	close(s.jobs)
@@ -204,8 +205,8 @@ func (s *Sink) fetchLoop(ctx context.Context, out chan<- jetstream.Msg, done cha
 	}
 }
 
-// add decodes one message into its partition buffer. Undecodable messages
-// are terminated: redelivery cannot fix them and they must not block acks.
+// add decodes one message into the buffer. Undecodable messages are
+// terminated: redelivery cannot fix them and they must not block acks.
 func (s *Sink) add(msg jetstream.Msg) {
 	event, err := stream.ParseMsg(msg.Headers(), msg.Data())
 	if err != nil {
@@ -215,56 +216,41 @@ func (s *Sink) add(msg jetstream.Msg) {
 		}
 		return
 	}
-
-	key := pqwrite.PartitionFor(&event.CloudEventHeader)
-	buf := s.buffers[key]
-	if buf == nil {
-		buf = &partitionBuffer{firstAt: time.Now()}
-		s.buffers[key] = buf
+	if meta, err := msg.Metadata(); err == nil && meta.NumDelivered > 1 {
+		redeliveries.Inc()
 	}
-	buf.events = append(buf.events, event)
-	buf.msgs = append(buf.msgs, msg)
-	buf.bytes += len(msg.Data())
-	s.total += len(msg.Data())
+
+	if s.buffer == nil {
+		s.buffer = &eventBuffer{firstAt: time.Now()}
+	}
+	s.buffer.events = append(s.buffer.events, event)
+	s.buffer.msgs = append(s.buffer.msgs, msg)
+	s.buffer.bytes += len(msg.Data())
 }
 
-// flushReady enqueues every buffer that hit a trigger (or all of them when
-// force is set), then keeps evicting the largest remaining buffer while the
-// global cap is exceeded. Enqueues never block the Run goroutine: when the
-// workers are saturated the buffer stays in place and retries next tick —
-// blocking here would stall JetStream fetching behind a slow object store
-// and let buffered bytes grow without bound.
+// flushReady enqueues the buffer once it hits a trigger (or always when
+// force is set). Enqueues never block the Run goroutine: when the workers
+// are saturated the buffer stays in place and retries next tick —
+// blocking here would stall JetStream fetching behind a slow commit and
+// let buffered bytes grow without bound.
 func (s *Sink) flushReady(force bool) {
-	for key, buf := range s.buffers {
-		if force ||
-			len(buf.events) >= s.cfg.MaxRowsPerFlush ||
-			buf.bytes >= s.cfg.MaxBytesPerFlush ||
-			time.Since(buf.firstAt) >= s.cfg.MaxAge {
-			if !s.enqueue(key, buf, force) {
-				return // workers saturated; everything else retries next tick
-			}
-		}
+	buf := s.buffer
+	if buf == nil || len(buf.events) == 0 {
+		return
 	}
-
-	for s.total > s.cfg.GlobalMaxBytes {
-		var largest pqwrite.PartitionKey
-		largestBytes := -1
-		for key, buf := range s.buffers {
-			if buf.bytes > largestBytes {
-				largest, largestBytes = key, buf.bytes
-			}
-		}
-		if largestBytes <= 0 || !s.enqueue(largest, s.buffers[largest], force) {
-			return
-		}
+	if force ||
+		len(buf.events) >= s.cfg.MaxRowsPerFlush ||
+		buf.bytes >= s.cfg.MaxBytesPerFlush ||
+		time.Since(buf.firstAt) >= s.cfg.MaxAge {
+		s.enqueue(buf, force)
 	}
 }
 
-// enqueue hands one buffer to the flush workers. Non-blocking by default;
-// the shutdown drain (block=true) waits up to DrainTimeout per buffer so a
-// wedged store can't hang exit — whatever doesn't flush redelivers.
-func (s *Sink) enqueue(key pqwrite.PartitionKey, buf *partitionBuffer, block bool) bool {
-	job := flushJob{partition: key, events: buf.events, msgs: buf.msgs}
+// enqueue hands the buffer to the flush workers. Non-blocking by default;
+// the shutdown drain (block=true) waits up to the drain deadline so a
+// wedged writer can't hang exit — whatever doesn't flush redelivers.
+func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
+	job := flushJob{events: buf.events, msgs: buf.msgs}
 	if block {
 		wait := time.Until(s.drainDeadline)
 		if wait <= 0 {
@@ -284,8 +270,7 @@ func (s *Sink) enqueue(key pqwrite.PartitionKey, buf *partitionBuffer, block boo
 			return false
 		}
 	}
-	delete(s.buffers, key)
-	s.total -= buf.bytes
+	s.buffer = nil
 	return true
 }
 
@@ -296,28 +281,20 @@ func (s *Sink) worker(ctx context.Context) {
 	}
 }
 
-// flush encodes and stores one bundle, then acks its messages. On failure
-// nothing is acked: JetStream redelivers and the rows land in a later
-// bundle (at-least-once).
+// flush commits one bundle, then acks its messages. On failure nothing is
+// acked: JetStream redelivers and the rows land in a later bundle
+// (at-least-once).
 func (s *Sink) flush(ctx context.Context, job flushJob) {
-	objectKey := pqwrite.NewIngestObjectKey(s.cfg.RootPrefix, job.partition, time.Now())
-
-	body, err := pqwrite.Encode(job.events, objectKey)
-	if err != nil {
-		s.log.Error().Err(err).Str("key", objectKey).Int("events", len(job.events)).
-			Msg("encoding bundle failed; messages left for redelivery")
-		return
-	}
-	if err := s.store.PutObject(ctx, objectKey, body); err != nil {
-		s.log.Error().Err(err).Str("key", objectKey).
-			Msg("storing bundle failed; messages left for redelivery")
+	if err := s.writer.WriteBundle(ctx, job.events); err != nil {
+		s.log.Error().Err(err).Int("events", len(job.events)).
+			Msg("committing bundle failed; messages left for redelivery")
 		return
 	}
 
 	for _, msg := range job.msgs {
 		if err := msg.Ack(); err != nil {
-			s.log.Warn().Err(err).Msg("ack failed after successful store; duplicate rows possible")
+			s.log.Warn().Err(err).Msg("ack failed after successful commit; duplicate rows possible")
 		}
 	}
-	s.log.Info().Str("key", objectKey).Int("events", len(job.events)).Msg("bundle stored")
+	s.log.Info().Int("events", len(job.events)).Msg("bundle committed")
 }

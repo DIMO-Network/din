@@ -1,16 +1,14 @@
 package sink_test
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"strings"
+	"errors"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
-	ceparquet "github.com/DIMO-Network/cloudevent/parquet"
 	"github.com/DIMO-Network/din/internal/natsembed"
 	"github.com/DIMO-Network/din/internal/sink"
 	"github.com/DIMO-Network/din/internal/stream"
@@ -20,28 +18,46 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type memStore struct {
+// memWriter records committed bundles; failures are injectable to test
+// the no-ack-on-error path.
+type memWriter struct {
 	mu      sync.Mutex
-	objects map[string][]byte
+	bundles [][]cloudevent.StoredEvent
+	fail    error
 }
 
-func newMemStore() *memStore { return &memStore{objects: map[string][]byte{}} }
-
-func (m *memStore) PutObject(_ context.Context, key string, body []byte) error {
+func (m *memWriter) WriteBundle(_ context.Context, events []cloudevent.StoredEvent) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.objects[key] = append([]byte(nil), body...)
+	if m.fail != nil {
+		return m.fail
+	}
+	m.bundles = append(m.bundles, append([]cloudevent.StoredEvent(nil), events...))
 	return nil
 }
 
-func (m *memStore) snapshot() map[string][]byte {
+func (m *memWriter) setFail(err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := make(map[string][]byte, len(m.objects))
-	for k, v := range m.objects {
-		out[k] = v
-	}
+	m.fail = err
+}
+
+func (m *memWriter) snapshot() [][]cloudevent.StoredEvent {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([][]cloudevent.StoredEvent, len(m.bundles))
+	copy(out, m.bundles)
 	return out
+}
+
+func (m *memWriter) totalEvents() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, b := range m.bundles {
+		n += len(b)
+	}
+	return n
 }
 
 func setup(t *testing.T) (jetstream.JetStream, jetstream.Consumer) {
@@ -85,10 +101,10 @@ func event(id, ceType, subject string, ts time.Time) *cloudevent.StoredEvent {
 	}
 }
 
-func TestSink_WritesPartitionedBundlesAndAcks(t *testing.T) {
+func TestSink_CommitsBundleAndAcks(t *testing.T) {
 	t.Parallel()
 	js, cons := setup(t)
-	store := newMemStore()
+	writer := &memWriter{}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	pub := stream.NewPublisher(js, 1)
@@ -98,35 +114,35 @@ func TestSink_WritesPartitionedBundlesAndAcks(t *testing.T) {
 	require.NoError(t, pub.Publish(ctx, event("e2", "dimo.status", "did:erc721:137:0xA:1", day2)))
 	require.NoError(t, pub.Publish(ctx, event("e3", "dimo.fingerprint", "did:erc721:137:0xB:2", day2)))
 
-	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, cons, store, zerolog.Nop())
+	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, cons, writer, zerolog.Nop())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
-	require.Eventually(t, func() bool { return len(store.snapshot()) >= 3 }, 10*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool { return writer.totalEvents() == 3 }, 10*time.Second, 50*time.Millisecond)
 	cancel()
 	require.NoError(t, <-done)
 
-	objects := store.snapshot()
-	require.Len(t, objects, 3, "one bundle per (type,date) partition")
-
-	var prefixes []string
-	for key, body := range objects {
-		prefixes = append(prefixes, key)
-		events, err := ceparquet.Decode(bytes.NewReader(body), int64(len(body)))
-		require.NoError(t, err)
-		require.NotEmpty(t, events)
-		assert.True(t, strings.HasSuffix(key, ".parquet"))
+	// Mixed types and days ride in one bundle — partition splitting is
+	// DuckLake's job, not the sink's.
+	ids := map[string]bool{}
+	for _, bundle := range writer.snapshot() {
+		for _, ev := range bundle {
+			ids[ev.ID] = true
+		}
 	}
-	joined := strings.Join(prefixes, "\n")
-	assert.Contains(t, joined, "raw/type=dimo.status/date=2026-06-08/ingest-")
-	assert.Contains(t, joined, "raw/type=dimo.status/date=2026-06-09/ingest-")
-	assert.Contains(t, joined, "raw/type=dimo.fingerprint/date=2026-06-09/ingest-")
+	assert.Equal(t, map[string]bool{"e1": true, "e2": true, "e3": true}, ids)
+
+	// Everything acked: a fresh consumer fetch returns nothing.
+	info, err := cons.Info(context.Background())
+	require.NoError(t, err)
+	assert.Zero(t, info.NumAckPending, "all messages acked after commit")
+	assert.Zero(t, info.NumPending)
 }
 
 func TestSink_RowCountTriggerFlushesEarly(t *testing.T) {
 	t.Parallel()
 	js, cons := setup(t)
-	store := newMemStore()
+	writer := &memWriter{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -138,16 +154,12 @@ func TestSink_RowCountTriggerFlushesEarly(t *testing.T) {
 	}
 
 	// MaxAge long; only the row trigger can flush.
-	s := sink.New(sink.Config{MaxRowsPerFlush: 10, MaxAge: time.Hour}, cons, store, zerolog.Nop())
+	s := sink.New(sink.Config{MaxRowsPerFlush: 10, MaxAge: time.Hour}, cons, writer, zerolog.Nop())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
-	require.Eventually(t, func() bool { return len(store.snapshot()) == 1 }, 10*time.Second, 50*time.Millisecond)
-	for _, body := range store.snapshot() {
-		events, err := ceparquet.Decode(bytes.NewReader(body), int64(len(body)))
-		require.NoError(t, err)
-		assert.Len(t, events, 10)
-	}
+	require.Eventually(t, func() bool { return len(writer.snapshot()) == 1 }, 10*time.Second, 50*time.Millisecond)
+	assert.Len(t, writer.snapshot()[0], 10)
 	cancel()
 	require.NoError(t, <-done)
 }
@@ -155,7 +167,7 @@ func TestSink_RowCountTriggerFlushesEarly(t *testing.T) {
 func TestSink_ShutdownFlushesBuffered(t *testing.T) {
 	t.Parallel()
 	js, cons := setup(t)
-	store := newMemStore()
+	writer := &memWriter{}
 	ctx, cancel := context.WithCancel(context.Background())
 
 	pub := stream.NewPublisher(js, 1)
@@ -163,7 +175,7 @@ func TestSink_ShutdownFlushesBuffered(t *testing.T) {
 	require.NoError(t, pub.Publish(ctx, event("e-shutdown", "dimo.status", "did:erc721:137:0xA:1", ts)))
 
 	// Triggers far away: only shutdown can flush.
-	s := sink.New(sink.Config{MaxAge: time.Hour, MaxRowsPerFlush: 1 << 20}, cons, store, zerolog.Nop())
+	s := sink.New(sink.Config{MaxAge: time.Hour, MaxRowsPerFlush: 1 << 20}, cons, writer, zerolog.Nop())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
@@ -172,5 +184,34 @@ func TestSink_ShutdownFlushesBuffered(t *testing.T) {
 	cancel()
 	require.NoError(t, <-done)
 
-	require.Len(t, store.snapshot(), 1, "shutdown must flush buffered events")
+	require.Equal(t, 1, writer.totalEvents(), "shutdown must flush buffered events")
+}
+
+func TestSink_FailedCommitLeavesMessagesUnacked(t *testing.T) {
+	t.Parallel()
+	js, cons := setup(t)
+	writer := &memWriter{}
+	writer.setFail(errors.New("catalog down"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pub := stream.NewPublisher(js, 1)
+	ts := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
+	require.NoError(t, pub.Publish(ctx, event("e-fail", "dimo.status", "did:erc721:137:0xA:1", ts)))
+
+	s := sink.New(sink.Config{MaxAge: 100 * time.Millisecond}, cons, writer, zerolog.Nop())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	// The flush fails; the message must stay pending (unacked).
+	require.Eventually(t, func() bool {
+		info, err := cons.Info(context.Background())
+		return err == nil && info.NumAckPending == 1
+	}, 10*time.Second, 50*time.Millisecond)
+
+	// Writer recovers; redelivery (AckWait) would eventually land it.
+	// Don't wait for the 5m AckWait — just confirm nothing was committed.
+	assert.Zero(t, writer.totalEvents())
+	cancel()
+	require.NoError(t, <-done)
 }

@@ -13,8 +13,12 @@ env:
   SYNTHETIC_NFT_ADDRESS: '0x4804e8D1661cd1a1e5dDdE1ff458A7f878c0aC6D'
   TOKEN_EXCHANGE_KEY_SET_URL: https://auth.dimo.zone/keys
   TOKEN_EXCHANGE_ISSUER: https://auth.dimo.zone
-  PARQUET_BUCKET: dimo-storage-prod
   BLOB_BUCKET: dimo-blob-storage-prod
+  LAKE_DATA_PATH: s3://dimo-storage-prod/lake/
+  LAKE_MEMORY_LIMIT: 1GB
+  # replicaCount is 2: maintenance must not run in the ingest pods —
+  # the maintenance CronJob below is the one maintenance process.
+  LAKE_MAINTENANCE_ENABLED: 'false'
 ingress:
   enabled: true
   className: nginx-direct
@@ -44,3 +48,5 @@ resources:
     memory: 512Mi
 autoscaling:
   enabled: false
+maintenance:
+  enabled: true

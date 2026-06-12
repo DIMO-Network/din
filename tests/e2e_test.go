@@ -1,6 +1,6 @@
 // Package tests exercises the full ingest path in-process: HTTP handler →
-// convert → split → JetStream → parquet sink → bundle on the object store,
-// plus the decodestream bridge feeding triggers-compatible subjects.
+// convert → split → JetStream → sink → DuckLake raw_events table, plus the
+// decodestream bridge feeding triggers-compatible subjects.
 package tests
 
 import (
@@ -10,17 +10,17 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
-	ceparquet "github.com/DIMO-Network/cloudevent/parquet"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/decodestream"
 	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/DIMO-Network/din/internal/natsembed"
-	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/DIMO-Network/din/internal/server"
 	"github.com/DIMO-Network/din/internal/sink"
 	"github.com/DIMO-Network/din/internal/split"
@@ -35,38 +35,18 @@ import (
 
 var vehicleNFT = common.HexToAddress("0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF")
 
-// e2eStore wraps a production object store (fsstore here, s3client in the
-// MinIO suite) with the listing/fetch helpers the e2e assertions use, so the
-// e2e proves the sink → store → parquet decode round trip on a real backend.
-type e2eStore struct {
-	objstore.Store
-}
-
-func newE2EStore(t *testing.T) e2eStore {
+// openTestLake opens a Lake on a local file catalog — the same code path
+// production uses, minus Postgres and S3.
+func openTestLake(t *testing.T) *lake.Lake {
 	t.Helper()
-	c, err := fsstore.New(t.TempDir())
+	dir := t.TempDir()
+	l, err := lake.Open(context.Background(), lake.Config{
+		CatalogDSN: filepath.Join(dir, "meta.ducklake"),
+		DataPath:   filepath.Join(dir, "data"),
+	})
 	require.NoError(t, err)
-	return e2eStore{Store: c}
-}
-
-func (s e2eStore) keys(prefix string) []string {
-	objects, err := s.ListObjectsV2(context.Background(), prefix)
-	if err != nil {
-		return nil
-	}
-	out := make([]string, len(objects))
-	for i, obj := range objects {
-		out[i] = obj.Key
-	}
-	return out
-}
-
-func (s e2eStore) get(key string) []byte {
-	body, err := s.GetObject(context.Background(), key, 0)
-	if err != nil {
-		return nil
-	}
-	return body
+	t.Cleanup(func() { _ = l.Close() })
+	return l
 }
 
 // sourceInjector simulates the mTLS middleware: every request carries the
@@ -77,8 +57,8 @@ func sourceInjector(source string, next http.Handler) http.Handler {
 	})
 }
 
-func TestEndToEnd_DeviceToParquetAndTriggers(t *testing.T) {
-	srv, err := natsembed.Run(natsembed.Config{StoreDir: t.TempDir()})
+func TestEndToEnd_DeviceToDuckLakeAndTriggers(t *testing.T) {
+	srv, err := natsembed.Run(natsembed.Config{StoreDir: t.TempDir(), MaxStore: 1 << 40})
 	require.NoError(t, err)
 	t.Cleanup(srv.Shutdown)
 	conn, err := natsembed.Connect(srv)
@@ -93,13 +73,16 @@ func TestEndToEnd_DeviceToParquetAndTriggers(t *testing.T) {
 	rawStreams, err := stream.EnsureStreams(ctx, js, stream.DefaultConfig())
 	require.NoError(t, err)
 
-	store := newE2EStore(t)
+	lk := openTestLake(t)
+	blobStore, err := fsstore.New(t.TempDir())
+	require.NoError(t, err)
+
 	cfg := convert.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}
 	convert.RegisterModules(cfg)
 
 	handlers := &handler.Handlers{
 		Converter: convert.NewConverter(zerolog.Nop(), cfg),
-		Splitter:  split.New(store, "cloudevent/blobs/", 1<<20),
+		Splitter:  split.New(blobStore, "cloudevent/blobs/", 1<<20),
 		Publisher: stream.NewPublisher(js, 1),
 		Log:       zerolog.Nop(),
 	}
@@ -111,8 +94,11 @@ func TestEndToEnd_DeviceToParquetAndTriggers(t *testing.T) {
 		Durable: "parquet-sink", AckPolicy: jetstream.AckExplicitPolicy, AckWait: 5 * time.Minute,
 	})
 	require.NoError(t, err)
+	writer, err := lk.NewWriter(ctx, lake.RawTable)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = writer.Close() })
 	go func() {
-		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, sinkConsumer, store, zerolog.Nop()).Run(ctx)
+		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
 	}()
 
 	// Decodestream bridge.
@@ -144,19 +130,23 @@ func TestEndToEnd_DeviceToParquetAndTriggers(t *testing.T) {
 	defer resp.Body.Close() //nolint:errcheck
 	require.Equal(t, http.StatusOK, resp.StatusCode, "device gets 200 only after JetStream ack")
 
-	// Raw parquet bundle lands in the right hive partition.
-	wantPrefix := "raw/type=dimo.status/date=" + ts.Format("2006-01-02") + "/"
-	require.Eventually(t, func() bool { return len(store.keys(wantPrefix)) == 1 }, 10*time.Second, 100*time.Millisecond)
+	// The row lands in the lake, findable by the partition columns.
+	query := `SELECT subject, id, data FROM lake.raw_events
+		WHERE type = 'dimo.status' AND "time"::DATE = ?::DATE`
+	require.Eventually(t, func() bool {
+		var n int
+		err := lk.DB().QueryRowContext(ctx,
+			`SELECT count(*) FROM lake.raw_events`).Scan(&n)
+		return err == nil && n == 1
+	}, 10*time.Second, 100*time.Millisecond)
 
-	bundleKey := store.keys(wantPrefix)[0]
-	body := store.get(bundleKey)
-	events, err := ceparquet.Decode(bytes.NewReader(body), int64(len(body)))
-	require.NoError(t, err)
-	require.Len(t, events, 1)
-	assert.Equal(t, subject, events[0].Subject)
-	assert.Equal(t, "device-msg-1", events[0].ID)
+	var gotSubject, gotID, gotData string
+	require.NoError(t, lk.DB().QueryRowContext(ctx, query, ts.Format("2006-01-02")).
+		Scan(&gotSubject, &gotID, &gotData))
+	assert.Equal(t, subject, gotSubject)
+	assert.Equal(t, "device-msg-1", gotID)
 	assert.JSONEq(t, `{"signals":[{"name":"speed","timestamp":"`+ts.Format(time.RFC3339Nano)+`","value":72.5}]}`,
-		string(events[0].Data), "raw payload stored verbatim — parse-on-read source of truth")
+		gotData, "raw payload stored verbatim — parse-on-read source of truth")
 
 	// Decoded signal reaches the triggers-compatible subject.
 	sigStream, err := js.Stream(ctx, decodestream.SignalsStreamName)

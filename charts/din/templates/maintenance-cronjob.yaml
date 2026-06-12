@@ -1,0 +1,46 @@
+{{- if .Values.maintenance.enabled }}
+# Lake maintenance as a CronJob: exactly one maintenance process may run
+# per catalog, which a multi-replica ingest deployment cannot guarantee.
+# concurrencyPolicy Forbid keeps a slow cycle from overlapping the next.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "din.fullname" . }}-maintenance
+  labels:
+    {{- include "din.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.maintenance.schedule | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      activeDeadlineSeconds: {{ .Values.maintenance.activeDeadlineSeconds }}
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "din.selectorLabels" . | nindent 12 }}
+            din.dimo.zone/role: maintenance
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "din.serviceAccountName" . }}
+          securityContext:
+            {{- toYaml .Values.podSecurityContext | nindent 12 }}
+          containers:
+            - name: {{ .Chart.Name }}-maintenance
+              securityContext:
+                {{- toYaml .Values.securityContext | nindent 16 }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              command:
+                - /din
+                - maintain
+              envFrom:
+                - configMapRef:
+                    name: {{ include "din.fullname" . }}-config
+                - secretRef:
+                    name: {{ include "din.fullname" . }}-secret
+              resources:
+                {{- toYaml .Values.maintenance.resources | nindent 16 }}
+{{- end }}

@@ -27,7 +27,7 @@ func vehicleDID(tokenID int) string {
 
 func setup(t *testing.T) jetstream.JetStream {
 	t.Helper()
-	srv, err := natsembed.Run(natsembed.Config{StoreDir: t.TempDir()})
+	srv, err := natsembed.Run(natsembed.Config{StoreDir: t.TempDir(), MaxStore: 1 << 40})
 	require.NoError(t, err)
 	t.Cleanup(srv.Shutdown)
 	conn, err := natsembed.Connect(srv)

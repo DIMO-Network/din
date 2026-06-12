@@ -1,7 +1,8 @@
 // din — DIMO Ingest Node. Single binary replacing dis + dps +
 // parquet-processor: HTTP ingest (mTLS + JWT) → NATS JetStream WAL →
-// hive-partitioned raw parquet on S3, with self-compaction and an optional
-// decoded-stream bridge for vehicle-triggers-api.
+// DuckLake raw_events table (partitioned parquet on S3 tracked by a SQL
+// catalog), with built-in lake maintenance and an optional decoded-stream
+// bridge for vehicle-triggers-api.
 package main
 
 import (
@@ -11,16 +12,17 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/DIMO-Network/din/internal/attest"
-	"github.com/DIMO-Network/din/internal/compact"
 	"github.com/DIMO-Network/din/internal/config"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/decodestream"
 	"github.com/DIMO-Network/din/internal/fsstore"
 	"github.com/DIMO-Network/din/internal/handler"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/DIMO-Network/din/internal/natsembed"
 	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/DIMO-Network/din/internal/s3client"
@@ -36,8 +38,122 @@ import (
 
 func main() {
 	log := zerolog.New(os.Stdout).With().Timestamp().Str("app", "din").Logger()
+
+	// Build-time/ops subcommands; the bare binary runs the service.
+	if len(os.Args) > 1 {
+		if err := runSubcommand(os.Args[1:], log); err != nil {
+			log.Fatal().Err(err).Str("subcommand", os.Args[1]).Msg("din exited with error")
+		}
+		return
+	}
+
 	if err := run(log); err != nil {
 		log.Fatal().Err(err).Msg("din exited with error")
+	}
+}
+
+func runSubcommand(args []string, log zerolog.Logger) error {
+	switch args[0] {
+	case "install-duckdb-extensions":
+		if len(args) != 2 {
+			return errors.New("usage: din install-duckdb-extensions <dir>")
+		}
+		return lake.InstallExtensions(context.Background(), args[1])
+	case "maintain":
+		// One maintenance cycle, then exit — for a k8s CronJob when the
+		// ingest deployment runs more than one replica (exactly one
+		// maintenance process may run per catalog).
+		return maintainOnce(log)
+	case "lake-backfill":
+		// One-time registration of legacy DIS bundles into the lake.
+		if len(args) != 2 {
+			return errors.New("usage: din lake-backfill <s3://bucket/prefix/ | /abs/dir>")
+		}
+		return lakeBackfill(args[1], log)
+	default:
+		return fmt.Errorf("unknown subcommand %q", args[0])
+	}
+}
+
+// lakeBackfill lists parquet bundles under source and registers them into
+// raw_events. Idempotent — rerun after any failure; already-registered
+// files are skipped.
+func lakeBackfill(source string, log zerolog.Logger) error {
+	settings, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	var bucket, prefix, uriBase string
+	if after, ok := strings.CutPrefix(source, "s3://"); ok {
+		bucket, prefix, _ = strings.Cut(after, "/")
+		uriBase = "s3://" + bucket + "/"
+	} else if objstore.IsLocalPath(source) {
+		bucket = source
+		uriBase = strings.TrimSuffix(objstore.LocalRoot(source), "/") + "/"
+	} else {
+		return fmt.Errorf("source must be s3://bucket/prefix/ or an absolute path, got %q", source)
+	}
+	store, err := newObjectStore(ctx, settings, bucket)
+	if err != nil {
+		return err
+	}
+	objects, err := store.ListObjectsV2(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("listing %s: %w", source, err)
+	}
+	files := make([]string, 0, len(objects))
+	for _, obj := range objects {
+		files = append(files, uriBase+obj.Key)
+	}
+	log.Info().Int("objects", len(files)).Str("source", source).Msg("backfill source listed")
+
+	lk, err := lake.Open(ctx, lakeConfig(settings))
+	if err != nil {
+		return err
+	}
+	defer lk.Close()
+	res, err := lk.Backfill(ctx, files, log)
+	if err != nil {
+		return err
+	}
+	log.Info().Int("registered", res.Registered).Int("skipped", res.Skipped).Msg("backfill complete")
+	return nil
+}
+
+func maintainOnce(log zerolog.Logger) error {
+	settings, err := config.Load()
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	lk, err := lake.Open(ctx, lakeConfig(settings))
+	if err != nil {
+		return err
+	}
+	defer lk.Close()
+	return lake.NewMaintainer(lk, lake.MaintConfig{
+		SnapshotKeep: settings.LakeSnapshotKeep,
+	}, log).Cycle(ctx)
+}
+
+func lakeConfig(settings config.Settings) lake.Config {
+	return lake.Config{
+		CatalogDSN:        settings.LakeCatalogDSN,
+		DataPath:          settings.LakeDataPath,
+		S3Region:          settings.S3Region,
+		S3AccessKeyID:     settings.S3AccessKeyID,
+		S3SecretAccessKey: settings.S3SecretAccessKey,
+		S3Endpoint:        settings.S3Endpoint,
+		MemoryLimit:       settings.LakeMemoryLimit,
+		Threads:           settings.LakeThreads,
+		TargetFileSize:    settings.LakeTargetFileSize,
+		ExtensionDir:      settings.LakeExtensionDir,
+		MaxConns:          settings.NATSStreamPartitions + 2,
 	}
 }
 
@@ -87,15 +203,15 @@ func run(log zerolog.Logger) error {
 		return err
 	}
 
-	// Storage. Blobs (externalized >1MB payloads) live in their own bucket
-	// like dis's BLOB_BUCKET; falling back to the parquet bucket would
-	// split durable documents across two locations. Each bucket value picks
-	// its backend independently: absolute path or file:// → local
-	// filesystem, anything else → S3.
-	store, err := newObjectStore(ctx, settings, settings.ParquetBucket)
+	// Storage. Raw events live in the DuckLake; blobs (externalized >1MB
+	// payloads) keep their own bucket like dis's BLOB_BUCKET — durable
+	// documents must not split across two locations.
+	lk, err := lake.Open(ctx, lakeConfig(settings))
 	if err != nil {
 		return err
 	}
+	defer lk.Close()
+
 	if settings.BlobBucket == "" {
 		return errors.New("BLOB_BUCKET is required")
 	}
@@ -160,7 +276,9 @@ func run(log zerolog.Logger) error {
 	group.Go(func() error { return serveHTTP(gctx, opsSrv, false, log) })
 
 	// One sink per WAL partition: disjoint subjects, independent flush
-	// pipelines — throughput scales with the partition count.
+	// pipelines — throughput scales with the partition count. Each sink
+	// gets its own writer connection; concurrent DuckLake appends never
+	// conflict.
 	for i, rawStream := range rawStreams {
 		durable := "parquet-sink"
 		if len(rawStreams) > 1 {
@@ -175,14 +293,20 @@ func run(log zerolog.Logger) error {
 		if err != nil {
 			return err
 		}
-		group.Go(func() error { return sink.New(sink.Config{}, sinkConsumer, store, log).Run(gctx) })
+		writer, err := lk.NewWriter(ctx, lake.RawTable)
+		if err != nil {
+			return err
+		}
+		defer writer.Close()
+		group.Go(func() error { return sink.New(sink.Config{}, sinkConsumer, writer, log).Run(gctx) })
 	}
 
-	if settings.CompactorEnabled {
-		compactStore := &compactStoreAdapter{client: store}
-		group.Go(func() error {
-			return compact.New(compact.Config{DecodedPrefix: settings.DecodedPrefix}, compactStore, log).Run(gctx)
-		})
+	if settings.LakeMaintenanceEnabled {
+		maintainer := lake.NewMaintainer(lk, lake.MaintConfig{
+			Interval:     settings.LakeMaintInterval,
+			SnapshotKeep: settings.LakeSnapshotKeep,
+		}, log)
+		group.Go(func() error { return maintainer.Run(gctx) })
 	}
 	if settings.DecodeStreamEnabled {
 		bridge := decodestream.New(decodestream.Config{
@@ -226,35 +350,6 @@ func newObjectStore(ctx context.Context, settings config.Settings, bucket string
 		SecretAccessKey: settings.S3SecretAccessKey,
 		Endpoint:        settings.S3Endpoint,
 	})
-}
-
-// compactStoreAdapter narrows a Store to the compactor's surface.
-type compactStoreAdapter struct {
-	client objstore.Store
-}
-
-func (a *compactStoreAdapter) List(ctx context.Context, prefix string) ([]compact.ObjectInfo, error) {
-	objects, err := a.client.ListObjectsV2(ctx, prefix)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]compact.ObjectInfo, len(objects))
-	for i, obj := range objects {
-		out[i] = compact.ObjectInfo{Key: obj.Key, Size: obj.Size}
-	}
-	return out, nil
-}
-
-func (a *compactStoreAdapter) GetObject(ctx context.Context, key string) ([]byte, error) {
-	return a.client.GetObject(ctx, key, 0)
-}
-
-func (a *compactStoreAdapter) PutObject(ctx context.Context, key string, body []byte) error {
-	return a.client.PutObject(ctx, key, body)
-}
-
-func (a *compactStoreAdapter) DeleteObject(ctx context.Context, key string) error {
-	return a.client.DeleteObjects(ctx, []string{key})
 }
 
 // serveHTTP runs srv until ctx cancels, then shuts it down gracefully.

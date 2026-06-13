@@ -115,7 +115,7 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	setup = append(setup, "INSTALL ducklake", "LOAD ducklake")
 
 	if isPostgresDSN(cfg.CatalogDSN) {
-		setup = append(setup, "INSTALL postgres")
+		setup = append(setup, "INSTALL postgres", "LOAD postgres")
 	}
 	if strings.HasPrefix(cfg.DataPath, "s3://") {
 		setup = append(setup, "INSTALL httpfs", "LOAD httpfs", s3SecretSQL(cfg))
@@ -123,12 +123,40 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (DATA_PATH %s)",
 		sqlString(catalogURI(cfg.CatalogDSN)), sqlString(cfg.DataPath)))
 
+	// Consumer progress lives in a plain table in the catalog database —
+	// not a DuckLake table (which would snapshot every cursor update). In
+	// prod that's the same Postgres holding the catalog, attached directly
+	// as `meta`; for a file catalog it's a sibling DuckDB file. See
+	// consumer.go for how the expiry floor reads it.
+	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS meta%s",
+		sqlString(metaTarget(cfg.CatalogDSN)), metaAttachOpts(cfg.CatalogDSN)))
+
 	for _, q := range setup {
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("lake bootstrap %q: %w", redact(q), err)
 		}
 	}
+	if _, err := l.db.ExecContext(ctx, consumerProgressDDL); err != nil {
+		return fmt.Errorf("lake bootstrap consumer-progress table: %w", err)
+	}
 	return l.ensureSchema(ctx, cfg)
+}
+
+// metaTarget is the ATTACH target for the side database holding consumer
+// progress: the catalog Postgres DSN itself, or a DuckDB file beside a
+// local catalog.
+func metaTarget(catalogDSN string) string {
+	if isPostgresDSN(catalogDSN) {
+		return catalogDSN
+	}
+	return catalogDSN + ".progress.db"
+}
+
+func metaAttachOpts(catalogDSN string) string {
+	if isPostgresDSN(catalogDSN) {
+		return " (TYPE postgres)"
+	}
+	return ""
 }
 
 // ensureSchema creates the tables and their layout options on first boot.

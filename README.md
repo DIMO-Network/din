@@ -37,6 +37,20 @@ Run **exactly one** maintenance process per catalog:
 - single-node: `LAKE_MAINTENANCE_ENABLED=true` in the service (runs every `LAKE_MAINTENANCE_INTERVAL`, default 15m), or
 - multi-replica: the chart's `maintenance.enabled` runs a dedicated single-replica Deployment (`din maintain`) — long-lived, so its health gauge `din_lake_oldest_unexpired_snapshot_age_seconds` stays scrapable. Alert when it approaches `LAKE_SNAPSHOT_RETENTION`.
 
+### Consumer progress floor
+
+Retention alone is a soft contract — expire a snapshot a consumer hasn't read and its change feed truncates. To make that safe, a downstream consumer (the dq materializer) reports how far it has consumed, and expiry never drops a snapshot at or past the slowest **live** consumer's cursor. A consumer that stops reporting for longer than `LAKE_CONSUMER_STALENESS` (default 1h) is presumed dead and dropped from the floor, so a crashed consumer can't wedge the lake — the tradeoff is it must rescan if it returns after its snapshots have expired. `din_lake_expiry_floor_binding` goes to 1 when a live consumer is holding expiry back below retention; alert on it.
+
+Progress lives in `meta.din_consumer_progress` — a plain table in the catalog database (the catalog Postgres in prod, a sibling DuckDB file for a local catalog), **not** a DuckLake table. The consumer upserts its cursor after committing each materialization batch:
+
+```sql
+-- the consumer holds a write grant on this one table
+DELETE FROM meta.din_consumer_progress WHERE consumer = 'dq-materializer';
+INSERT INTO meta.din_consumer_progress VALUES ('dq-materializer', :last_snapshot_id, now());
+```
+
+With no consumer reporting, expiry falls back to pure time-based retention (current behavior), so this is inert until dq adopts it.
+
 ## Run it locally (verified single-node quickstart)
 
 No S3, no Postgres, no NATS cluster, no Kubernetes. You need a TLS keypair for the mTLS port (self-signed is fine locally — the cert CN plays the connection-license role):
@@ -95,6 +109,7 @@ Scaling out is the same binary with a PostgreSQL `LAKE_CATALOG_DSN`, an S3 `LAKE
 | `NATS_MODE` | no | `embedded` (single-node) or `external` (default) + `NATS_URL` |
 | `LAKE_MAINTENANCE_ENABLED` | no | default false; one maintenance process per catalog |
 | `LAKE_MAINTENANCE_INTERVAL` / `LAKE_SNAPSHOT_RETENTION` | no | defaults 15m / 72h; retention must exceed consumer lag |
+| `LAKE_CONSUMER_STALENESS` | no | default 1h; a consumer quiet this long is dropped from the expiry floor |
 | `LAKE_MEMORY_LIMIT` / `LAKE_THREADS` / `LAKE_TARGET_FILE_SIZE` | no | DuckDB/DuckLake tuning (e.g. `1GB`, `4`, `512MB`) |
 | `LAKE_EXTENSION_DIR` | no | pre-baked DuckDB extensions (set in the container image) |
 | `DECODESTREAM_ENABLED` | no | default true |

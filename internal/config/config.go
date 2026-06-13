@@ -75,6 +75,11 @@ type Settings struct {
 	LakeMaintenanceEnabled bool          // LAKE_MAINTENANCE_ENABLED
 	LakeMaintInterval      time.Duration // LAKE_MAINTENANCE_INTERVAL
 	LakeSnapshotKeep       time.Duration // LAKE_SNAPSHOT_RETENTION
+	// LakeConsumerStaleness is how long a downstream consumer may go
+	// without reporting progress before expiry stops protecting its
+	// cursor. Must exceed a healthy consumer's reporting gap, stay well
+	// below LakeSnapshotKeep.
+	LakeConsumerStaleness time.Duration // LAKE_CONSUMER_STALENESS
 
 	// Modules.
 	DecodeStreamEnabled bool
@@ -179,6 +184,9 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	if s.LakeSnapshotKeep, err = envDuration("LAKE_SNAPSHOT_RETENTION", 72*time.Hour); err != nil {
+		return s, err
+	}
+	if s.LakeConsumerStaleness, err = envDuration("LAKE_CONSUMER_STALENESS", time.Hour); err != nil {
 		return s, err
 	}
 

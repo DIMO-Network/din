@@ -144,8 +144,9 @@ func runMaintenance(log zerolog.Logger) error {
 
 	opsSrv := server.NewOpsServer(server.OpsConfig{Addr: settings.OpsAddr})
 	maintainer := lake.NewMaintainer(lk, lake.MaintConfig{
-		Interval:     settings.LakeMaintInterval,
-		SnapshotKeep: settings.LakeSnapshotKeep,
+		Interval:          settings.LakeMaintInterval,
+		SnapshotKeep:      settings.LakeSnapshotKeep,
+		ConsumerStaleness: settings.LakeConsumerStaleness,
 	}, log)
 
 	group, gctx := errgroup.WithContext(ctx)
@@ -319,8 +320,9 @@ func run(log zerolog.Logger) error {
 
 	if settings.LakeMaintenanceEnabled {
 		maintainer := lake.NewMaintainer(lk, lake.MaintConfig{
-			Interval:     settings.LakeMaintInterval,
-			SnapshotKeep: settings.LakeSnapshotKeep,
+			Interval:          settings.LakeMaintInterval,
+			SnapshotKeep:      settings.LakeSnapshotKeep,
+			ConsumerStaleness: settings.LakeConsumerStaleness,
 		}, log)
 		group.Go(func() error { return maintainer.Run(gctx) })
 	}

@@ -70,14 +70,14 @@ func TestOpen_BootstrapIdempotent(t *testing.T) {
 	// Reopen: bootstrap must be a no-op, not an error or a new table.
 	l2, err := Open(ctx, cfg)
 	require.NoError(t, err)
-	defer l2.Close()
+	defer l2.Close() //nolint:errcheck
 	var snapshotsBefore int
 	require.NoError(t, l2.DB().QueryRowContext(ctx,
 		"SELECT count(*) FROM lake.snapshots()").Scan(&snapshotsBefore))
 	require.NoError(t, l2.Close())
 	l3, err := Open(ctx, cfg)
 	require.NoError(t, err)
-	defer l3.Close()
+	defer l3.Close() //nolint:errcheck
 	var snapshotsAfter int
 	require.NoError(t, l3.DB().QueryRowContext(ctx,
 		"SELECT count(*) FROM lake.snapshots()").Scan(&snapshotsAfter))
@@ -91,7 +91,7 @@ func TestWriter_RoundTrip(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	ts := time.Date(2026, 6, 8, 10, 30, 0, 0, time.UTC)
 	inline := testEvent("e-inline", "dimo.status", "did:erc721:137:0xA:1", ts)
@@ -107,7 +107,7 @@ func TestWriter_RoundTrip(t *testing.T) {
 	rows, err := l.DB().QueryContext(ctx, `SELECT id, subject, "time", type, extras,
 		data, data_base64, data_index_key FROM lake.raw_events ORDER BY id`)
 	require.NoError(t, err)
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 
 	type got struct {
 		id, subject, ceType, extras string
@@ -153,7 +153,7 @@ func TestWriter_OneSnapshotPerBundle(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	var before int
 	require.NoError(t, l.DB().QueryRowContext(ctx,
@@ -188,7 +188,7 @@ func TestWriter_PartitionedDataLayout(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	// Big enough to clear DuckLake's data-inlining threshold — tiny
 	// bundles live as rows in the catalog until maintenance flushes them.
@@ -243,7 +243,7 @@ func TestWriter_TinyBundleInlines(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
 	require.NoError(t, w.WriteBundle(ctx, []cloudevent.StoredEvent{
@@ -274,10 +274,10 @@ func TestWriter_ConcurrentBundles(t *testing.T) {
 
 	w1, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w1.Close()
+	defer w1.Close() //nolint:errcheck
 	w2, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w2.Close()
+	defer w2.Close() //nolint:errcheck
 
 	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
 	var wg sync.WaitGroup

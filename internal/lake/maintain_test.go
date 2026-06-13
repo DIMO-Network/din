@@ -45,7 +45,7 @@ func TestMaintainer_MergePreservesChangeFeed(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	var startSnapshot int64
 	require.NoError(t, l.DB().QueryRowContext(ctx,
@@ -98,7 +98,7 @@ func TestMaintainer_RetentionReleasesFiles(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 
 	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
 	total := 0

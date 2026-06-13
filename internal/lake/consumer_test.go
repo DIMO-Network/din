@@ -19,7 +19,7 @@ func writeSnapshots(t *testing.T, l *Lake, n int) []int64 {
 	ctx := context.Background()
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
 	ids := make([]int64, 0, n)
 	for b := range n {

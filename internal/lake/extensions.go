@@ -17,7 +17,7 @@ func InstallExtensions(ctx context.Context, dir string) error {
 		return fmt.Errorf("opening duckdb: %w", err)
 	}
 	db := sql.OpenDB(connector)
-	defer db.Close()
+	defer db.Close() //nolint:errcheck
 
 	for _, q := range []string{
 		"SET extension_directory = " + sqlString(dir),

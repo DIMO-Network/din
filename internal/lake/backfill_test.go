@@ -102,7 +102,7 @@ func TestBackfill_ThenMaintenance(t *testing.T) {
 
 	w, err := l.NewWriter(ctx, RawTable)
 	require.NoError(t, err)
-	defer w.Close()
+	defer w.Close() //nolint:errcheck
 	var native []cloudevent.StoredEvent
 	for i := range 25 {
 		native = append(native, testEvent(fmt.Sprintf("native-%d", i), "dimo.status", "did:1", ts))

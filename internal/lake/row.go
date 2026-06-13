@@ -13,8 +13,9 @@ import (
 // byte-compatible with backfilled DIS bundles: extras carries the
 // non-column header fields as JSON, exactly one of data/data_base64 is
 // set (NULL otherwise, like the parquet encoder's optional columns), and
-// data_base64 holds the base64 text bytes verbatim. VoidsID is not
-// stored, matching ParquetRow.
+// data_base64 holds the base64 text bytes verbatim. voids_id carries the
+// tombstone pointer (NULL when empty), matching ParquetRow so backfilled
+// DIS bundles register cleanly and dq can resolve voiding.
 func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 	extrasJSON := []byte("{}")
 	if extras := cloudevent.AddNonColumnFieldsToExtras(&event.CloudEventHeader); extras != nil {
@@ -34,6 +35,10 @@ func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 	if event.DataIndexKey != "" {
 		dataIndexKey = event.DataIndexKey
 	}
+	var voidsID driver.Value
+	if event.VoidsID != "" {
+		voidsID = event.VoidsID
+	}
 
 	return []driver.Value{
 		event.Subject,
@@ -48,5 +53,6 @@ func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 		data,
 		dataBase64,
 		dataIndexKey,
+		voidsID,
 	}, nil
 }

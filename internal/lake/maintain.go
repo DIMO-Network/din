@@ -231,7 +231,7 @@ func (m *Maintainer) execCount(ctx context.Context, q string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 	n := 0
 	for rows.Next() {
 		n++

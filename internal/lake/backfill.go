@@ -38,7 +38,7 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 	if err != nil {
 		return res, fmt.Errorf("lake backfill: %w", err)
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	// Legacy bundles span multiple (type, day) values per file, which a
 	// partitioned table refuses to register. Partitioning only governs
@@ -116,7 +116,7 @@ func (l *Lake) registeredFiles(ctx context.Context) (map[string]bool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("lake backfill: listing registered files: %w", err)
 	}
-	defer rows.Close()
+	defer rows.Close() //nolint:errcheck
 	out := map[string]bool{}
 	for rows.Next() {
 		var path string

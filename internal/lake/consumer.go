@@ -35,7 +35,7 @@ func (l *Lake) RecordConsumerProgress(ctx context.Context, consumer string, snap
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer conn.Close() //nolint:errcheck
 
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return err

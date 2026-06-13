@@ -22,7 +22,8 @@ var rawEventsDDL = []string{
 		extras VARCHAR,
 		data VARCHAR,
 		data_base64 BLOB,
-		data_index_key VARCHAR)`,
+		data_index_key VARCHAR,
+		voids_id VARCHAR)`,
 	`ALTER TABLE lake.raw_events SET PARTITIONED BY (type, day("time"))`,
 	`ALTER TABLE lake.raw_events SET SORTED BY (subject, "time")`,
 }

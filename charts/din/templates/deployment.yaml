@@ -11,6 +11,7 @@ spec:
   selector:
     matchLabels:
       {{- include "din.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ingest
   template:
     metadata:
       annotations:
@@ -20,6 +21,7 @@ spec:
       {{- end }}
       labels:
         {{- include "din.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ingest
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:

@@ -2,6 +2,7 @@ package lake
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"time"
@@ -60,6 +61,19 @@ var (
 		Name: "din_lake_maintenance_step_seconds",
 		Help: "Duration of each lake maintenance step.",
 	}, []string{"step"})
+	// maintOldestSnapshotAge is the health SLI: alert when it approaches
+	// LAKE_SNAPSHOT_RETENTION, the budget that must stay ahead of the dq
+	// consumer's lag. A gauge (not a counter) so the alert reads current
+	// state; it needs a long-lived process to be scraped, which is why
+	// maintenance runs as its own Deployment, not a CronJob.
+	maintOldestSnapshotAge = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "din_lake_oldest_unexpired_snapshot_age_seconds",
+		Help: "Age of the oldest retained snapshot; must stay below LAKE_SNAPSHOT_RETENTION.",
+	})
+	maintLastSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "din_lake_last_successful_cycle_timestamp_seconds",
+		Help: "Unix time of the last fully successful maintenance cycle.",
+	})
 )
 
 // NewMaintainer wires a Maintainer onto an open Lake.
@@ -123,8 +137,27 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	}
 	if firstErr == nil {
 		maintCycles.Inc()
+		maintLastSuccess.Set(float64(time.Now().Unix()))
 	}
+	// Refresh the health gauge every cycle, even on partial failure — a
+	// stalled expire step is exactly when oldest-snapshot age matters.
+	m.recordOldestSnapshotAge(ctx)
 	return firstErr
+}
+
+// recordOldestSnapshotAge sets the retention-headroom gauge from the
+// catalog. Best-effort: a failed read logs and leaves the last value.
+func (m *Maintainer) recordOldestSnapshotAge(ctx context.Context) {
+	var age sql.NullFloat64
+	err := m.lake.db.QueryRowContext(ctx,
+		"SELECT epoch(now()) - epoch(min(snapshot_time)) FROM lake.snapshots()").Scan(&age)
+	if err != nil {
+		m.log.Warn().Err(err).Msg("recording oldest-snapshot age failed")
+		return
+	}
+	if age.Valid {
+		maintOldestSnapshotAge.Set(age.Float64)
+	}
 }
 
 // execCount runs a maintenance CALL and drains its result rows; the row

@@ -35,7 +35,7 @@ Blobs (>1MB payloads) keep their own bucket: `BLOB_BUCKET` is an S3 bucket name 
 Run **exactly one** maintenance process per catalog:
 
 - single-node: `LAKE_MAINTENANCE_ENABLED=true` in the service (runs every `LAKE_MAINTENANCE_INTERVAL`, default 15m), or
-- multi-replica: the chart's `maintenance.enabled` CronJob runs `din maintain` (one cycle per invocation).
+- multi-replica: the chart's `maintenance.enabled` runs a dedicated single-replica Deployment (`din maintain`) — long-lived, so its health gauge `din_lake_oldest_unexpired_snapshot_age_seconds` stays scrapable. Alert when it approaches `LAKE_SNAPSHOT_RETENTION`.
 
 ## Run it locally (verified single-node quickstart)
 
@@ -103,7 +103,7 @@ Scaling out is the same binary with a PostgreSQL `LAKE_CATALOG_DSN`, an S3 `LAKE
 ### Subcommands
 
 ```bash
-din maintain                          # one lake maintenance cycle (CronJob entrypoint)
+din maintain                          # run the lake maintenance service (ops server + loop)
 din install-duckdb-extensions <dir>   # bake extensions into the image at build time
 ```
 

@@ -1,0 +1,94 @@
+{{- if .Values.maintenance.enabled }}
+# Lake maintenance as a dedicated single-replica Deployment: exactly one
+# maintenance process per catalog, long-lived so its health gauges
+# (din_lake_oldest_unexpired_snapshot_age_seconds, last-successful-cycle)
+# have a stable Prometheus scrape target. It attaches the same catalog as
+# ingest but starts no sinks or ingest servers — just the ops server and
+# the merge/expire/cleanup loop. Recreate strategy avoids two maintenance
+# processes overlapping during a rollout.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "din.fullname" . }}-maintenance
+  labels:
+    {{- include "din.labels" . | nindent 4 }}
+    app.kubernetes.io/component: maintenance
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "din.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: maintenance
+  template:
+    metadata:
+      annotations:
+        checksum/env: {{ include (print $.Template.BasePath "/configenv.yaml" ) . | sha256sum }}
+      {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "din.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: maintenance
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "din.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}-maintenance
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - /din
+            - maintain
+          envFrom:
+          - configMapRef:
+              name: {{ include "din.fullname" . }}-config
+          - secretRef:
+              name: {{ include "din.fullname" . }}-secret
+          ports:
+            - name: mon-http
+              containerPort: 8888
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: mon-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: mon-http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.maintenance.resources | nindent 12 }}
+---
+# Carries din.labels so the existing ServiceMonitor matches it and scrapes
+# the maintenance pod's /metrics; selects only the maintenance pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "din.fullname" . }}-maintenance
+  labels:
+    {{- include "din.labels" . | nindent 4 }}
+    app.kubernetes.io/component: maintenance
+spec:
+  type: ClusterIP
+  ports:
+    - name: mon-http
+      port: 8888
+      targetPort: mon-http
+      protocol: TCP
+  selector:
+    {{- include "din.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: maintenance
+{{- end }}

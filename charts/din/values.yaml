@@ -135,12 +135,13 @@ tolerations: []
 affinity: {}
 podDisruptionBudget:
   minAvailable: 0
-# Lake maintenance CronJob (din maintain): use instead of
-# LAKE_MAINTENANCE_ENABLED whenever replicaCount > 1.
+# Dedicated single-replica maintenance Deployment (din maintain). Use this
+# instead of in-process LAKE_MAINTENANCE_ENABLED whenever replicaCount > 1,
+# so exactly one maintenance process runs per catalog and its health gauges
+# stay scrapable. LAKE_MAINTENANCE_INTERVAL / LAKE_SNAPSHOT_RETENTION come
+# from the shared config.
 maintenance:
   enabled: false
-  schedule: '*/15 * * * *'
-  activeDeadlineSeconds: 840
   resources:
     limits:
       cpu: '1'

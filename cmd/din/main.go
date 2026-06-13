@@ -60,10 +60,12 @@ func runSubcommand(args []string, log zerolog.Logger) error {
 		}
 		return lake.InstallExtensions(context.Background(), args[1])
 	case "maintain":
-		// One maintenance cycle, then exit — for a k8s CronJob when the
-		// ingest deployment runs more than one replica (exactly one
-		// maintenance process may run per catalog).
-		return maintainOnce(log)
+		// Long-running maintenance service: an ops server (probes +
+		// Prometheus scrape target) plus the merge/expire/cleanup loop.
+		// Runs as its own single-replica Deployment, so exactly one
+		// maintenance process exists per catalog and its health gauges
+		// have a stable target to scrape.
+		return runMaintenance(log)
 	case "lake-backfill":
 		// One-time registration of legacy DIS bundles into the lake.
 		if len(args) != 2 {
@@ -123,10 +125,13 @@ func lakeBackfill(source string, log zerolog.Logger) error {
 	return nil
 }
 
-func maintainOnce(log zerolog.Logger) error {
+func runMaintenance(log zerolog.Logger) error {
 	settings, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if level, err := zerolog.ParseLevel(settings.LogLevel); err == nil {
+		zerolog.SetGlobalLevel(level)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -136,9 +141,20 @@ func maintainOnce(log zerolog.Logger) error {
 		return err
 	}
 	defer lk.Close()
-	return lake.NewMaintainer(lk, lake.MaintConfig{
+
+	opsSrv := server.NewOpsServer(server.OpsConfig{Addr: settings.OpsAddr})
+	maintainer := lake.NewMaintainer(lk, lake.MaintConfig{
+		Interval:     settings.LakeMaintInterval,
 		SnapshotKeep: settings.LakeSnapshotKeep,
-	}, log).Cycle(ctx)
+	}, log)
+
+	group, gctx := errgroup.WithContext(ctx)
+	group.Go(func() error { return serveHTTP(gctx, opsSrv, false, log) })
+	group.Go(func() error { return maintainer.Run(gctx) })
+
+	log.Info().Str("ops", settings.OpsAddr).Dur("interval", settings.LakeMaintInterval).
+		Dur("retention", settings.LakeSnapshotKeep).Msg("din maintenance started")
+	return group.Wait()
 }
 
 func lakeConfig(settings config.Settings) lake.Config {

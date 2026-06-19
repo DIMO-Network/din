@@ -191,6 +191,25 @@ func (l *Lake) tryEnsureSchema(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("lake: checking schema: %w", err)
 	}
 	if n > 0 {
+		// The table exists. A crashed backfill may have left partitioning RESET
+		// (its restore defer never ran), which the existence check would
+		// otherwise make permanent. Re-assert the layout only when it is
+		// actually missing, so a normal reboot mints no pointless ALTER
+		// snapshots but a crash-reset is repaired (CHD-23).
+		partitioned, err := l.isPartitioned(ctx)
+		if err != nil {
+			// Can't tell — re-assert defensively (idempotent) rather than risk
+			// leaving a reset unfixed.
+			partitioned = false
+		}
+		if partitioned {
+			return nil
+		}
+		for _, q := range rawEventsLayout {
+			if _, err := l.db.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("lake re-assert layout %q: %w", q, err)
+			}
+		}
 		return nil
 	}
 	ddl := append([]string{}, rawEventsDDL...)
@@ -208,6 +227,24 @@ func (l *Lake) tryEnsureSchema(ctx context.Context, cfg Config) error {
 		}
 	}
 	return nil
+}
+
+// isPartitioned reports whether raw_events currently has an active partition
+// spec. The catalog is attached as "lake", so DuckLake keeps its metadata in
+// __ducklake_metadata_lake; a table with no active (end_snapshot IS NULL)
+// partition row was reset (CHD-23).
+func (l *Lake) isPartitioned(ctx context.Context) (bool, error) {
+	// RESET leaves an active partition spec with zero columns, so count the
+	// active partition COLUMNS, not the spec row.
+	var ok bool
+	err := l.db.QueryRowContext(ctx, `
+		SELECT count(*) > 0
+		FROM __ducklake_metadata_lake.ducklake_partition_column pc
+		JOIN __ducklake_metadata_lake.ducklake_partition_info pi ON pc.partition_id = pi.partition_id
+		WHERE pi.end_snapshot IS NULL
+		  AND pi.table_id = (SELECT table_id FROM ducklake_table_info('lake') WHERE table_name = ?)`,
+		RawTable).Scan(&ok)
+	return ok, err
 }
 
 // catalogURI maps a config DSN onto a ducklake ATTACH URI.

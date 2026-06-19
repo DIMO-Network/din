@@ -142,13 +142,18 @@ podDisruptionBudget:
 # from the shared config.
 maintenance:
   enabled: false
+  # The maintainer merges/expires across the whole catalog (raw_events + the
+  # decoded tables) — memory-heavy parquet rewrites. Undersizing it slows merges
+  # and leaves small files that inflate per-query S3 GET cost (CHD-20, R2-H5).
+  # memoryLimit overrides the shared LAKE_MEMORY_LIMIT for the maintainer only.
+  memoryLimit: 3GB
   resources:
     limits:
+      cpu: '2'
+      memory: 4Gi
+    requests:
       cpu: '1'
       memory: 1Gi
-    requests:
-      cpu: 100m
-      memory: 256Mi
 serviceMonitor:
   enabled: true
   path: /metrics

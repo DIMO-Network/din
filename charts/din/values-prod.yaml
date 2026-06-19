@@ -7,6 +7,11 @@ env:
   ENVIRONMENT: prod
   NATS_URL: nats://nats-prod:4222
   NATS_REPLICAS: '3'
+  # One WAL partition per ingest replica (replicaCount: 2) so each replica owns
+  # whole partitions and two never race one (CHD-9). Must be >= replicaCount /
+  # autoscaling.maxReplicas — the deployment guard enforces it. Changing this
+  # re-partitions the stream: follow the runbook.
+  NATS_STREAM_PARTITIONS: '2'
   DIMO_REGISTRY_CHAIN_ID: 137
   VEHICLE_NFT_ADDRESS: '0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF'
   AFTERMARKET_NFT_ADDRESS: '0x9c94C395cBcBDe662235E0A9d3bB87Ad708561BA'

@@ -53,6 +53,13 @@ spec:
               name: {{ include "din.fullname" . }}-config
           - secretRef:
               name: {{ include "din.fullname" . }}-secret
+          {{- if .Values.maintenance.memoryLimit }}
+          # Explicit env overrides the shared configmap's LAKE_MEMORY_LIMIT so
+          # the maintainer's DuckDB can use the larger merge budget (CHD-20).
+          env:
+            - name: LAKE_MEMORY_LIMIT
+              value: {{ .Values.maintenance.memoryLimit | quote }}
+          {{- end }}
           ports:
             - name: mon-http
               containerPort: 8888

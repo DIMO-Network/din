@@ -90,6 +90,21 @@ var (
 		Name: "din_lake_expiry_floor_binding",
 		Help: "1 when a live consumer's progress floor is holding expiry back below retention.",
 	})
+	// staleConsumers is the count of consumers present in the progress table
+	// but past the staleness window — known consumers the floor no longer
+	// protects. Non-zero means a consumer is unprotected (SR review #2, F2).
+	staleConsumers = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "din_lake_stale_consumers",
+		Help: "Consumers with a progress row older than the staleness window (no longer protected by the expiry floor).",
+	})
+	// consumerDropped counts un-consumed snapshots reclaimed past a dropped
+	// (stale) consumer's cursor — the actual data-loss event. The floor-binding
+	// gauge flips 1→0 at this exact moment, so its alert *resolves* and reads as
+	// recovery; this counter makes the loss its own alertable signal (F1).
+	consumerDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "din_lake_consumer_dropped_total",
+		Help: "Un-consumed snapshots reclaimed past a dropped stale consumer's cursor (permanent change-feed loss).",
+	}, []string{"consumer"})
 )
 
 // NewMaintainer wires a Maintainer onto an open Lake.
@@ -120,6 +135,25 @@ func (m *Maintainer) Run(ctx context.Context) error {
 
 // Cycle runs one full maintenance pass.
 func (m *Maintainer) Cycle(ctx context.Context) error {
+	var firstErr error
+
+	// Re-assert the partition layout first. A crashed backfill can leave
+	// raw_events RESET, and unlike a fresh Open the long-lived maintainer never
+	// re-runs ensureSchema — so without this it would merge new data into
+	// unpartitioned files until the next pod boot (SR review #9). Idempotent and
+	// snapshot-free when the layout is already active.
+	start := time.Now()
+	if err := m.lake.reassertLayout(ctx); err != nil {
+		maintErrors.WithLabelValues("reassert_layout").Inc()
+		m.log.Error().Err(err).Str("step", "reassert_layout").Msg("maintenance step failed")
+		firstErr = fmt.Errorf("reassert_layout: %w", err)
+	}
+	maintStepSeconds.WithLabelValues("reassert_layout").Observe(time.Since(start).Seconds())
+
+	// Surface stale/dropped consumers before expiry runs, while the snapshots
+	// they are about to lose still exist to be counted (SR review #2).
+	m.reportConsumerHealth(ctx)
+
 	expireSQL, err := m.expireSQL(ctx)
 	if err != nil {
 		return err
@@ -134,7 +168,6 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 		{"delete_orphaned_files", "CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL '1 day')"},
 	}
 
-	var firstErr error
 	for _, step := range steps {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -161,6 +194,39 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	// stalled expire step is exactly when oldest-snapshot age matters.
 	m.recordOldestSnapshotAge(ctx)
 	return firstErr
+}
+
+// reportConsumerHealth surfaces consumers that have gone stale (present but
+// past the staleness window) and, distinctly, the moment a dropped consumer's
+// un-consumed backlog is reclaimed by time-only expiry. Without it that loss
+// shows up only as the floor-binding gauge clearing — an alert *resolving*,
+// which reads as recovery (SR review #2). Best-effort; never fails the cycle.
+func (m *Maintainer) reportConsumerHealth(ctx context.Context) {
+	if m.cfg.ConsumerStaleness <= 0 {
+		return
+	}
+	stale, err := m.lake.StaleConsumers(ctx, m.cfg.ConsumerStaleness)
+	if err != nil {
+		m.log.Warn().Err(err).Msg("reading stale consumers failed")
+		return
+	}
+	staleConsumers.Set(float64(len(stale)))
+	for _, c := range stale {
+		lost, err := m.lake.UnconsumedExpiringCount(ctx, c.SnapshotID, m.cfg.SnapshotKeep)
+		if err != nil {
+			m.log.Warn().Err(err).Str("consumer", c.Name).Msg("checking dropped-consumer backlog failed")
+			continue
+		}
+		if lost > 0 {
+			consumerDropped.WithLabelValues(c.Name).Add(float64(lost))
+			m.log.Error().Str("consumer", c.Name).Int64("cursor_snapshot", c.SnapshotID).
+				Float64("stale_age_seconds", c.AgeSeconds).Int64("snapshots_reclaimed", lost).
+				Msg("data loss: dropped stale consumer's un-consumed snapshots are being expired; backfill the gap and restore the consumer")
+			continue
+		}
+		m.log.Warn().Str("consumer", c.Name).Float64("stale_age_seconds", c.AgeSeconds).
+			Msg("consumer is stale and unprotected by the expiry floor (no backlog past retention yet)")
+	}
 }
 
 // recordOldestSnapshotAge sets the retention-headroom gauge from the

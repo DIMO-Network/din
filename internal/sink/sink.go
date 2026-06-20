@@ -34,6 +34,21 @@ var redeliveries = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "JetStream messages delivered to the sink more than once.",
 })
 
+// poisonRows counts messages terminated because the writer could not persist
+// them (a row it deterministically rejects: bad UTF-8, type/precision, schema
+// drift). Terminating them stops one bad row from wedging a whole WAL partition
+// via infinite redelivery (SR review #1).
+var poisonRows = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "din_sink_poison_rows_total",
+	Help: "Raw events terminated because the writer could not persist them.",
+})
+
+// poisonRedeliveryThreshold bounds how many times a message that fails to
+// commit even on its own is redelivered before it is terminated as poison.
+// High enough that a transient writer/catalog outage — each redelivery waits
+// one AckWait — resolves before a healthy message is ever dropped.
+const poisonRedeliveryThreshold = 10
+
 // Config tunes batching. Zero values take the defaults.
 type Config struct {
 	// MaxRowsPerFlush flushes the buffer at this row count.
@@ -311,20 +326,79 @@ func (s *Sink) worker(ctx context.Context) {
 	}
 }
 
-// flush commits one bundle, then acks its messages. On failure nothing is
-// acked: JetStream redelivers and the rows land in a later bundle
-// (at-least-once).
+// flush commits one bundle, then acks its messages. On a bundle failure it
+// isolates the cause per-event (the bundle's transaction rolled back atomically,
+// so retries write fresh rows): see isolate. The old behavior — ack nothing,
+// redeliver the whole bundle — wedged a partition forever when one row was
+// unpersistable (no MaxDeliver, no Term on this path), since the bad row
+// re-formed the same failing bundle on every redelivery (SR review #1).
 func (s *Sink) flush(ctx context.Context, job flushJob) {
 	if err := s.writer.WriteBundle(ctx, job.events); err != nil {
-		s.log.Error().Err(err).Int("events", len(job.events)).
-			Msg("committing bundle failed; messages left for redelivery")
+		s.log.Warn().Err(err).Int("events", len(job.events)).
+			Msg("bundle commit failed; isolating per-event")
+		s.isolate(ctx, job)
 		return
 	}
+	s.ackAll(job.msgs)
+	s.log.Info().Int("events", len(job.events)).Msg("bundle committed")
+}
 
-	for _, msg := range job.msgs {
+func (s *Sink) ackAll(msgs []jetstream.Msg) {
+	for _, msg := range msgs {
 		if err := msg.Ack(); err != nil {
 			s.log.Warn().Err(err).Msg("ack failed after successful commit; duplicate rows possible")
 		}
 	}
-	s.log.Info().Int("events", len(job.events)).Msg("bundle committed")
+}
+
+// isolate retries a failed bundle one event at a time so a single poison row
+// can't take the bundle's good events or the partition's progress down with it.
+// An event that commits alone is acked. An event that fails while another in the
+// same bundle succeeds is poison (the writer is healthy, the row is bad) and is
+// terminated. If NOTHING commits, the fault is treated as transient and the
+// failures are left for redelivery — except messages that have already cycled
+// poisonRedeliveryThreshold times, which are terminated to bound an all-poison
+// or single-row-poison bundle that would otherwise redeliver forever.
+func (s *Sink) isolate(ctx context.Context, job flushJob) {
+	committed := 0
+	var failed []int
+	for i := range job.events {
+		if err := s.writer.WriteBundle(ctx, job.events[i:i+1]); err != nil {
+			failed = append(failed, i)
+			continue
+		}
+		if err := job.msgs[i].Ack(); err != nil {
+			s.log.Warn().Err(err).Msg("ack failed after isolated commit; duplicate rows possible")
+		}
+		committed++
+	}
+	for _, i := range failed {
+		if committed > 0 || redeliveryCount(job.msgs[i]) >= poisonRedeliveryThreshold {
+			s.terminatePoison(job.events[i], job.msgs[i])
+		}
+		// else: not acked, not terminated → JetStream redelivers (likely transient).
+	}
+	if committed == 0 && len(failed) > 0 {
+		s.log.Error().Int("events", len(failed)).
+			Msg("no event in bundle committed; treating as transient, leaving for redelivery")
+	}
+}
+
+func (s *Sink) terminatePoison(event cloudevent.StoredEvent, msg jetstream.Msg) {
+	poisonRows.Inc()
+	s.log.Error().Str("subject", event.Subject).Str("id", event.ID).Str("type", event.Type).
+		Msg("terminating poison row: writer cannot persist it")
+	if err := msg.Term(); err != nil {
+		s.log.Error().Err(err).Msg("terminating poison message failed")
+	}
+}
+
+// redeliveryCount returns how many times JetStream has delivered msg (1 on the
+// first delivery), or 0 when metadata is unavailable.
+func redeliveryCount(msg jetstream.Msg) uint64 {
+	meta, err := msg.Metadata()
+	if err != nil {
+		return 0
+	}
+	return meta.NumDelivered
 }

@@ -74,3 +74,54 @@ func (l *Lake) ConsumerFloor(ctx context.Context, staleness time.Duration) (floo
 	}
 	return v.Int64, v.Valid, nil
 }
+
+// StaleConsumer is a consumer with a progress row older than the staleness
+// window: it has reported before but is now presumed dead, so the expiry floor
+// no longer protects it and its un-consumed snapshots may be reclaimed.
+type StaleConsumer struct {
+	Name       string
+	SnapshotID int64
+	AgeSeconds float64
+}
+
+// StaleConsumers returns consumers whose last report is older than staleness —
+// present in the table but excluded from the floor. The maintainer surfaces
+// these so a consumer being dropped (and its backlog reclaimed) is observable,
+// rather than looking like the floor-binding alert merely resolving (SR review
+// #2). Distinct from ConsumerFloor's (0,false), which conflates "never
+// reported", "caught up", and "dropped as stale".
+func (l *Lake) StaleConsumers(ctx context.Context, staleness time.Duration) ([]StaleConsumer, error) {
+	rows, err := l.db.QueryContext(ctx, fmt.Sprintf(
+		`SELECT consumer, snapshot_id, epoch(now()) - epoch(updated_at)
+		 FROM meta.din_consumer_progress
+		 WHERE updated_at <= now() - INTERVAL '%d seconds'`, int64(staleness.Seconds())))
+	if err != nil {
+		return nil, fmt.Errorf("stale consumers: %w", err)
+	}
+	defer rows.Close() //nolint:errcheck
+	var out []StaleConsumer
+	for rows.Next() {
+		var c StaleConsumer
+		if err := rows.Scan(&c.Name, &c.SnapshotID, &c.AgeSeconds); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// UnconsumedExpiringCount counts snapshots newer than cursor that are already
+// older than the retention horizon — snapshots a dropped consumer never
+// consumed that this cycle's time-only expiry will reclaim, permanently
+// truncating that consumer's change feed.
+func (l *Lake) UnconsumedExpiringCount(ctx context.Context, cursor int64, keep time.Duration) (int64, error) {
+	var n sql.NullInt64
+	err := l.db.QueryRowContext(ctx, fmt.Sprintf(
+		`SELECT count(*) FROM lake.snapshots()
+		 WHERE snapshot_id > %d AND snapshot_time < now() - INTERVAL '%d seconds'`,
+		cursor, int64(keep.Seconds()))).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("unconsumed expiring count: %w", err)
+	}
+	return n.Int64, nil
+}

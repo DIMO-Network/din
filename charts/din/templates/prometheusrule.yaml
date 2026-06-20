@@ -49,15 +49,46 @@ spec:
               consumer that lags further will have its cursor range expired.
               Raise retention or speed up the slow consumer.
         - alert: DinExpiryFloorBinding
+          # `for` MUST stay well below LAKE_CONSUMER_STALENESS (default 1h):
+          # a consumer can bind the floor and then be dropped as stale before a
+          # longer `for` ever elapses, so the alert would never fire (SR review
+          # #2 nit). 15m gives early warning while the floor is still binding.
           expr: max(din_lake_expiry_floor_binding) == 1
-          for: 1h
+          for: 15m
           labels:
             severity: warning
           annotations:
             summary: a slow consumer is holding back snapshot expiry
             description: >-
               Snapshot expiry is pinned to a downstream consumer's reported
-              floor (dq) rather than the time window for over an hour. dq is
-              lagging — expect growing storage and, if it falls past
-              LAKE_CONSUMER_STALENESS, a cursor reset.
+              floor (dq) rather than the time window. dq is lagging — expect
+              growing storage and, if it falls past LAKE_CONSUMER_STALENESS, a
+              cursor reset and data loss (DinConsumerDropped).
+        - alert: DinConsumerStale
+          expr: max(din_lake_stale_consumers) > 0
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: a known consumer is unprotected by the expiry floor
+            description: >-
+              A consumer has a progress row but has not reported within
+              LAKE_CONSUMER_STALENESS, so the floor no longer protects it. If it
+              falls past retention its un-consumed snapshots are reclaimed
+              (DinConsumerDropped). Restore the consumer or reduce its lag.
+        - alert: DinConsumerDropped
+          # The actual data-loss event. The floor-binding gauge flips 1→0 here,
+          # so DinExpiryFloorBinding *resolves* and reads as recovery — this
+          # counter is the signal that the loss is happening (SR review #2, F1).
+          expr: increase(din_lake_consumer_dropped_total[1h]) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: a dropped consumer's un-consumed snapshots are being expired (data loss)
+            description: >-
+              A stale consumer was dropped from the expiry floor and din is
+              reclaiming snapshots it never consumed — permanent change-feed
+              loss for that consumer (e.g. dq). Backfill the skipped snapshot
+              range, then restore the consumer and raise retention or decode
+              throughput.
 {{- end }}

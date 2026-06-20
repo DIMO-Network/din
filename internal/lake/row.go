@@ -4,6 +4,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/DIMO-Network/cloudevent"
 )
@@ -20,6 +21,12 @@ const emptyExtrasJSON = "{}"
 // data_base64 holds the base64 text bytes verbatim. voids_id carries the
 // tombstone pointer (NULL when empty), matching ParquetRow so backfilled
 // DIS bundles register cleanly and dq can resolve voiding.
+//
+// "time" is truncated to milliseconds: the legacy DIS parquet encoder wrote
+// timestamp(millisecond), so a native row and the same event registered from a
+// backfilled bundle must carry an identical value or reader dedup — keyed on
+// (subject, "time", ...) — would treat them as distinct and fail to collapse
+// the native/backfill overlap (SR review #6).
 func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 	extrasJSON := emptyExtrasJSON
 	if extras := cloudevent.AddNonColumnFieldsToExtras(&event.CloudEventHeader); extras != nil {
@@ -47,7 +54,7 @@ func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 
 	return []driver.Value{
 		event.Subject,
-		event.Time.UTC(),
+		event.Time.UTC().Truncate(time.Millisecond),
 		event.Type,
 		event.ID,
 		event.Source,

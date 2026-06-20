@@ -15,6 +15,13 @@ import (
 // split by partition — and returns only once the commit is durable in the
 // catalog, so the caller can ack its WAL messages. Safe for concurrent
 // use; bundles serialize on one pinned connection.
+//
+// Writes are a blind append: there is NO at-rest dedup here (no anti-join, no
+// ON CONFLICT). Delivery is at-least-once — NATS Nats-Msg-Id collapses retries
+// only within the stream's DuplicateWindow, so beyond it (consumer lag, broker
+// failover, replay) duplicate rows persist in raw_events. Dedup is delegated to
+// readers: dq's INSERT anti-join for decoded signals/events and its read-side
+// QUALIFY for queries. Do not assume raw_events rows are unique (SR review #5).
 type Writer struct {
 	mu    sync.Mutex
 	conn  *sql.Conn

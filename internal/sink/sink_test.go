@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -19,11 +20,14 @@ import (
 )
 
 // memWriter records committed bundles; failures are injectable to test
-// the no-ack-on-error path.
+// the no-ack-on-error path. failID makes WriteBundle reject any bundle that
+// contains an event with that ID — a deterministic "poison row" the writer can
+// never persist — to exercise per-event quarantine.
 type memWriter struct {
 	mu      sync.Mutex
 	bundles [][]cloudevent.StoredEvent
 	fail    error
+	failID  string
 }
 
 func (m *memWriter) WriteBundle(_ context.Context, events []cloudevent.StoredEvent) error {
@@ -31,6 +35,11 @@ func (m *memWriter) WriteBundle(_ context.Context, events []cloudevent.StoredEve
 	defer m.mu.Unlock()
 	if m.fail != nil {
 		return m.fail
+	}
+	for _, ev := range events {
+		if m.failID != "" && ev.ID == m.failID {
+			return fmt.Errorf("poison row %s", ev.ID)
+		}
 	}
 	m.bundles = append(m.bundles, append([]cloudevent.StoredEvent(nil), events...))
 	return nil
@@ -214,4 +223,45 @@ func TestSink_FailedCommitLeavesMessagesUnacked(t *testing.T) {
 	assert.Zero(t, writer.totalEvents())
 	cancel()
 	require.NoError(t, <-done)
+}
+
+// TestSink_PoisonRowQuarantined proves one unpersistable row no longer wedges a
+// partition: the good events in its bundle still commit (via per-event
+// isolation) and the poison row is terminated, so the queue fully drains. On
+// the old code this bundle redelivered forever (SR review #1).
+func TestSink_PoisonRowQuarantined(t *testing.T) {
+	t.Parallel()
+	js, cons := setup(t)
+	writer := &memWriter{failID: "poison"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pub := stream.NewPublisher(js, 1)
+	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
+	require.NoError(t, pub.Publish(ctx, event("good1", "dimo.status", "did:erc721:137:0xA:1", ts)))
+	require.NoError(t, pub.Publish(ctx, event("poison", "dimo.status", "did:erc721:137:0xA:1", ts)))
+	require.NoError(t, pub.Publish(ctx, event("good2", "dimo.status", "did:erc721:137:0xA:1", ts)))
+
+	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, cons, writer, zerolog.Nop())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	// Two good events commit; the poison row is terminated, so nothing is left
+	// pending — the old whole-bundle-redelivers behavior would never drain.
+	require.Eventually(t, func() bool {
+		info, err := cons.Info(context.Background())
+		return err == nil && writer.totalEvents() == 2 &&
+			info.NumAckPending == 0 && info.NumPending == 0
+	}, 15*time.Second, 100*time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+
+	ids := map[string]bool{}
+	for _, b := range writer.snapshot() {
+		for _, ev := range b {
+			ids[ev.ID] = true
+		}
+	}
+	assert.Equal(t, map[string]bool{"good1": true, "good2": true}, ids,
+		"good events commit, poison row excluded")
 }

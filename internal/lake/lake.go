@@ -151,14 +151,22 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	return l.assertOptions(ctx, cfg)
 }
 
-// assertOptions sets the catalog-global write options on every boot. DuckLake
-// keeps these as catalog metadata (not data): the most recent value applies to
-// new writes across every table — din's raw_events and dq's decoded tables
-// alike — and re-setting an unchanged value mints no snapshot
-// (TestOpen_BootstrapIdempotent guards that). Asserting them on every boot,
-// rather than only when raw_events is first created, is what lets a changed
-// option (e.g. raising parquet_version) reach a catalog that already exists.
+// assertOptions sets the catalog-global write options on every boot, retrying
+// to absorb metadata-commit conflicts when several replicas open the same
+// catalog at once. Without the retry a transient set_option conflict during a
+// cluster-wide cold start is fatal and CrashLoopBackOffs the pod (SR review #7).
 func (l *Lake) assertOptions(ctx context.Context, cfg Config) error {
+	return retryCatalog(ctx, func() error { return l.tryAssertOptions(ctx, cfg) })
+}
+
+// tryAssertOptions sets the catalog-global write options. DuckLake keeps these
+// as catalog metadata (not data): the most recent value applies to new writes
+// across every table — din's raw_events and dq's decoded tables alike — and
+// re-setting an unchanged value mints no snapshot (TestOpen_BootstrapIdempotent
+// guards that). Asserting them on every boot, rather than only when raw_events
+// is first created, is what lets a changed option (e.g. raising parquet_version)
+// reach a catalog that already exists.
+func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 	// name → already-SQL-formatted value (a quoted string or a bare literal).
 	opts := []struct{ name, valueSQL string }{
 		// zstd matches the old pqwrite encoder and beats the snappy default for
@@ -212,14 +220,15 @@ func metaAttachOpts(catalogDSN string) string {
 	return ""
 }
 
-// ensureSchema creates the tables and their layout options on first boot.
-// The existence check keeps reboots from minting pointless ALTER snapshots;
-// the retry loop absorbs metadata-commit conflicts when two replicas
-// bootstrap a fresh catalog at once.
-func (l *Lake) ensureSchema(ctx context.Context) error {
+// retryCatalog runs a catalog bootstrap step up to 3 times, backing off between
+// attempts, to absorb metadata-commit conflicts when several replicas open the
+// same catalog concurrently (fresh-catalog DDL or a set_option write racing a
+// peer). Shared by ensureSchema and assertOptions so neither is fatal on a
+// cluster-wide cold start.
+func retryCatalog(ctx context.Context, fn func() error) error {
 	var attempt int
 	for {
-		err := l.tryEnsureSchema(ctx)
+		err := fn()
 		if err == nil {
 			return nil
 		}
@@ -235,6 +244,14 @@ func (l *Lake) ensureSchema(ctx context.Context) error {
 	}
 }
 
+// ensureSchema creates the tables and their layout options on first boot.
+// The existence check keeps reboots from minting pointless ALTER snapshots;
+// retryCatalog absorbs metadata-commit conflicts when two replicas bootstrap a
+// fresh catalog at once.
+func (l *Lake) ensureSchema(ctx context.Context) error {
+	return retryCatalog(ctx, func() error { return l.tryEnsureSchema(ctx) })
+}
+
 func (l *Lake) tryEnsureSchema(ctx context.Context) error {
 	var n int
 	err := l.db.QueryRowContext(ctx,
@@ -246,31 +263,41 @@ func (l *Lake) tryEnsureSchema(ctx context.Context) error {
 	if n > 0 {
 		// The table exists. A crashed backfill may have left partitioning RESET
 		// (its restore defer never ran), which the existence check would
-		// otherwise make permanent. Re-assert the layout only when it is
-		// actually missing, so a normal reboot mints no pointless ALTER
-		// snapshots but a crash-reset is repaired (CHD-23).
-		partitioned, err := l.isPartitioned(ctx)
-		if err != nil {
-			// Can't tell — re-assert defensively (idempotent) rather than risk
-			// leaving a reset unfixed.
-			partitioned = false
-		}
-		if partitioned {
-			return nil
-		}
-		for _, q := range rawEventsLayout {
-			if _, err := l.db.ExecContext(ctx, q); err != nil {
-				return fmt.Errorf("lake re-assert layout %q: %w", q, err)
-			}
-		}
-		return nil
+		// otherwise make permanent — re-assert the layout when it is missing
+		// (CHD-23). Catalog-global write options are handled by assertOptions.
+		return l.reassertLayout(ctx)
 	}
-	// Catalog-global write options (compression, parquet_version,
-	// target_file_size) are asserted separately in assertOptions on every boot,
-	// so first-boot only has to create the table and its layout.
+	// First boot: create the table and its layout. Catalog-global write options
+	// (compression, parquet_version, target_file_size) are asserted separately
+	// in assertOptions on every boot.
 	for _, q := range rawEventsDDL {
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("lake schema %q: %w", q, err)
+		}
+	}
+	return nil
+}
+
+// reassertLayout re-applies raw_events' partition + sort layout when it is
+// currently missing (e.g. a crashed backfill left it RESET). It is idempotent
+// and mints no snapshot when the layout is already active, so it is safe to call
+// on every boot (ensureSchema) and at the top of every maintenance cycle. The
+// latter repairs a crashed-backfill RESET promptly instead of letting the
+// long-lived maintainer merge into unpartitioned files until the next pod boot
+// (SR review #9).
+func (l *Lake) reassertLayout(ctx context.Context) error {
+	partitioned, err := l.isPartitioned(ctx)
+	if err != nil {
+		// Can't tell — re-assert defensively (idempotent) rather than risk
+		// leaving a reset unfixed.
+		partitioned = false
+	}
+	if partitioned {
+		return nil
+	}
+	for _, q := range rawEventsLayout {
+		if _, err := l.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("lake re-assert layout %q: %w", q, err)
 		}
 	}
 	return nil

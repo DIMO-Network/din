@@ -75,12 +75,6 @@ func SubjectFilterForType(ceType string) string {
 	return SubjectRoot + "." + typeToken(ceType) + ".>"
 }
 
-// SubjectFilterForSubject returns a filter subject matching all event types
-// for one cloudevent subject (vehicle DID).
-func SubjectFilterForSubject(ceSubject string) string {
-	return SubjectRoot + ".*." + sanitizeToken(ceSubject)
-}
-
 // MsgID returns the JetStream deduplication ID for an event: the SHA-256 of
 // the header uniqueness key (subject+time+type+source+id). Devices that
 // retry after a timed-out 200 collapse into one stored message inside the

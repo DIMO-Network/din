@@ -44,7 +44,6 @@ func TestSubject_EmptySubject(t *testing.T) {
 func TestSubjectFilters(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t, "in.raw.dimo_status.>", SubjectFilterForType("dimo.status"))
-	assert.Equal(t, "in.raw.*.did:erc721:137:0xA:1", SubjectFilterForSubject("did:erc721:137:0xA:1"))
 }
 
 func TestMsgID_StableAndDistinct(t *testing.T) {

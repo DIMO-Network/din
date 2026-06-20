@@ -103,12 +103,7 @@ func (c *coordinateStore) processSignals() ([]vss.Signal, error) {
 	// a location.
 	c.tryCreateLocation()
 
-	var out []vss.Signal
-	for _, sig := range c.signals {
-		if sig.Data.Name != pruneSignalName {
-			out = append(out, sig)
-		}
-	}
+	out := dropPruned(c.signals)
 
 	// TODO(elffjs): Should we sort these?
 	out = append(out, c.created...)

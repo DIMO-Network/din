@@ -360,6 +360,19 @@ func groupSignalsByName(signals []vss.Signal) map[string][]vss.Signal {
 	return byName
 }
 
+// dropPruned returns signals with every entry marked pruneSignalName removed.
+// Pruning marks an entry by renaming it rather than deleting in place, so the
+// final pass filters them out.
+func dropPruned(signals []vss.Signal) []vss.Signal {
+	var out []vss.Signal
+	for _, sig := range signals {
+		if sig.Data.Name != pruneSignalName {
+			out = append(out, sig)
+		}
+	}
+	return out
+}
+
 // pruneFutureAndDuplicateSignals is ported from dis signalconvert.
 func pruneFutureAndDuplicateSignals(signals []vss.Signal) ([]vss.Signal, error) {
 	var errs error
@@ -379,13 +392,7 @@ func pruneFutureAndDuplicateSignals(signals []vss.Signal) ([]vss.Signal, error) 
 		}
 	}
 
-	var pruned []vss.Signal
-	for _, signal := range signals {
-		if signal.Data.Name != pruneSignalName {
-			pruned = append(pruned, signal)
-		}
-	}
-	return pruned, errs
+	return dropPruned(signals), errs
 }
 
 func signalEqual(a, b vss.Signal) bool {

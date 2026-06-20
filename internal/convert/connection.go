@@ -106,35 +106,38 @@ func (c *Converter) warnFutureTimestamp(hdr *cloudevent.CloudEventHeader) {
 // rewrites Subject, Producer, and Source in place so that any contract or
 // account address is in EIP-55 checksum form. Lowercased / mixed-case
 // addresses are accepted on input but normalized before being passed
-// downstream (ClickHouse, Kafka, Parquet). Legacy `did:nft:` values are also
+// downstream (NATS and the lake). Legacy `did:nft:` values are also
 // rewritten to their canonical `did:erc721:` form.
 func canonicalizeConnectionHeader(eventHdr *cloudevent.CloudEventHeader, logger zerolog.Logger) bool {
-	if did, err := cloudevent.DecodeERC721DID(eventHdr.Subject); err == nil {
-		eventHdr.Subject = did.String()
-	} else {
-		did, err := cloudevent.DecodeLegacyNFTDID(eventHdr.Subject)
-		if err != nil {
-			return false
-		}
-		eventHdr.Subject = did.String()
-		logger.Debug().Msgf("Cloud event header subject for source %s is a legacy NFT DID: %v", eventHdr.Source, eventHdr)
+	if !canonicalizeDID(&eventHdr.Subject, "subject", eventHdr, logger) {
+		return false
 	}
-
-	if did, err := cloudevent.DecodeERC721DID(eventHdr.Producer); err == nil {
-		eventHdr.Producer = did.String()
-	} else {
-		did, err := cloudevent.DecodeLegacyNFTDID(eventHdr.Producer)
-		if err != nil {
-			return false
-		}
-		eventHdr.Producer = did.String()
-		logger.Debug().Msgf("Cloud event header producer for source %s is a legacy NFT DID: %v", eventHdr.Source, eventHdr)
+	if !canonicalizeDID(&eventHdr.Producer, "producer", eventHdr, logger) {
+		return false
 	}
 
 	if !common.IsHexAddress(eventHdr.Source) {
 		return false
 	}
 	eventHdr.Source = common.HexToAddress(eventHdr.Source).Hex()
+	return true
+}
+
+// canonicalizeDID rewrites *field to canonical ERC721 DID form in place,
+// accepting either an ERC721 DID or a legacy `did:nft:` value. field names the
+// header field for the legacy-form debug log. Returns false if the value is
+// neither form.
+func canonicalizeDID(field *string, name string, hdr *cloudevent.CloudEventHeader, logger zerolog.Logger) bool {
+	if did, err := cloudevent.DecodeERC721DID(*field); err == nil {
+		*field = did.String()
+		return true
+	}
+	did, err := cloudevent.DecodeLegacyNFTDID(*field)
+	if err != nil {
+		return false
+	}
+	*field = did.String()
+	logger.Debug().Msgf("Cloud event header %s for source %s is a legacy NFT DID: %v", name, hdr.Source, hdr)
 	return true
 }
 

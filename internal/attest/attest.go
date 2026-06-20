@@ -26,7 +26,7 @@ import (
 
 // MaxTombstoneReasonBytes caps the length of the reason field in a tombstone
 // data payload. Tombstones are tiny by design and live alongside attestations
-// in ClickHouse; bounding reason keeps row size predictable and limits abuse.
+// in the lake; bounding reason keeps row size predictable and limits abuse.
 const MaxTombstoneReasonBytes = 512
 
 // ErrValidation marks 400-class errors caused by invalid attestation payloads

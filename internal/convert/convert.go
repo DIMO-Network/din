@@ -18,7 +18,7 @@ const (
 	// MaxHeaderBytes caps the JSON-serialized size of a CloudEvent header
 	// (every field except data and data_base64). No individual header field
 	// has its own length limit, so without this any string field, Tags entry,
-	// or Extras value could balloon ClickHouse rows and Parquet columns
+	// or Extras value could balloon stored rows and Parquet columns
 	// downstream.
 	MaxHeaderBytes = 8 * 1024
 

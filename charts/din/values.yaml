@@ -52,6 +52,12 @@ env:
   # immutable once the catalog exists — choose deliberately.
   LAKE_DATA_PATH: s3://dimo-storage-dev/lake/
   LAKE_MEMORY_LIMIT: 512MB
+  # Parquet write tuning (catalog-global; applies to din's raw_events and dq's
+  # decoded tables). v2 delta-packs the sorted (subject,"time") layer for a
+  # large size win over v1 on top of zstd — only DuckDB reads the lake, so it
+  # is compatibility-safe. target_file_size is DuckLake's compaction target.
+  LAKE_PARQUET_VERSION: '2'
+  LAKE_TARGET_FILE_SIZE: 512MB
   # Exactly one maintenance process per catalog: keep this on a single
   # replica (or a dedicated deployment) — never with autoscaling > 1.
   LAKE_MAINTENANCE_ENABLED: 'true'

@@ -21,6 +21,12 @@ env:
   BLOB_BUCKET: dimo-blob-storage-prod
   LAKE_DATA_PATH: s3://dimo-storage-prod/lake/
   LAKE_MEMORY_LIMIT: 1GB
+  # Parquet write tuning (catalog-global). v2 delta-packs the sorted
+  # (subject,"time") layer for a large size win over v1 on top of zstd; only
+  # DuckDB reads the lake, so it is compatibility-safe. Asserted on every boot,
+  # so it also applies to the already-created prod catalog going forward.
+  LAKE_PARQUET_VERSION: '2'
+  LAKE_TARGET_FILE_SIZE: 512MB
   # replicaCount is 2: maintenance must not run in the ingest pods — the
   # dedicated maintenance Deployment (maintenance.enabled) is the one
   # maintenance process.

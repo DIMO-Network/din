@@ -66,6 +66,7 @@ type Settings struct {
 	LakeMemoryLimit    string // LAKE_MEMORY_LIMIT, e.g. "1GB"
 	LakeThreads        int    // LAKE_THREADS
 	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
+	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
 	LakeExtensionDir   string // LAKE_EXTENSION_DIR: pre-baked DuckDB extensions
 
 	// Lake maintenance (compaction, snapshot expiry, file cleanup).
@@ -111,7 +112,8 @@ func Load() (Settings, error) {
 		LakeCatalogDSN:         os.Getenv("LAKE_CATALOG_DSN"),
 		LakeDataPath:           os.Getenv("LAKE_DATA_PATH"),
 		LakeMemoryLimit:        os.Getenv("LAKE_MEMORY_LIMIT"),
-		LakeTargetFileSize:     os.Getenv("LAKE_TARGET_FILE_SIZE"),
+		LakeTargetFileSize:     env("LAKE_TARGET_FILE_SIZE", "512MB"),
+		LakeParquetVersion:     env("LAKE_PARQUET_VERSION", "2"),
 		LakeExtensionDir:       os.Getenv("LAKE_EXTENSION_DIR"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),

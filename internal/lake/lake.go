@@ -46,6 +46,12 @@ type Config struct {
 	// TargetFileSize is DuckLake's target Parquet file size for writes
 	// and compaction (e.g. "512MB"); empty keeps the DuckLake default.
 	TargetFileSize string
+	// ParquetVersion is the Parquet format version DuckLake writes, "1" or
+	// "2"; empty (or anything else) keeps the DuckLake default of 1. v2 turns
+	// on DELTA_BINARY_PACKED / byte-stream-split encodings that shrink the
+	// sorted (subject,"time") time-series layer on top of zstd. Only DuckDB
+	// reads this lake, so v2 is compatibility-safe.
+	ParquetVersion string
 	// ExtensionDir overrides where DuckDB looks for/installs extensions
 	// (pre-baked in the container image); empty uses the default.
 	ExtensionDir string
@@ -139,7 +145,54 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	if _, err := l.db.ExecContext(ctx, consumerProgressDDL); err != nil {
 		return fmt.Errorf("lake bootstrap consumer-progress table: %w", err)
 	}
-	return l.ensureSchema(ctx, cfg)
+	if err := l.ensureSchema(ctx); err != nil {
+		return err
+	}
+	return l.assertOptions(ctx, cfg)
+}
+
+// assertOptions sets the catalog-global write options on every boot. DuckLake
+// keeps these as catalog metadata (not data): the most recent value applies to
+// new writes across every table — din's raw_events and dq's decoded tables
+// alike — and re-setting an unchanged value mints no snapshot
+// (TestOpen_BootstrapIdempotent guards that). Asserting them on every boot,
+// rather than only when raw_events is first created, is what lets a changed
+// option (e.g. raising parquet_version) reach a catalog that already exists.
+func (l *Lake) assertOptions(ctx context.Context, cfg Config) error {
+	// name → already-SQL-formatted value (a quoted string or a bare literal).
+	opts := []struct{ name, valueSQL string }{
+		// zstd matches the old pqwrite encoder and beats the snappy default for
+		// this sorted time-series; DuckDB also writes bloom filters on
+		// dictionary-encoded columns (subject), preserving the old bundles'
+		// pruning characteristics.
+		{"parquet_compression", "'zstd'"},
+	}
+	if v := parquetVersionLiteral(cfg.ParquetVersion); v != "" {
+		opts = append(opts, struct{ name, valueSQL string }{"parquet_version", v})
+	}
+	if cfg.TargetFileSize != "" {
+		opts = append(opts, struct{ name, valueSQL string }{"target_file_size", sqlString(cfg.TargetFileSize)})
+	}
+	for _, o := range opts {
+		q := fmt.Sprintf("CALL lake.set_option(%s, %s)", sqlString(o.name), o.valueSQL)
+		if _, err := l.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("lake set_option %s: %w", o.name, err)
+		}
+	}
+	return nil
+}
+
+// parquetVersionLiteral validates the configured Parquet version and returns it
+// as a bare SQL integer literal, or "" to keep DuckLake's default. Only "1" and
+// "2" are valid; anything else (including empty) yields "" so a typo can neither
+// inject SQL nor wedge boot.
+func parquetVersionLiteral(v string) string {
+	switch v {
+	case "1", "2":
+		return v
+	default:
+		return ""
+	}
 }
 
 // metaTarget is the ATTACH target for the side database holding consumer
@@ -163,10 +216,10 @@ func metaAttachOpts(catalogDSN string) string {
 // The existence check keeps reboots from minting pointless ALTER snapshots;
 // the retry loop absorbs metadata-commit conflicts when two replicas
 // bootstrap a fresh catalog at once.
-func (l *Lake) ensureSchema(ctx context.Context, cfg Config) error {
+func (l *Lake) ensureSchema(ctx context.Context) error {
 	var attempt int
 	for {
-		err := l.tryEnsureSchema(ctx, cfg)
+		err := l.tryEnsureSchema(ctx)
 		if err == nil {
 			return nil
 		}
@@ -182,7 +235,7 @@ func (l *Lake) ensureSchema(ctx context.Context, cfg Config) error {
 	}
 }
 
-func (l *Lake) tryEnsureSchema(ctx context.Context, cfg Config) error {
+func (l *Lake) tryEnsureSchema(ctx context.Context) error {
 	var n int
 	err := l.db.QueryRowContext(ctx,
 		`SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND table_name = ?`,
@@ -212,16 +265,10 @@ func (l *Lake) tryEnsureSchema(ctx context.Context, cfg Config) error {
 		}
 		return nil
 	}
-	ddl := append([]string{}, rawEventsDDL...)
-	// zstd matches the old pqwrite encoder; DuckDB's writer also emits
-	// bloom filters on dictionary-encoded columns (subject included), so
-	// lake files keep the old bundles' pruning characteristics.
-	ddl = append(ddl, "CALL lake.set_option('parquet_compression', 'zstd')")
-	if cfg.TargetFileSize != "" {
-		ddl = append(ddl, fmt.Sprintf("CALL lake.set_option('target_file_size', %s)",
-			sqlString(cfg.TargetFileSize)))
-	}
-	for _, q := range ddl {
+	// Catalog-global write options (compression, parquet_version,
+	// target_file_size) are asserted separately in assertOptions on every boot,
+	// so first-boot only has to create the table and its layout.
+	for _, q := range rawEventsDDL {
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("lake schema %q: %w", q, err)
 		}

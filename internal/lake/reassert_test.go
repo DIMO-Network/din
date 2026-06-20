@@ -36,7 +36,7 @@ func TestEnsureSchema_ReassertsPartitioningOnReboot(t *testing.T) {
 
 	// A reboot re-runs ensureSchema; it must re-assert the layout, not
 	// early-return because the table exists.
-	require.NoError(t, l.ensureSchema(ctx, cfg))
+	require.NoError(t, l.ensureSchema(ctx))
 
 	// Write data spanning three (type, day) partitions; a partitioned table
 	// writes one file per partition.

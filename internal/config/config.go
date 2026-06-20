@@ -208,7 +208,22 @@ func Load() (Settings, error) {
 			return s, fmt.Errorf("%s must not be a relative path, got %q", name, v)
 		}
 	}
+	if err := s.validateMaintenance(); err != nil {
+		return s, err
+	}
 	return s, nil
+}
+
+// validateMaintenance checks maintenance-tuning invariants. ConsumerStaleness
+// must stay below SnapshotKeep: if a consumer may go un-reported for longer than
+// snapshots are kept, the expiry floor can never protect its cursor and ranges
+// it has not read are reclaimed — silent data loss for that consumer (SR-15).
+func (s Settings) validateMaintenance() error {
+	if s.LakeConsumerStaleness >= s.LakeSnapshotKeep {
+		return fmt.Errorf("LAKE_CONSUMER_STALENESS (%s) must be less than LAKE_SNAPSHOT_RETENTION (%s)",
+			s.LakeConsumerStaleness, s.LakeSnapshotKeep)
+	}
+	return nil
 }
 
 func envDuration(key string, def time.Duration) (time.Duration, error) {

@@ -159,3 +159,10 @@ serviceMonitor:
   path: /metrics
   port: mon-http
   interval: 30s
+# Alerts on the maintenance Deployment's health gauges (SR-14). Thresholds
+# default to ~3x the maintenance interval and ~90% of LAKE_SNAPSHOT_RETENTION;
+# tune them together with LAKE_MAINTENANCE_INTERVAL / LAKE_SNAPSHOT_RETENTION.
+prometheusRule:
+  enabled: true
+  maintenanceStalledSeconds: 2700 # 45m = 3x the 15m default interval
+  snapshotAgeAlertSeconds: 233280 # 64.8h = 90% of the 72h default retention

@@ -300,9 +300,13 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 // (Nak after a partial publish failure) collapse inside the stream's
 // duplicate window instead of double-delivering to vehicle-triggers.
 func (b *Bridge) publishJSONAsync(subject string, payload any, dedup string) (jetstream.PubAckFuture, error) {
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling decoded payload for %s: %w", subject, err)
+	}
 	msg := &nats.Msg{
 		Subject: subject,
-		Data:    mustJSON(payload),
+		Data:    data,
 		Header:  nats.Header{nats.MsgIdHdr: []string{dedup}},
 	}
 	fut, err := b.js.PublishMsgAsync(msg)
@@ -388,19 +392,15 @@ func signalEqual(a, b vss.Signal) bool {
 	return a.Data.Name == b.Data.Name && a.Data.Timestamp.Equal(b.Data.Timestamp)
 }
 
+// subjectSanitizer matches vehicle-triggers-api's subject sanitizer. Hoisted to
+// a package var: building the replacer's trie on every signal name was wasted
+// work in the per-event fan-out (SR-20).
+var subjectSanitizer = strings.NewReplacer(" ", "_", ".", "_", "*", "_", ">", "_", "\t", "_", "\n", "_", "\r", "_")
+
 // sanitize matches vehicle-triggers-api's subject sanitizer.
 func sanitize(s string) string {
 	if s == "" {
 		return "_"
 	}
-	r := strings.NewReplacer(" ", "_", ".", "_", "*", "_", ">", "_", "\t", "_", "\n", "_", "\r", "_")
-	return r.Replace(s)
-}
-
-func mustJSON(v any) []byte {
-	body, err := json.Marshal(v)
-	if err != nil {
-		panic(fmt.Sprintf("marshaling decoded payload: %v", err))
-	}
-	return body
+	return subjectSanitizer.Replace(s)
 }

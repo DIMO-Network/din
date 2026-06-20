@@ -1,0 +1,63 @@
+{{- if .Values.prometheusRule.enabled }}
+# Alerts on the maintenance Deployment's health gauges. Previously din shipped
+# no PrometheusRule at all, so a wedged or crashed maintainer was invisible —
+# its first downstream symptom is dq's cursor resetting past expired snapshots
+# (silent data loss), hours later (SR-14).
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "din.fullname" . }}-alerts
+  labels:
+    {{- include "din.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: din-maintenance
+      rules:
+        - alert: DinMaintenanceErrors
+          expr: increase(din_lake_maintenance_errors_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: lake maintenance cycle is erroring
+            description: >-
+              The din maintainer is failing merge/expire/cleanup steps. Small
+              files accumulate (per-query S3 GET cost) and snapshot expiry may
+              stall; investigate before the consumer floor or retention drift.
+        - alert: DinMaintenanceStalled
+          expr: time() - max(din_lake_last_successful_cycle_timestamp_seconds) > {{ .Values.prometheusRule.maintenanceStalledSeconds }}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: lake maintenance has not completed a cycle recently
+            description: >-
+              No successful maintenance cycle within the alert window — the
+              maintainer is crashed or wedged. Snapshot expiry has stopped;
+              once a consumer (dq) lags past LAKE_SNAPSHOT_RETENTION its cursor
+              resets and un-decoded raw events are skipped. Restart the
+              maintenance Deployment.
+        - alert: DinSnapshotAgeNearRetention
+          expr: max(din_lake_oldest_unexpired_snapshot_age_seconds) > {{ .Values.prometheusRule.snapshotAgeAlertSeconds }}
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: oldest unexpired snapshot is approaching retention
+            description: >-
+              The change-feed window is close to LAKE_SNAPSHOT_RETENTION. A
+              consumer that lags further will have its cursor range expired.
+              Raise retention or speed up the slow consumer.
+        - alert: DinExpiryFloorBinding
+          expr: max(din_lake_expiry_floor_binding) == 1
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: a slow consumer is holding back snapshot expiry
+            description: >-
+              Snapshot expiry is pinned to a downstream consumer's reported
+              floor (dq) rather than the time window for over an hour. dq is
+              lagging — expect growing storage and, if it falls past
+              LAKE_CONSUMER_STALENESS, a cursor reset.
+{{- end }}

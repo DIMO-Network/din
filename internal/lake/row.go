@@ -8,6 +8,10 @@ import (
 	"github.com/DIMO-Network/cloudevent"
 )
 
+// emptyExtrasJSON is the extras column value for an event with no non-column
+// header fields — the common case. A package const avoids per-row allocation.
+const emptyExtrasJSON = "{}"
+
 // rowArgs maps a StoredEvent onto raw_events columns with the same
 // semantics as cloudevent/parquet.convertEvent, keeping native rows
 // byte-compatible with backfilled DIS bundles: extras carries the
@@ -17,12 +21,13 @@ import (
 // tombstone pointer (NULL when empty), matching ParquetRow so backfilled
 // DIS bundles register cleanly and dq can resolve voiding.
 func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
-	extrasJSON := []byte("{}")
+	extrasJSON := emptyExtrasJSON
 	if extras := cloudevent.AddNonColumnFieldsToExtras(&event.CloudEventHeader); extras != nil {
-		var err error
-		if extrasJSON, err = json.Marshal(extras); err != nil {
+		b, err := json.Marshal(extras)
+		if err != nil {
 			return nil, fmt.Errorf("marshaling extras: %w", err)
 		}
+		extrasJSON = string(b)
 	}
 
 	var data, dataBase64, dataIndexKey driver.Value

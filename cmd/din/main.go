@@ -136,9 +136,7 @@ func maintainOnce(log zerolog.Logger) error {
 		return err
 	}
 	defer lk.Close() //nolint:errcheck
-	return lake.NewMaintainer(lk, lake.MaintConfig{
-		SnapshotKeep: settings.LakeSnapshotKeep,
-	}, log).Cycle(ctx)
+	return lake.NewMaintainer(lk, maintConfig(settings), log).Cycle(ctx)
 }
 
 func lakeConfig(settings config.Settings) lake.Config {
@@ -154,6 +152,18 @@ func lakeConfig(settings config.Settings) lake.Config {
 		TargetFileSize:    settings.LakeTargetFileSize,
 		ExtensionDir:      settings.LakeExtensionDir,
 		MaxConns:          settings.NATSStreamPartitions + 2,
+	}
+}
+
+// maintConfig builds the maintainer config from settings. Single source of
+// truth so every caller plumbs the same fields — notably ConsumerStaleness,
+// which gates how long a lagging consumer (dq) is protected from snapshot
+// expiry before its cursor range is reclaimed (SR-2).
+func maintConfig(settings config.Settings) lake.MaintConfig {
+	return lake.MaintConfig{
+		Interval:          settings.LakeMaintInterval,
+		SnapshotKeep:      settings.LakeSnapshotKeep,
+		ConsumerStaleness: settings.LakeConsumerStaleness,
 	}
 }
 
@@ -302,10 +312,7 @@ func run(log zerolog.Logger) error {
 	}
 
 	if settings.LakeMaintenanceEnabled {
-		maintainer := lake.NewMaintainer(lk, lake.MaintConfig{
-			Interval:     settings.LakeMaintInterval,
-			SnapshotKeep: settings.LakeSnapshotKeep,
-		}, log)
+		maintainer := lake.NewMaintainer(lk, maintConfig(settings), log)
 		group.Go(func() error { return maintainer.Run(gctx) })
 	}
 	if settings.DecodeStreamEnabled {

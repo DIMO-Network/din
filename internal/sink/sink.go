@@ -42,6 +42,11 @@ type Config struct {
 	// size. DuckLake splits each bundle across partitions itself, so a
 	// single buffer needs no per-partition cap.
 	MaxBytesPerFlush int
+	// MaxBufferedBytes is the hard ceiling on un-flushed buffered payload.
+	// When the writer stalls and flush slots fill, the Run loop blocks on
+	// this ceiling so JetStream backpressure propagates instead of the
+	// buffer growing until OOM (SR-8). Defaults to 4x MaxBytesPerFlush.
+	MaxBufferedBytes int
 	// MaxAge flushes the buffer this long after its first event.
 	MaxAge time.Duration
 	// Workers is the number of flush workers. Bundles serialize on the
@@ -61,6 +66,11 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxBytesPerFlush == 0 {
 		c.MaxBytesPerFlush = 128 << 20
+	}
+	if c.MaxBufferedBytes == 0 {
+		// Headroom for normal bursts above the flush size, but a firm cap so
+		// a stalled writer can't grow the buffer without bound.
+		c.MaxBufferedBytes = 4 * c.MaxBytesPerFlush
 	}
 	if c.MaxAge == 0 {
 		c.MaxAge = time.Minute
@@ -147,6 +157,7 @@ loop:
 			}
 			s.add(msg)
 			s.flushReady(false)
+			s.applyBackpressure(ctx)
 		case <-ticker.C:
 			s.flushReady(false)
 		}
@@ -272,6 +283,25 @@ func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
 	}
 	s.buffer = nil
 	return true
+}
+
+// applyBackpressure blocks the Run goroutine while the buffer sits above the
+// hard byte ceiling and no flush slot is free. Blocking here stops draining the
+// msgs channel, which fills and stalls the fetch loop, propagating backpressure
+// to JetStream — bounding buffered memory instead of letting a stalled writer
+// grow it without limit (SR-8). Returns immediately under the ceiling, on
+// hand-off, or when ctx is done (the shutdown drain then flushes what remains).
+func (s *Sink) applyBackpressure(ctx context.Context) {
+	buf := s.buffer
+	if buf == nil || s.cfg.MaxBufferedBytes <= 0 || buf.bytes < s.cfg.MaxBufferedBytes {
+		return
+	}
+	job := flushJob{events: buf.events, msgs: buf.msgs}
+	select {
+	case s.jobs <- job:
+		s.buffer = nil
+	case <-ctx.Done():
+	}
 }
 
 func (s *Sink) worker(ctx context.Context) {

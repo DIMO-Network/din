@@ -60,10 +60,10 @@ func runSubcommand(args []string, log zerolog.Logger) error {
 		}
 		return lake.InstallExtensions(context.Background(), args[1])
 	case "maintain":
-		// One maintenance cycle, then exit — for a k8s CronJob when the
-		// ingest deployment runs more than one replica (exactly one
-		// maintenance process may run per catalog).
-		return maintainOnce(log)
+		// The dedicated lake-maintenance service (long-lived loop + ops
+		// server) for the maintenance Deployment when ingest runs more than
+		// one replica — exactly one maintenance process per catalog.
+		return runMaintenance(log)
 	case "lake-backfill":
 		// One-time registration of legacy DIS bundles into the lake.
 		if len(args) != 2 {
@@ -123,11 +123,22 @@ func lakeBackfill(source string, log zerolog.Logger) error {
 	return nil
 }
 
-func maintainOnce(log zerolog.Logger) error {
+// runMaintenance is the dedicated lake-maintenance service: the long-lived
+// maintainer loop plus the ops server (health + metrics). It backs the
+// maintenance Deployment used when ingest runs more than one replica (exactly
+// one maintenance process per catalog). It mirrors run()'s maintenance + ops
+// wiring so the health gauge stays scrapable and the Deployment's liveness
+// probe has an endpoint to hit — a one-shot here would exit immediately and
+// CrashLoop under those probes.
+func runMaintenance(log zerolog.Logger) error {
 	settings, err := config.Load()
 	if err != nil {
 		return err
 	}
+	if level, err := zerolog.ParseLevel(settings.LogLevel); err == nil {
+		zerolog.SetGlobalLevel(level)
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -136,7 +147,14 @@ func maintainOnce(log zerolog.Logger) error {
 		return err
 	}
 	defer lk.Close() //nolint:errcheck
-	return lake.NewMaintainer(lk, maintConfig(settings), log).Cycle(ctx)
+
+	opsSrv := server.NewOpsServer(server.OpsConfig{Addr: settings.OpsAddr})
+	maintainer := lake.NewMaintainer(lk, maintConfig(settings), log)
+
+	group, gctx := errgroup.WithContext(ctx)
+	group.Go(func() error { return serveHTTP(gctx, opsSrv, false, log) })
+	group.Go(func() error { return maintainer.Run(gctx) })
+	return group.Wait()
 }
 
 func lakeConfig(settings config.Settings) lake.Config {

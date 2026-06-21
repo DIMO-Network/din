@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -18,16 +16,11 @@ import (
 
 // fakeAPI implements the api interface for unit tests; no real S3.
 type fakeAPI struct {
-	putInputs    []*s3.PutObjectInput
-	putErr       error
-	getOutput    *s3.GetObjectOutput
-	getErr       error
-	listPages    []*s3.ListObjectsV2Output
-	listInputs   []*s3.ListObjectsV2Input
-	listErr      error
-	deleteInputs []*s3.DeleteObjectsInput
-	deleteOutput *s3.DeleteObjectsOutput
-	deleteErr    error
+	putInputs  []*s3.PutObjectInput
+	putErr     error
+	listPages  []*s3.ListObjectsV2Output
+	listInputs []*s3.ListObjectsV2Input
+	listErr    error
 }
 
 func (f *fakeAPI) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
@@ -38,13 +31,6 @@ func (f *fakeAPI) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(
 	return &s3.PutObjectOutput{}, nil
 }
 
-func (f *fakeAPI) GetObject(_ context.Context, _ *s3.GetObjectInput, _ ...func(*s3.Options)) (*s3.GetObjectOutput, error) {
-	if f.getErr != nil {
-		return nil, f.getErr
-	}
-	return f.getOutput, nil
-}
-
 func (f *fakeAPI) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	f.listInputs = append(f.listInputs, in)
 	if f.listErr != nil {
@@ -53,17 +39,6 @@ func (f *fakeAPI) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ 
 	page := f.listPages[0]
 	f.listPages = f.listPages[1:]
 	return page, nil
-}
-
-func (f *fakeAPI) DeleteObjects(_ context.Context, in *s3.DeleteObjectsInput, _ ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error) {
-	f.deleteInputs = append(f.deleteInputs, in)
-	if f.deleteErr != nil {
-		return nil, f.deleteErr
-	}
-	if f.deleteOutput != nil {
-		return f.deleteOutput, nil
-	}
-	return &s3.DeleteObjectsOutput{}, nil
 }
 
 func newTestClient(api *fakeAPI) *Client {
@@ -98,67 +73,6 @@ func TestPutObject_ErrorWrapped(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, api.putErr)
 	assert.Contains(t, err.Error(), "test-bucket/k")
-}
-
-func TestGetObject(t *testing.T) {
-	t.Parallel()
-	payload := strings.Repeat("d", 100)
-
-	t.Run("within max size", func(t *testing.T) {
-		api := &fakeAPI{getOutput: &s3.GetObjectOutput{
-			Body:          io.NopCloser(strings.NewReader(payload)),
-			ContentLength: aws.Int64(int64(len(payload))),
-		}}
-		c := newTestClient(api)
-
-		got, err := c.GetObject(context.Background(), "k", 200)
-		require.NoError(t, err)
-		assert.Equal(t, []byte(payload), got)
-	})
-
-	t.Run("no max size reads everything", func(t *testing.T) {
-		api := &fakeAPI{getOutput: &s3.GetObjectOutput{
-			Body: io.NopCloser(strings.NewReader(payload)),
-		}}
-		c := newTestClient(api)
-
-		got, err := c.GetObject(context.Background(), "k", 0)
-		require.NoError(t, err)
-		assert.Equal(t, []byte(payload), got)
-	})
-
-	t.Run("content length over max size", func(t *testing.T) {
-		api := &fakeAPI{getOutput: &s3.GetObjectOutput{
-			Body:          io.NopCloser(strings.NewReader(payload)),
-			ContentLength: aws.Int64(int64(len(payload))),
-		}}
-		c := newTestClient(api)
-
-		_, err := c.GetObject(context.Background(), "k", 50)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "exceeds max size")
-	})
-
-	t.Run("body longer than advertised content length", func(t *testing.T) {
-		api := &fakeAPI{getOutput: &s3.GetObjectOutput{
-			Body:          io.NopCloser(strings.NewReader(payload)),
-			ContentLength: aws.Int64(10), // lies
-		}}
-		c := newTestClient(api)
-
-		_, err := c.GetObject(context.Background(), "k", 50)
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "exceeds max size")
-	})
-
-	t.Run("get error wrapped", func(t *testing.T) {
-		api := &fakeAPI{getErr: errors.New("no such key")}
-		c := newTestClient(api)
-
-		_, err := c.GetObject(context.Background(), "k", 0)
-		require.Error(t, err)
-		assert.ErrorIs(t, err, api.getErr)
-	})
 }
 
 func TestListObjectsV2_Paginates(t *testing.T) {
@@ -204,62 +118,6 @@ func TestListObjectsV2_ErrorWrapped(t *testing.T) {
 	_, err := c.ListObjectsV2(context.Background(), "prefix/")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, api.listErr)
-}
-
-func TestDeleteObjects_Batches(t *testing.T) {
-	t.Parallel()
-	api := &fakeAPI{}
-	c := newTestClient(api)
-
-	keys := make([]string, 0, deleteBatchSize+5)
-	for i := range deleteBatchSize + 5 {
-		keys = append(keys, fmt.Sprintf("key-%04d", i))
-	}
-
-	require.NoError(t, c.DeleteObjects(context.Background(), keys))
-
-	require.Len(t, api.deleteInputs, 2, "1005 keys must be split into two batches")
-	assert.Len(t, api.deleteInputs[0].Delete.Objects, deleteBatchSize)
-	assert.Len(t, api.deleteInputs[1].Delete.Objects, 5)
-	assert.Equal(t, "key-0000", aws.ToString(api.deleteInputs[0].Delete.Objects[0].Key))
-	assert.Equal(t, fmt.Sprintf("key-%04d", deleteBatchSize), aws.ToString(api.deleteInputs[1].Delete.Objects[0].Key))
-	assert.True(t, aws.ToBool(api.deleteInputs[0].Delete.Quiet))
-}
-
-func TestDeleteObjects_Empty(t *testing.T) {
-	t.Parallel()
-	api := &fakeAPI{}
-	c := newTestClient(api)
-
-	require.NoError(t, c.DeleteObjects(context.Background(), nil))
-	assert.Empty(t, api.deleteInputs, "no API call for an empty key list")
-}
-
-func TestDeleteObjects_PerKeyErrorsSurface(t *testing.T) {
-	t.Parallel()
-	api := &fakeAPI{deleteOutput: &s3.DeleteObjectsOutput{
-		Errors: []s3types.Error{
-			{Key: aws.String("key-1"), Message: aws.String("access denied")},
-			{Key: aws.String("key-2"), Message: aws.String("access denied")},
-		},
-	}}
-	c := newTestClient(api)
-
-	err := c.DeleteObjects(context.Background(), []string{"key-1", "key-2"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "2 keys failed")
-	assert.Contains(t, err.Error(), "access denied")
-	assert.Contains(t, err.Error(), "key-1")
-}
-
-func TestDeleteObjects_RequestErrorWrapped(t *testing.T) {
-	t.Parallel()
-	api := &fakeAPI{deleteErr: errors.New("connection reset")}
-	c := newTestClient(api)
-
-	err := c.DeleteObjects(context.Background(), []string{"key-1"})
-	require.Error(t, err)
-	assert.ErrorIs(t, err, api.deleteErr)
 }
 
 func TestNew_RequiresBucket(t *testing.T) {

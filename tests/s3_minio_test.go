@@ -3,9 +3,8 @@
 //
 //   - TestMinIO_S3ClientParity pins s3client semantics that the fsstore
 //     mirrors (lexicographic listing, key-prefix — not directory — list
-//     semantics, maxSize enforcement, quiet deletes of missing keys) on a
-//     real S3 implementation instead of the in-package fake. s3client
-//     serves the blob bucket.
+//     semantics) on a real S3 implementation instead of the in-package
+//     fake. s3client serves the blob bucket.
 //   - TestMinIO_EndToEnd_DeviceToDuckLake runs the full ingest pipeline
 //     (device POST → JetStream → sink → DuckLake commit) with the lake's
 //     DATA_PATH on MinIO, then a maintenance cycle, proving the
@@ -149,24 +148,6 @@ func TestMinIO_S3ClientParity(t *testing.T) {
 		require.NoError(t, client.PutObject(ctx, key, body), "put %s", key)
 	}
 
-	// Get round-trips bytes exactly.
-	const statusKey = "raw/type=dimo.status/date=2026-06-08/a.parquet"
-	got, err := client.GetObject(ctx, statusKey, 0)
-	require.NoError(t, err)
-	assert.Equal(t, seed[statusKey], got)
-
-	// maxSize: exactly the object size passes, one byte under fails.
-	size := int64(len(seed[statusKey]))
-	got, err = client.GetObject(ctx, statusKey, size)
-	require.NoError(t, err)
-	assert.Equal(t, seed[statusKey], got)
-	_, err = client.GetObject(ctx, statusKey, size-1)
-	require.ErrorContains(t, err, "exceeds max size", "real S3 returns Content-Length so the pre-read guard fires")
-
-	// Missing key surfaces an error (NoSuchKey under the wrap).
-	_, err = client.GetObject(ctx, "raw/no-such-key", 0)
-	require.Error(t, err)
-
 	// List semantics: prefixes are key prefixes, not directories. "raw/type="
 	// spans both event types, and S3 returns keys in lexicographic order —
 	// dimo.events before dimo.status, dates ascending within a type.
@@ -192,18 +173,6 @@ func TestMinIO_S3ClientParity(t *testing.T) {
 	objects, err = client.ListObjectsV2(ctx, "raw/type=dimo.unknown/")
 	require.NoError(t, err)
 	assert.Empty(t, objects)
-
-	// DeleteObjects tolerates missing keys (S3 quiet-delete) and removes the
-	// rest; an empty key slice is a no-op.
-	require.NoError(t, client.DeleteObjects(ctx, nil))
-	err = client.DeleteObjects(ctx, []string{
-		"raw/type=dimo.events/date=2026-06-09/a.parquet",
-		"raw/type=dimo.missing/never-existed.parquet",
-	})
-	require.NoError(t, err, "deleting a missing key alongside a real one must not fail")
-	objects, err = client.ListObjectsV2(ctx, "raw/")
-	require.NoError(t, err)
-	require.Len(t, objects, 2, "only the two status objects remain")
 }
 
 // TestMinIO_EndToEnd_DeviceToDuckLake is the din e2e (device POST → convert

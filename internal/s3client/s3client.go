@@ -1,24 +1,19 @@
-// Package s3client wraps aws-sdk-go-v2 S3 access for din. It implements
-// split.ObjectStore for blob externalization and exposes the get/list/delete
-// surface the parquet compactor needs (ported from
-// DIMO-Network/parquet-processor).
+// Package s3client wraps aws-sdk-go-v2 S3 access for din: blob PutObject for
+// split externalization and ListObjectsV2 for lake backfill discovery. It
+// implements objstore.Store and split.ObjectStore.
 package s3client
 
 import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 
 	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
-
-const deleteBatchSize = 1000
 
 // Config holds the S3 connection settings.
 type Config struct {
@@ -42,9 +37,7 @@ type ObjectInfo = objstore.ObjectInfo
 // api is the subset of the AWS S3 client the wrapper uses.
 type api interface {
 	PutObject(ctx context.Context, in *s3.PutObjectInput, opts ...func(*s3.Options)) (*s3.PutObjectOutput, error)
-	GetObject(ctx context.Context, in *s3.GetObjectInput, opts ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	ListObjectsV2(ctx context.Context, in *s3.ListObjectsV2Input, opts ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
-	DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput, opts ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 }
 
 // Client is a bucket-bound S3 wrapper.
@@ -98,39 +91,6 @@ func (c *Client) PutObject(ctx context.Context, key string, body []byte) error {
 	return nil
 }
 
-// GetObject downloads the object at key. maxSize > 0 rejects objects larger
-// than maxSize bytes; maxSize <= 0 reads without bound.
-func (c *Client) GetObject(ctx context.Context, key string, maxSize int64) ([]byte, error) {
-	resp, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(c.bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("get object %s/%s: %w", c.bucket, key, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if maxSize <= 0 {
-		data, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("read object %s/%s: %w", c.bucket, key, err)
-		}
-		return data, nil
-	}
-
-	if resp.ContentLength != nil && *resp.ContentLength > maxSize {
-		return nil, fmt.Errorf("object %s/%s exceeds max size of %d bytes", c.bucket, key, maxSize)
-	}
-	data, err := io.ReadAll(io.LimitReader(resp.Body, maxSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("read object %s/%s: %w", c.bucket, key, err)
-	}
-	if int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("object %s/%s exceeds max size of %d bytes", c.bucket, key, maxSize)
-	}
-	return data, nil
-}
-
 // ListObjectsV2 lists all objects under prefix, following pagination.
 func (c *Client) ListObjectsV2(ctx context.Context, prefix string) ([]ObjectInfo, error) {
 	var objects []ObjectInfo
@@ -151,35 +111,4 @@ func (c *Client) ListObjectsV2(ctx context.Context, prefix string) ([]ObjectInfo
 		}
 	}
 	return objects, nil
-}
-
-// DeleteObjects removes keys in batches of 1000 (the S3 API limit) and
-// surfaces per-key delete failures as an error.
-func (c *Client) DeleteObjects(ctx context.Context, keys []string) error {
-	for i := 0; i < len(keys); i += deleteBatchSize {
-		end := i + deleteBatchSize
-		if end > len(keys) {
-			end = len(keys)
-		}
-		batch := keys[i:end]
-
-		objects := make([]s3types.ObjectIdentifier, len(batch))
-		for j, key := range batch {
-			objects[j] = s3types.ObjectIdentifier{Key: aws.String(key)}
-		}
-
-		resp, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(c.bucket),
-			Delete: &s3types.Delete{Objects: objects, Quiet: aws.Bool(true)},
-		})
-		if err != nil {
-			return fmt.Errorf("delete objects batch starting at %d: %w", i, err)
-		}
-		if len(resp.Errors) > 0 {
-			first := resp.Errors[0]
-			return fmt.Errorf("delete objects batch starting at %d: %d keys failed, first error: %s (key: %s)",
-				i, len(resp.Errors), aws.ToString(first.Message), aws.ToString(first.Key))
-		}
-	}
-	return nil
 }

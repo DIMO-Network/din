@@ -1,8 +1,7 @@
 // Package fsstore is the local-filesystem objstore.Store implementation for
 // single-node deployments. Semantics mirror s3client where consumers can
 // tell the difference: keys are slash-separated, List returns
-// lexicographically sorted keys, deleting a missing object is not an error,
-// and a missing prefix lists empty.
+// lexicographically sorted keys, and a missing prefix lists empty.
 //
 // Durability matches the sink's ack-after-durable contract: PutObject writes
 // a temp file in the target directory, fsyncs, then renames, so readers
@@ -103,28 +102,6 @@ func (c *Client) PutObject(_ context.Context, key string, body []byte) error {
 	return nil
 }
 
-// GetObject reads the object at key. maxSize > 0 rejects objects larger than
-// maxSize bytes; maxSize <= 0 reads without bound. A missing key wraps
-// fs.ErrNotExist.
-func (c *Client) GetObject(_ context.Context, key string, maxSize int64) ([]byte, error) {
-	p := c.path(key)
-	info, err := os.Stat(p)
-	if err != nil {
-		return nil, fmt.Errorf("get object %s: %w", key, err)
-	}
-	if maxSize > 0 && info.Size() > maxSize {
-		return nil, fmt.Errorf("object %s exceeds max size of %d bytes", key, maxSize)
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return nil, fmt.Errorf("read object %s: %w", key, err)
-	}
-	if maxSize > 0 && int64(len(data)) > maxSize {
-		return nil, fmt.Errorf("object %s exceeds max size of %d bytes", key, maxSize)
-	}
-	return data, nil
-}
-
 // ListObjectsV2 lists all objects whose key starts with prefix, sorted
 // lexicographically like S3. prefix is a key prefix, not a directory:
 // "raw/type=" matches every type partition. A missing prefix lists empty.
@@ -174,15 +151,4 @@ func (c *Client) ListObjectsV2(_ context.Context, prefix string) ([]objstore.Obj
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out, nil
-}
-
-// DeleteObjects removes the given keys. Missing keys are ignored, matching
-// S3's quiet delete.
-func (c *Client) DeleteObjects(_ context.Context, keys []string) error {
-	for _, key := range keys {
-		if err := os.Remove(c.path(key)); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("delete object %s: %w", key, err)
-		}
-	}
-	return nil
 }

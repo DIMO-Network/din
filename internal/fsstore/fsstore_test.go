@@ -2,8 +2,6 @@ package fsstore
 
 import (
 	"context"
-	"errors"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -30,8 +28,9 @@ func TestPutGetRoundTrip(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
 
-	require.NoError(t, c.PutObject(ctx, "raw/type=dimo.status/date=2026-06-10/a.parquet", []byte("body")))
-	got, err := c.GetObject(ctx, "raw/type=dimo.status/date=2026-06-10/a.parquet", 0)
+	key := "raw/type=dimo.status/date=2026-06-10/a.parquet"
+	require.NoError(t, c.PutObject(ctx, key, []byte("body")))
+	got, err := os.ReadFile(c.path(key))
 	require.NoError(t, err)
 	assert.Equal(t, []byte("body"), got)
 }
@@ -41,9 +40,10 @@ func TestPutOverwritesAtomically(t *testing.T) {
 	c := newClient(t)
 	ctx := context.Background()
 
-	require.NoError(t, c.PutObject(ctx, "decoded/v1/_state/watermark.json", []byte(`{"a":"1"}`)))
-	require.NoError(t, c.PutObject(ctx, "decoded/v1/_state/watermark.json", []byte(`{"a":"2"}`)))
-	got, err := c.GetObject(ctx, "decoded/v1/_state/watermark.json", 0)
+	key := "decoded/v1/_state/watermark.json"
+	require.NoError(t, c.PutObject(ctx, key, []byte(`{"a":"1"}`)))
+	require.NoError(t, c.PutObject(ctx, key, []byte(`{"a":"2"}`)))
+	got, err := os.ReadFile(c.path(key))
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"a":"2"}`, string(got))
 }
@@ -57,32 +57,6 @@ func TestPutLeavesNoTempResidue(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
 	assert.Equal(t, "a.parquet", entries[0].Name())
-}
-
-func TestGetObject_Missing(t *testing.T) {
-	t.Parallel()
-	c := newClient(t)
-	_, err := c.GetObject(context.Background(), "nope/missing", 0)
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, fs.ErrNotExist))
-}
-
-func TestGetObject_MaxSize(t *testing.T) {
-	t.Parallel()
-	c := newClient(t)
-	ctx := context.Background()
-	require.NoError(t, c.PutObject(ctx, "k", []byte("12345")))
-
-	_, err := c.GetObject(ctx, "k", 4)
-	require.ErrorContains(t, err, "exceeds max size of 4 bytes")
-
-	got, err := c.GetObject(ctx, "k", 5)
-	require.NoError(t, err)
-	assert.Len(t, got, 5)
-
-	got, err = c.GetObject(ctx, "k", 0)
-	require.NoError(t, err)
-	assert.Len(t, got, 5)
 }
 
 func TestListObjectsV2_KeyPrefixAcrossDirs(t *testing.T) {
@@ -130,16 +104,4 @@ func TestListObjectsV2_HidesTempFiles(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, out, 1)
 	assert.Equal(t, "raw/a.parquet", out[0].Key)
-}
-
-func TestDeleteObjects_MissingTolerated(t *testing.T) {
-	t.Parallel()
-	c := newClient(t)
-	ctx := context.Background()
-	require.NoError(t, c.PutObject(ctx, "raw/a.parquet", []byte("x")))
-
-	require.NoError(t, c.DeleteObjects(ctx, []string{"raw/a.parquet", "raw/never-existed"}))
-	out, err := c.ListObjectsV2(ctx, "raw/")
-	require.NoError(t, err)
-	assert.Empty(t, out)
 }

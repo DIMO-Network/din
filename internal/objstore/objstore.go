@@ -18,14 +18,14 @@ type ObjectInfo struct {
 	Size int64
 }
 
-// Store is the full client surface shared by s3client.Client and
-// fsstore.Client. Consumers keep their own narrower interfaces (sink, split,
-// compact); Store exists so main can hold either implementation.
+// Store is the client surface shared by s3client.Client and fsstore.Client:
+// din writes blobs (split) and lists objects (lake backfill). Consumers keep
+// their own narrower interfaces; Store exists so main can hold either
+// implementation. DuckLake owns reading and deleting lake data through its
+// catalog, so the store surface is write + list only.
 type Store interface {
 	PutObject(ctx context.Context, key string, body []byte) error
-	GetObject(ctx context.Context, key string, maxSize int64) ([]byte, error)
 	ListObjectsV2(ctx context.Context, prefix string) ([]ObjectInfo, error)
-	DeleteObjects(ctx context.Context, keys []string) error
 }
 
 // IsLocalPath reports whether bucket names a local filesystem root rather

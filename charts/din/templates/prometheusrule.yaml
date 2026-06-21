@@ -37,6 +37,26 @@ spec:
               once a consumer (dq) lags past LAKE_SNAPSHOT_RETENTION its cursor
               resets and un-decoded raw events are skipped. Restart the
               maintenance Deployment.
+{{- if .Values.maintenance.enabled }}
+        - alert: DinMaintenanceDown
+          # absent_over_time catches what DinMaintenanceStalled cannot: when the
+          # maintenance pod is down / CrashLooping / unscraped, its gauges are
+          # ABSENT, so `time() - max(absent)` returns no data and never fires.
+          # This alerts on the absence itself. Rendered only when the dedicated
+          # maintenance Deployment is enabled (its sole scrape target).
+          expr: absent_over_time(din_lake_last_successful_cycle_timestamp_seconds[15m])
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: lake maintenance is not reporting (down, CrashLooping, or unscraped)
+            description: >-
+              No maintenance metric has been scraped for 15m — the maintenance
+              Deployment is not running, so snapshot expiry has stopped and the
+              expiry / floor / dropped-consumer alerts are all blind. Restart it
+              before a consumer (dq) lags past LAKE_SNAPSHOT_RETENTION and resets
+              its cursor (silent data loss).
+{{- end }}
         - alert: DinSnapshotAgeNearRetention
           expr: max(din_lake_oldest_unexpired_snapshot_age_seconds) > {{ .Values.prometheusRule.snapshotAgeAlertSeconds }}
           for: 10m
@@ -91,4 +111,29 @@ spec:
               loss for that consumer (e.g. dq). Backfill the skipped snapshot
               range, then restore the consumer and raise retention or decode
               throughput.
+    - name: din-ingest
+      rules:
+        - alert: DinSinkPoisonRows
+          expr: increase(din_sink_poison_rows_total[15m]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: ingest is dropping un-writable rows (data loss)
+            description: >-
+              The sink terminated rows it could not persist (bad encoding, schema
+              drift) to avoid wedging a WAL partition — those events never reach
+              the lake. A sustained rate is a producer/schema regression silently
+              discarding customer data; inspect the source.
+        - alert: DinSinkRedeliveriesHigh
+          expr: rate(din_sink_redeliveries_total[5m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: sink redeliveries sustained — writer/catalog distress
+            description: >-
+              The sink is repeatedly failing to commit bundles (NATS redelivery),
+              an early indicator of catalog Postgres / S3 trouble before the WAL
+              backs up. Check the lake writer and catalog connectivity.
 {{- end }}

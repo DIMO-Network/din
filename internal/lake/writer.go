@@ -73,8 +73,10 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 		return nil
 	}
 	// Round-robin to the next connection; concurrent callers land on different
-	// connections and proceed in parallel, queueing only when they collide.
-	wc := w.conns[int(w.next.Add(1)-1)%len(w.conns)]
+	// connections and proceed in parallel, queueing only when they collide. The
+	// modulo stays in the unsigned domain so the index can't go negative once the
+	// counter passes the int64 boundary.
+	wc := w.conns[int(w.next.Add(1)%uint64(len(w.conns)))]
 	wc.mu.Lock()
 	defer wc.mu.Unlock()
 	conn := wc.conn

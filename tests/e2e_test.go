@@ -98,7 +98,9 @@ func TestEndToEnd_DeviceToDuckLakeAndTriggers(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = writer.Close() })
 	go func() {
-		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
+		// MinFlushBytes: 1 so the soft-age trigger fires on these tiny buffers; the
+		// default 16 MiB floor would hold them until the 5m hard cap (past Eventually).
+		_ = sink.New(sink.Config{MaxAge: 200 * time.Millisecond, MinFlushBytes: 1}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
 	}()
 
 	// Decodestream bridge.

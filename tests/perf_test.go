@@ -117,7 +117,7 @@ func TestIngestPerformance(t *testing.T) {
 	sinkDone := make(chan struct{})
 	go func() {
 		defer close(sinkDone)
-		_ = sink.New(sink.Config{MaxAge: time.Second}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
+		_ = sink.New(sink.Config{MaxAge: time.Second, MinFlushBytes: 1}, sinkConsumer, writer, zerolog.Nop()).Run(ctx)
 	}()
 
 	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: concurrency}}

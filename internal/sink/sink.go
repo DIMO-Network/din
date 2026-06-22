@@ -70,8 +70,16 @@ type Config struct {
 	// this ceiling so JetStream backpressure propagates instead of the
 	// buffer growing until OOM (SR-8). Defaults to 4x MaxBytesPerFlush.
 	MaxBufferedBytes int
-	// MaxAge flushes the buffer this long after its first event.
+	// MaxAge is the soft age trigger: flush a buffer this old only once it has
+	// accumulated at least MinFlushBytes, so a low-traffic partition doesn't emit
+	// a tiny Parquet file every MaxAge. MaxAgeHard is the hard cap.
 	MaxAge time.Duration
+	// MinFlushBytes gates the MaxAge (soft) trigger — a buffer below this size
+	// keeps accumulating past MaxAge (up to MaxAgeHard) rather than flushing tiny.
+	MinFlushBytes int
+	// MaxAgeHard force-flushes the buffer this long after its first event,
+	// regardless of size — the latency bound for very-low-traffic partitions.
+	MaxAgeHard time.Duration
 	// Workers is the number of flush workers. Bundles serialize on the
 	// writer's connection; extra workers only deepen the queue between
 	// fetching and committing.
@@ -97,6 +105,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxAge == 0 {
 		c.MaxAge = time.Minute
+	}
+	if c.MinFlushBytes == 0 {
+		c.MinFlushBytes = 16 << 20 // 16 MiB — well above "tiny", well below the 128 MiB target
+	}
+	if c.MaxAgeHard == 0 {
+		c.MaxAgeHard = 5 * time.Minute
 	}
 	if c.Workers == 0 {
 		c.Workers = 2
@@ -281,10 +295,12 @@ func (s *Sink) flushReady(force bool) {
 	if buf == nil || len(buf.events) == 0 {
 		return
 	}
+	age := time.Since(buf.firstAt)
 	if force ||
 		len(buf.events) >= s.cfg.MaxRowsPerFlush ||
 		buf.bytes >= s.cfg.MaxBytesPerFlush ||
-		time.Since(buf.firstAt) >= s.cfg.MaxAge {
+		(age >= s.cfg.MaxAge && buf.bytes >= s.cfg.MinFlushBytes) ||
+		age >= s.cfg.MaxAgeHard {
 		s.enqueue(buf, force)
 	}
 }

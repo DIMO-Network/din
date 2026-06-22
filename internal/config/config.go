@@ -81,6 +81,21 @@ type Settings struct {
 	// cursor. Must exceed a healthy consumer's reporting gap, stay well
 	// below LakeSnapshotKeep.
 	LakeConsumerStaleness time.Duration // LAKE_CONSUMER_STALENESS
+	// LakeWriterConnections is how many pinned DuckDB connections each sink's
+	// writer round-robins bundles across, so several bundles' S3 uploads overlap.
+	// >1 raises per-partition write throughput; the DuckDB pool is sized for it.
+	LakeWriterConnections int // LAKE_WRITER_CONNECTIONS
+
+	// Sink (ingest batching). Zero takes the sink package default. Exposed to
+	// tune flush size vs latency — e.g. raise SinkMaxAgeHard to cut tiny Parquet
+	// files on low-traffic partitions, at the cost of higher latency-to-durable.
+	SinkMaxRowsPerFlush  uint64        // SINK_MAX_ROWS_PER_FLUSH
+	SinkMaxBytesPerFlush uint64        // SINK_MAX_BYTES_PER_FLUSH
+	SinkMinFlushBytes    uint64        // SINK_MIN_FLUSH_BYTES
+	SinkMaxAge           time.Duration // SINK_MAX_AGE
+	SinkMaxAgeHard       time.Duration // SINK_MAX_AGE_HARD
+	SinkWorkers          uint64        // SINK_WORKERS
+	SinkDrainTimeout     time.Duration // SINK_DRAIN_TIMEOUT
 
 	// Modules.
 	DecodeStreamEnabled bool
@@ -189,6 +204,34 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	if s.LakeConsumerStaleness, err = envDuration("LAKE_CONSUMER_STALENESS", time.Hour); err != nil {
+		return s, err
+	}
+	writerConns, err := envUint("LAKE_WRITER_CONNECTIONS", 2)
+	if err != nil {
+		return s, err
+	}
+	s.LakeWriterConnections = max(int(writerConns), 1) // keep the pool-size math consistent with the writer
+
+	// Sink knobs default to 0 → the sink package applies its own defaults.
+	if s.SinkMaxRowsPerFlush, err = envUint("SINK_MAX_ROWS_PER_FLUSH", 0); err != nil {
+		return s, err
+	}
+	if s.SinkMaxBytesPerFlush, err = envUint("SINK_MAX_BYTES_PER_FLUSH", 0); err != nil {
+		return s, err
+	}
+	if s.SinkMinFlushBytes, err = envUint("SINK_MIN_FLUSH_BYTES", 0); err != nil {
+		return s, err
+	}
+	if s.SinkMaxAge, err = envDuration("SINK_MAX_AGE", 0); err != nil {
+		return s, err
+	}
+	if s.SinkMaxAgeHard, err = envDuration("SINK_MAX_AGE_HARD", 0); err != nil {
+		return s, err
+	}
+	if s.SinkWorkers, err = envUint("SINK_WORKERS", 0); err != nil {
+		return s, err
+	}
+	if s.SinkDrainTimeout, err = envDuration("SINK_DRAIN_TIMEOUT", 0); err != nil {
 		return s, err
 	}
 

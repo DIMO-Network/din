@@ -171,7 +171,7 @@ func lakeConfig(settings config.Settings) lake.Config {
 		TargetFileSize:    settings.LakeTargetFileSize,
 		ParquetVersion:    settings.LakeParquetVersion,
 		ExtensionDir:      settings.LakeExtensionDir,
-		MaxConns:          settings.NATSStreamPartitions + 2,
+		MaxConns:          settings.NATSStreamPartitions*settings.LakeWriterConnections + 2,
 	}
 }
 
@@ -184,6 +184,20 @@ func maintConfig(settings config.Settings) lake.MaintConfig {
 		Interval:          settings.LakeMaintInterval,
 		SnapshotKeep:      settings.LakeSnapshotKeep,
 		ConsumerStaleness: settings.LakeConsumerStaleness,
+	}
+}
+
+// sinkConfig maps the env-tuned sink settings onto sink.Config. Zero values pass
+// through to the sink package's own defaults.
+func sinkConfig(settings config.Settings) sink.Config {
+	return sink.Config{
+		MaxRowsPerFlush:  int(settings.SinkMaxRowsPerFlush),
+		MaxBytesPerFlush: int(settings.SinkMaxBytesPerFlush),
+		MinFlushBytes:    int(settings.SinkMinFlushBytes),
+		MaxAge:           settings.SinkMaxAge,
+		MaxAgeHard:       settings.SinkMaxAgeHard,
+		Workers:          int(settings.SinkWorkers),
+		DrainTimeout:     settings.SinkDrainTimeout,
 	}
 }
 
@@ -335,12 +349,12 @@ func run(log zerolog.Logger) error {
 		if err != nil {
 			return err
 		}
-		writer, err := lk.NewWriter(ctx, lake.RawTable)
+		writer, err := lk.NewWriterN(ctx, lake.RawTable, settings.LakeWriterConnections)
 		if err != nil {
 			return err
 		}
 		defer writer.Close() //nolint:errcheck
-		group.Go(func() error { return sink.New(sink.Config{}, sinkConsumer, writer, log).Run(gctx) })
+		group.Go(func() error { return sink.New(sinkConfig(settings), sinkConsumer, writer, log).Run(gctx) })
 	}
 
 	if settings.LakeMaintenanceEnabled {

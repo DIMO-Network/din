@@ -30,6 +30,40 @@ func (m probeMsg) Metadata() (*jetstream.MsgMetadata, error) {
 	return &jetstream.MsgMetadata{NumDelivered: m.delivered}, nil
 }
 
+// flushReady's age trigger is adaptive: a buffer past the soft MaxAge flushes
+// only once it holds MinFlushBytes (so low-traffic partitions don't emit tiny
+// Parquet files), but the hard MaxAgeHard cap flushes regardless of size.
+func TestFlushReady_AdaptiveAgeTrigger(t *testing.T) {
+	mk := func() *Sink {
+		return &Sink{
+			cfg: Config{
+				MaxRowsPerFlush: 100_000, MaxBytesPerFlush: 128 << 20,
+				MinFlushBytes: 16 << 20, MaxAge: time.Minute, MaxAgeHard: 5 * time.Minute,
+			},
+			jobs: make(chan flushJob, 1),
+		}
+	}
+	buf := func(bytes int, age time.Duration) *eventBuffer {
+		return &eventBuffer{events: []cloudevent.StoredEvent{{}}, bytes: bytes, firstAt: time.Now().Add(-age)}
+	}
+	flushed := func(b *eventBuffer) bool {
+		s := mk()
+		s.buffer = b
+		s.flushReady(false)
+		return len(s.jobs) == 1
+	}
+
+	if flushed(buf(1<<20, 2*time.Minute)) {
+		t.Fatal("a 1 MiB buffer past the soft age flushed before the hard cap (tiny file)")
+	}
+	if !flushed(buf(20<<20, 2*time.Minute)) {
+		t.Fatal("a 20 MiB buffer past the soft age did not flush")
+	}
+	if !flushed(buf(1<<20, 6*time.Minute)) {
+		t.Fatal("a buffer past the hard age cap did not flush regardless of size")
+	}
+}
+
 // On a global fault (every write fails, nothing commits) isolate must stop after
 // the probe instead of grinding the whole bundle into N single-row transactions
 // — the bundle redelivers wholesale anyway (SR review — isolate-grind).

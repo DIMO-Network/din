@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/DIMO-Network/cloudevent"
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -14,8 +15,10 @@ import (
 // Writer appends raw cloudevents to one lake table. Each WriteBundle is a
 // single DuckLake transaction — one snapshot, one or more Parquet files
 // split by partition — and returns only once the commit is durable in the
-// catalog, so the caller can ack its WAL messages. Safe for concurrent
-// use; bundles serialize on one pinned connection.
+// catalog, so the caller can ack its WAL messages. Safe for concurrent use:
+// bundles are round-robined across a pool of pinned connections, so several
+// bundles' S3 Parquet uploads + commits overlap instead of serializing on one
+// connection (the per-partition write-throughput ceiling).
 //
 // Writes are a blind append: there is NO at-rest dedup here (no anti-join, no
 // ON CONFLICT). Delivery is at-least-once — NATS Nats-Msg-Id collapses retries
@@ -23,19 +26,44 @@ import (
 // failover, replay) duplicate rows persist in raw_events. Dedup is delegated to
 // readers: dq's INSERT anti-join for decoded signals/events and its read-side
 // QUALIFY for queries. Do not assume raw_events rows are unique (SR review #5).
+// Because writes carry no ordering, distributing bundles across connections is
+// safe.
 type Writer struct {
-	mu    sync.Mutex
-	conn  *sql.Conn
 	table string
+	conns []*writerConn
+	next  atomic.Uint64
 }
 
-// NewWriter pins a dedicated connection for appends to table.
+// writerConn is one pinned connection plus the mutex serializing the bundles
+// routed to it (a single DuckDB connection is not safe for concurrent BEGIN/
+// append/COMMIT).
+type writerConn struct {
+	mu   sync.Mutex
+	conn *sql.Conn
+}
+
+// NewWriter pins a single dedicated connection for appends to table.
 func (l *Lake) NewWriter(ctx context.Context, table string) (*Writer, error) {
-	conn, err := l.db.Conn(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("lake writer: %w", err)
+	return l.NewWriterN(ctx, table, 1)
+}
+
+// NewWriterN pins n dedicated connections; WriteBundle round-robins across them
+// so up to n bundles commit concurrently. The shared DuckDB pool must have room
+// for n connections per writer (see MaxConns sizing in cmd/din).
+func (l *Lake) NewWriterN(ctx context.Context, table string, n int) (*Writer, error) {
+	if n < 1 {
+		n = 1
 	}
-	return &Writer{conn: conn, table: table}, nil
+	w := &Writer{table: table, conns: make([]*writerConn, 0, n)}
+	for range n {
+		conn, err := l.db.Conn(ctx)
+		if err != nil {
+			_ = w.Close() // release any already-pinned connections
+			return nil, fmt.Errorf("lake writer: %w", err)
+		}
+		w.conns = append(w.conns, &writerConn{conn: conn})
+	}
+	return w, nil
 }
 
 // WriteBundle durably persists events; on return, acking is safe. On
@@ -44,29 +72,33 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 	if len(events) == 0 {
 		return nil
 	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
+	// Round-robin to the next connection; concurrent callers land on different
+	// connections and proceed in parallel, queueing only when they collide.
+	wc := w.conns[int(w.next.Add(1)-1)%len(w.conns)]
+	wc.mu.Lock()
+	defer wc.mu.Unlock()
+	conn := wc.conn
 
 	// Explicit BEGIN/COMMIT rather than database/sql Tx: the appender
 	// needs the raw driver connection, which sql.Tx keeps to itself.
-	if _, err := w.conn.ExecContext(ctx, "BEGIN"); err != nil {
+	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return fmt.Errorf("lake write begin: %w", err)
 	}
-	if err := w.appendAll(ctx, events); err != nil {
-		if _, rbErr := w.conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
+	if err := appendAll(ctx, conn, w.table, events); err != nil {
+		if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
 			return fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
 		}
 		return err
 	}
-	if _, err := w.conn.ExecContext(ctx, "COMMIT"); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return fmt.Errorf("lake write commit: %w", err)
 	}
 	return nil
 }
 
-func (w *Writer) appendAll(ctx context.Context, events []cloudevent.StoredEvent) error {
-	return w.conn.Raw(func(driverConn any) error {
-		appender, err := duckdb.NewAppender(driverConn.(*duckdb.Conn), "lake", "main", w.table)
+func appendAll(ctx context.Context, conn *sql.Conn, table string, events []cloudevent.StoredEvent) error {
+	return conn.Raw(func(driverConn any) error {
+		appender, err := duckdb.NewAppender(driverConn.(*duckdb.Conn), "lake", "main", table)
 		if err != nil {
 			return fmt.Errorf("lake appender: %w", err)
 		}
@@ -95,9 +127,15 @@ func (w *Writer) appendAll(ctx context.Context, events []cloudevent.StoredEvent)
 	})
 }
 
-// Close releases the pinned connection.
+// Close releases all pinned connections.
 func (w *Writer) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.conn.Close()
+	var firstErr error
+	for _, wc := range w.conns {
+		wc.mu.Lock()
+		if err := wc.conn.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		wc.mu.Unlock()
+	}
+	return firstErr
 }

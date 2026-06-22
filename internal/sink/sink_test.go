@@ -123,7 +123,7 @@ func TestSink_CommitsBundleAndAcks(t *testing.T) {
 	require.NoError(t, pub.Publish(ctx, event("e2", "dimo.status", "did:erc721:137:0xA:1", day2)))
 	require.NoError(t, pub.Publish(ctx, event("e3", "dimo.fingerprint", "did:erc721:137:0xB:2", day2)))
 
-	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, cons, writer, zerolog.Nop())
+	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond, MinFlushBytes: 1}, cons, writer, zerolog.Nop())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
@@ -208,7 +208,7 @@ func TestSink_FailedCommitLeavesMessagesUnacked(t *testing.T) {
 	ts := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
 	require.NoError(t, pub.Publish(ctx, event("e-fail", "dimo.status", "did:erc721:137:0xA:1", ts)))
 
-	s := sink.New(sink.Config{MaxAge: 100 * time.Millisecond}, cons, writer, zerolog.Nop())
+	s := sink.New(sink.Config{MaxAge: 100 * time.Millisecond, MinFlushBytes: 1}, cons, writer, zerolog.Nop())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 
@@ -242,7 +242,7 @@ func TestSink_PoisonRowQuarantined(t *testing.T) {
 	require.NoError(t, pub.Publish(ctx, event("poison", "dimo.status", "did:erc721:137:0xA:1", ts)))
 	require.NoError(t, pub.Publish(ctx, event("good2", "dimo.status", "did:erc721:137:0xA:1", ts)))
 
-	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond}, cons, writer, zerolog.Nop())
+	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond, MinFlushBytes: 1}, cons, writer, zerolog.Nop())
 	done := make(chan error, 1)
 	go func() { done <- s.Run(ctx) }()
 

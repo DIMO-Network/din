@@ -65,6 +65,18 @@ env:
   # Must exceed the slowest downstream consumer's lag (dq): expiring an
   # unread snapshot truncates its change feed.
   LAKE_SNAPSHOT_RETENTION: 72h
+  # Connections each partition's writer round-robins bundles across, so several
+  # bundles' S3 uploads overlap (raises per-partition write throughput). The
+  # DuckDB pool is sized partitions*this + 2.
+  LAKE_WRITER_CONNECTIONS: '2'
+  # Sink batching (all optional; unset takes the binary defaults). A buffer is
+  # flushed at SINK_MAX_ROWS_PER_FLUSH rows, SINK_MAX_BYTES_PER_FLUSH bytes,
+  # SINK_MAX_AGE once it holds at least SINK_MIN_FLUSH_BYTES, or SINK_MAX_AGE_HARD
+  # regardless of size. Raise SINK_MIN_FLUSH_BYTES / SINK_MAX_AGE_HARD to cut tiny
+  # Parquet files on low-traffic partitions (trades latency-to-durable).
+  SINK_MIN_FLUSH_BYTES: '16777216' # 16 MiB
+  SINK_MAX_AGE: 1m
+  SINK_MAX_AGE_HARD: 5m
 service:
   type: ClusterIP
   ports:

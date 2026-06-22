@@ -7,12 +7,22 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/DIMO-Network/din/internal/objstore"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+)
+
+// putObjectTimeout bounds a single blob externalization on the ingest hot path,
+// so a stalled S3 endpoint degrades to a fast error (and WAL redelivery) instead
+// of pinning the request goroutine on an established-but-hung connection past the
+// SDK's generous defaults. Retries are bounded by maxRetryAttempts.
+const (
+	putObjectTimeout = 30 * time.Second
+	maxRetryAttempts = 3
 )
 
 // Config holds the S3 connection settings.
@@ -61,6 +71,8 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 			credentials.NewStaticCredentialsProvider(cfg.AccessKeyID, cfg.SecretAccessKey, ""),
 		))
 	}
+	// Make the retry contract explicit rather than relying on the SDK default.
+	opts = append(opts, awsconfig.WithRetryMaxAttempts(maxRetryAttempts))
 
 	awsCfg, err := awsconfig.LoadDefaultConfig(ctx, opts...)
 	if err != nil {

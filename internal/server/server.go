@@ -19,6 +19,13 @@ const (
 	DefaultOpsAddr         = ":8080"
 	DefaultTimeout         = 5 * time.Second
 	DefaultMaxBodyBytes    = 32 << 20 // 32 MiB
+	// DefaultIdleTimeout bounds how long a keep-alive connection may sit idle
+	// between requests; without it an idle (or slow-trickle) connection is held
+	// open indefinitely, tying up a goroutine/fd (slowloris-style exhaustion).
+	DefaultIdleTimeout = 60 * time.Second
+	// DefaultMaxHeaderBytes caps request header size (the net/http default is
+	// 1 MiB); a tight bound blunts header-flood attacks on the ingest listeners.
+	DefaultMaxHeaderBytes = 64 << 10 // 64 KiB
 )
 
 // ConnectionConfig configures the mTLS connection ingest server.
@@ -71,6 +78,12 @@ type AttestationConfig struct {
 type OpsConfig struct {
 	// Addr is the listen address; defaults to ":8080".
 	Addr string
+	// Ready, when non-nil, backs the /ready probe: /ready returns 503 until
+	// Ready() returns true, so Kubernetes withholds traffic until the process
+	// has finished wiring (NATS connected, streams ensured, lake attached).
+	// /ping (liveness) stays an unconditional 200 so a busy-but-healthy pod is
+	// never restarted. A nil Ready keeps /ready unconditionally 200 (back-compat).
+	Ready func() bool
 }
 
 // NewConnectionServer builds the mTLS ingest server. Clients must present a
@@ -125,6 +138,8 @@ func NewConnectionServer(cfg ConnectionConfig, handler http.Handler) (*http.Serv
 		ReadTimeout:       cfg.Timeout,
 		ReadHeaderTimeout: cfg.Timeout,
 		WriteTimeout:      cfg.Timeout,
+		IdleTimeout:       DefaultIdleTimeout,
+		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 	}, nil
 }
 
@@ -170,6 +185,8 @@ func NewAttestationServer(cfg AttestationConfig, handler http.Handler) (*http.Se
 		ReadTimeout:       cfg.Timeout,
 		ReadHeaderTimeout: cfg.Timeout,
 		WriteTimeout:      cfg.Timeout,
+		IdleTimeout:       DefaultIdleTimeout,
+		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 	}, nil
 }
 
@@ -184,15 +201,28 @@ func NewOpsServer(cfg OpsConfig) *http.Server {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	}
+	ready := ok
+	if cfg.Ready != nil {
+		ready = func(w http.ResponseWriter, _ *http.Request) {
+			if !cfg.Ready() {
+				http.Error(w, "not ready", http.StatusServiceUnavailable)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", ok)
-	mux.HandleFunc("/ready", ok)
+	mux.HandleFunc("/ready", ready)
 	mux.Handle("/metrics", promhttp.Handler())
 
 	return &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: DefaultTimeout,
+		IdleTimeout:       DefaultIdleTimeout,
+		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 	}
 }

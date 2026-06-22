@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -296,7 +297,10 @@ func run(log zerolog.Logger) error {
 	if err != nil {
 		return err
 	}
-	opsSrv := server.NewOpsServer(server.OpsConfig{Addr: settings.OpsAddr})
+	// readyGate flips true once all wiring below is complete; /ready stays 503
+	// until then so Kubernetes withholds ingest traffic from a half-started pod.
+	var readyGate atomic.Bool
+	opsSrv := server.NewOpsServer(server.OpsConfig{Addr: settings.OpsAddr, Ready: readyGate.Load})
 
 	group, gctx := errgroup.WithContext(ctx)
 
@@ -318,6 +322,15 @@ func run(log zerolog.Logger) error {
 			AckPolicy:     jetstream.AckExplicitPolicy,
 			AckWait:       5 * time.Minute,
 			MaxAckPending: 250_000,
+			// Backstop a sustained writer/catalog outage. Without these the same
+			// message redelivers forever at the fixed AckWait cadence — a
+			// redelivery storm at full MaxAckPending width with no escalation. The
+			// escalating BackOff spaces retries out as an outage drags on; the
+			// (high) MaxDeliver caps total attempts well above the in-sink poison
+			// threshold (10), so genuine poison is Term'd by the sink long before
+			// this fires and only a truly-stuck message is ever shed.
+			MaxDeliver: 1000,
+			BackOff:    []time.Duration{5 * time.Minute, 10 * time.Minute, 30 * time.Minute},
 		})
 		if err != nil {
 			return err
@@ -347,6 +360,9 @@ func run(log zerolog.Logger) error {
 		group.Go(func() error { return bridge.Run(gctx) })
 	}
 
+	// Listeners, per-partition sinks, streams, and the maintainer are all wired;
+	// open the readiness gate so traffic can be routed to this pod.
+	readyGate.Store(true)
 	log.Info().Str("connection", settings.ConnectionAddr).Str("attestation", settings.AttestationAddr).
 		Str("nats", settings.NATSMode).Msg("din started")
 	return group.Wait()

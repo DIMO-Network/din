@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"time"
 
@@ -175,10 +176,10 @@ func (c *coordinateStore) tryCreateLocation() {
 		lat := c.signals[c.lastLat].Data.ValueNumber
 		lon := c.signals[c.lastLon].Data.ValueNumber
 
-		if lat == 0 && lon == 0 {
+		if !validLatLon(lat, lon) {
 			c.signals[c.lastLat].Data.Name = pruneSignalName
 			c.signals[c.lastLon].Data.Name = pruneSignalName
-			c.errs = append(c.errs, fmt.Errorf("%w: latitude and longitude at origin at time %s", errLatLongMismatch, c.lastTime))
+			c.errs = append(c.errs, fmt.Errorf("%w: invalid coordinate lat=%v lon=%v at time %s", errLatLongMismatch, lat, lon, c.lastTime))
 		} else {
 			loc.Latitude = lat
 			loc.Longitude = lon
@@ -216,4 +217,20 @@ func (c *coordinateStore) tryCreateLocation() {
 	c.lastLon = -1
 	c.lastHDOP = -1
 	c.lastTime = zeroTime
+}
+
+// validLatLon reports whether a decoded coordinate is a usable WGS-84 position:
+// finite, within latitude/longitude bounds, and not the (0,0) null island that
+// devices emit for "no fix". model-garage's per-source decoders pass numbers
+// through without enforcing their documented min/max, so din rejects bad
+// coordinates here — otherwise a device reporting lat=5000 or NaN would flow
+// into storage and the DIMO_SIGNALS trigger stream (geofence/threshold rules).
+func validLatLon(lat, lon float64) bool {
+	if math.IsNaN(lat) || math.IsNaN(lon) || math.IsInf(lat, 0) || math.IsInf(lon, 0) {
+		return false
+	}
+	if lat == 0 && lon == 0 {
+		return false
+	}
+	return lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180
 }

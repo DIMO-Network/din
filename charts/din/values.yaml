@@ -139,8 +139,15 @@ autoscaling:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+# Scoped to ingest pods (see poddisruptionbudget.yaml). minAvailable must be >= 1
+# so a node drain / cluster upgrade can't evict every ingest replica at once
+# (minAvailable: 0 is a no-op PDB — zero protection).
 podDisruptionBudget:
-  minAvailable: 0
+  minAvailable: 1
+# Grace period for SIGTERM: must exceed the sink DrainTimeout (30s) + HTTP
+# shutdown so a rollout/drain flushes and acks in-flight bundles instead of
+# being SIGKILLed mid-commit (which forces WAL redelivery).
+terminationGracePeriodSeconds: 60
 # Dedicated single-replica maintenance Deployment (din maintain). Use this
 # instead of in-process LAKE_MAINTENANCE_ENABLED whenever replicaCount > 1,
 # so exactly one maintenance process runs per catalog and its health gauges

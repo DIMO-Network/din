@@ -9,4 +9,8 @@ spec:
   selector:
     matchLabels:
     {{- include "din.selectorLabels" . | nindent 6 }}
+      # Scope to ingest only: the single-replica maintenance Deployment shares
+      # din.selectorLabels, and lumping it under one budget would block its
+      # (Recreate) rollout once minAvailable >= 1.
+      app.kubernetes.io/component: ingest
 {{ toYaml .Values.podDisruptionBudget | indent 2 }}

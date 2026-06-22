@@ -49,6 +49,14 @@ var poisonRows = promauto.NewCounter(prometheus.CounterOpts{
 // one AckWait — resolves before a healthy message is ever dropped.
 const poisonRedeliveryThreshold = 10
 
+// isolateProbeLimit bounds the per-event isolation probe. If this many single-row
+// writes fail with nothing committed, the fault is almost certainly global
+// (catalog/S3 unreachable), not a poison row: grinding the rest into N single-row
+// transactions only holds the writer lock and mints no progress, and the bundle
+// redelivers wholesale anyway. A healthy writer commits something within the
+// first few rows (poison is rare), so this only short-circuits a true outage.
+const isolateProbeLimit = 8
+
 // Config tunes batching. Zero values take the defaults.
 type Config struct {
 	// MaxRowsPerFlush flushes the buffer at this row count.
@@ -191,9 +199,13 @@ loop:
 		s.wg.Wait()
 		close(workersDone)
 	}()
+	// One shared budget for the whole drain: the blocking enqueue in
+	// flushReady(true) already consumed part of drainDeadline, so wait only the
+	// remainder here (not a fresh DrainTimeout) — otherwise the total drain can
+	// reach 2× DrainTimeout and overrun the pod's termination grace period.
 	select {
 	case <-workersDone:
-	case <-time.After(s.cfg.DrainTimeout):
+	case <-time.After(time.Until(s.drainDeadline)):
 		s.log.Warn().Dur("timeout", s.cfg.DrainTimeout).Msg("drain timeout; canceling in-flight flushes")
 		cancelWorkers()
 		<-workersDone
@@ -242,7 +254,12 @@ func (s *Sink) add(msg jetstream.Msg) {
 		}
 		return
 	}
-	if meta, err := msg.Metadata(); err == nil && meta.NumDelivered > 1 {
+	if meta, err := msg.Metadata(); err != nil {
+		// Don't let a metadata failure silently blind the duplicate-volume SLO —
+		// metadata is least available exactly when the broker is stressed and
+		// redelivery is most likely.
+		s.log.Debug().Err(err).Msg("redelivery metadata unavailable; duplicate-volume metric may undercount")
+	} else if meta.NumDelivered > 1 {
 		redeliveries.Inc()
 	}
 
@@ -365,6 +382,15 @@ func (s *Sink) isolate(ctx context.Context, job flushJob) {
 	for i := range job.events {
 		if err := s.writer.WriteBundle(ctx, job.events[i:i+1]); err != nil {
 			failed = append(failed, i)
+			// Global-fault bail-out: nothing has committed after probing the first
+			// isolateProbeLimit rows → treat as a transient outage, not poison.
+			// Leave the rest un-acked for redelivery instead of grinding the bundle.
+			if committed == 0 && len(failed) >= isolateProbeLimit {
+				s.log.Error().Int("probed", len(failed)).Int("remaining", len(job.events)-i-1).
+					Msg("isolate: probe failed with zero commits; treating as global fault, leaving bundle for redelivery")
+				s.termExpiredPoison(job, failed)
+				return
+			}
 			continue
 		}
 		if err := job.msgs[i].Ack(); err != nil {
@@ -381,6 +407,18 @@ func (s *Sink) isolate(ctx context.Context, job flushJob) {
 	if committed == 0 && len(failed) > 0 {
 		s.log.Error().Int("events", len(failed)).
 			Msg("no event in bundle committed; treating as transient, leaving for redelivery")
+	}
+}
+
+// termExpiredPoison terminates only the probed failures that have already cycled
+// past the redelivery threshold, so a genuinely all-poison bundle still drains
+// over successive redeliveries even when the global-fault bail-out skips full
+// per-event isolation. Rows still under the threshold are left for redelivery.
+func (s *Sink) termExpiredPoison(job flushJob, failed []int) {
+	for _, i := range failed {
+		if redeliveryCount(job.msgs[i]) >= poisonRedeliveryThreshold {
+			s.terminatePoison(job.events[i], job.msgs[i])
+		}
 	}
 }
 

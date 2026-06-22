@@ -36,6 +36,9 @@ spec:
         {{- include "din.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: ingest
     spec:
+      # Exceed the sink DrainTimeout (30s) + HTTP shutdown so a rollout/drain
+      # lets in-flight bundles flush and ack instead of SIGKILLing mid-commit.
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default 60 }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}

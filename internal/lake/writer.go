@@ -51,7 +51,7 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 	if _, err := w.conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return fmt.Errorf("lake write begin: %w", err)
 	}
-	if err := w.appendAll(events); err != nil {
+	if err := w.appendAll(ctx, events); err != nil {
 		if _, rbErr := w.conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
 			return fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
 		}
@@ -63,7 +63,7 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 	return nil
 }
 
-func (w *Writer) appendAll(events []cloudevent.StoredEvent) error {
+func (w *Writer) appendAll(ctx context.Context, events []cloudevent.StoredEvent) error {
 	return w.conn.Raw(func(driverConn any) error {
 		appender, err := duckdb.NewAppender(driverConn.(*duckdb.Conn), "lake", "main", w.table)
 		if err != nil {
@@ -72,15 +72,19 @@ func (w *Writer) appendAll(events []cloudevent.StoredEvent) error {
 		for i := range events {
 			args, err := rowArgs(&events[i])
 			if err != nil {
-				_ = appender.Close()
+				_ = appender.CloseWithCancel(ctx)
 				return fmt.Errorf("lake row %d: %w", i, err)
 			}
 			if err := appender.AppendRow(args...); err != nil {
-				_ = appender.Close()
+				_ = appender.CloseWithCancel(ctx)
 				return fmt.Errorf("lake append row %d: %w", i, err)
 			}
 		}
-		if err := appender.Close(); err != nil {
+		// CloseWithCancel threads the caller's ctx through the final flush — the
+		// real S3 Parquet upload + catalog commit. Plain Close() flushes under
+		// context.Background(), so a shutdown (worker ctx canceled past
+		// DrainTimeout) could not interrupt a wedged write; this honors that bound.
+		if err := appender.CloseWithCancel(ctx); err != nil {
 			return fmt.Errorf("lake appender close: %w", err)
 		}
 		return nil

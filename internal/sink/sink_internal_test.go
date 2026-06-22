@@ -2,11 +2,53 @@ package sink
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/rs/zerolog"
 )
+
+// countingFailWriter fails every write and counts the attempts.
+type countingFailWriter struct{ calls int }
+
+func (w *countingFailWriter) WriteBundle(context.Context, []cloudevent.StoredEvent) error {
+	w.calls++
+	return errors.New("global fault")
+}
+
+// probeMsg is a minimal jetstream.Msg: only Metadata is exercised on the
+// all-fail isolate path (under the poison threshold, so no Ack/Term).
+type probeMsg struct {
+	jetstream.Msg
+	delivered uint64
+}
+
+func (m probeMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{NumDelivered: m.delivered}, nil
+}
+
+// On a global fault (every write fails, nothing commits) isolate must stop after
+// the probe instead of grinding the whole bundle into N single-row transactions
+// — the bundle redelivers wholesale anyway (SR review — isolate-grind).
+func TestIsolate_BailsOutOnGlobalFault(t *testing.T) {
+	w := &countingFailWriter{}
+	s := &Sink{writer: w, log: zerolog.Nop()}
+	const n = 100
+	job := flushJob{
+		events: make([]cloudevent.StoredEvent, n),
+		msgs:   make([]jetstream.Msg, n),
+	}
+	for i := range job.msgs {
+		job.msgs[i] = probeMsg{delivered: 1} // under the poison threshold
+	}
+	s.isolate(context.Background(), job)
+	if w.calls > isolateProbeLimit {
+		t.Fatalf("isolate ground %d writes on a global fault; want <= %d (bail-out)", w.calls, isolateProbeLimit)
+	}
+}
 
 // applyBackpressure must block the Run goroutine while the buffer is over the
 // hard byte ceiling and no flush slot is free, so messages stop being pulled

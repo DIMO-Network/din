@@ -56,6 +56,24 @@ func (c *MaintConfig) applyDefaults() {
 	}
 }
 
+// maintStep is one maintenance CALL and its metric label.
+type maintStep struct{ name, sql string }
+
+const (
+	// maxConsecutiveCycleFailures bounds how many cycles may fail back-to-back
+	// before Run returns, failing the errgroup so the pod restarts (and re-runs
+	// Open/ensureSchema). At the 15-minute default interval this is ~1h of
+	// durably-broken maintenance — long enough to ride out a transient catalog/S3
+	// outage, short enough that snapshots don't silently stop expiring against
+	// the retention budget while the pod sits Ready-but-idle.
+	maxConsecutiveCycleFailures = 4
+	// maintStepTimeout bounds a single maintenance CALL. merge/expire run minutes
+	// by design, so the budget is generous; it exists only to break a step wedged
+	// on a hung S3 multipart or catalog lock, which the between-steps ctx check
+	// cannot preempt.
+	maintStepTimeout = 30 * time.Minute
+)
+
 var (
 	maintCycles = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "din_lake_maintenance_cycles_total",
@@ -118,12 +136,23 @@ func NewMaintainer(l *Lake, cfg MaintConfig, log zerolog.Logger) *Maintainer {
 func (m *Maintainer) Run(ctx context.Context) error {
 	ticker := time.NewTicker(m.cfg.Interval)
 	defer ticker.Stop()
+	consecutiveFailures := 0
 	for {
 		if err := m.Cycle(ctx); err != nil {
 			if errors.Is(err, context.Canceled) {
 				return nil
 			}
-			m.log.Error().Err(err).Msg("maintenance cycle failed")
+			consecutiveFailures++
+			m.log.Error().Err(err).Int("consecutive", consecutiveFailures).Msg("maintenance cycle failed")
+			if consecutiveFailures >= maxConsecutiveCycleFailures {
+				// Durably broken (catalog unreachable, metadata wedged): stop
+				// pretending to be healthy. Returning fails the errgroup so K8s
+				// restarts the pod instead of leaving it Ready while snapshots
+				// silently stop expiring (SR review — wedged-maintainer-invisible).
+				return fmt.Errorf("maintenance wedged after %d consecutive cycle failures: %w", consecutiveFailures, err)
+			}
+		} else {
+			consecutiveFailures = 0
 		}
 		select {
 		case <-ticker.C:
@@ -154,26 +183,37 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	// they are about to lose still exist to be counted (SR review #2).
 	m.reportConsumerHealth(ctx)
 
-	expireSQL, err := m.expireSQL(ctx)
-	if err != nil {
-		return err
-	}
-	steps := []struct{ name, sql string }{
+	steps := []maintStep{
 		// Inlined rows first so the merge pass sees their files.
 		{"flush_inlined_data", "CALL ducklake_flush_inlined_data('lake')"},
 		{"merge_adjacent_files", "CALL ducklake_merge_adjacent_files('lake')"},
-		{"expire_snapshots", expireSQL},
-		// Files released by expired snapshots, then crash leftovers.
-		{"cleanup_old_files", "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"},
-		{"delete_orphaned_files", "CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL '1 day')"},
 	}
+	// A transient catalog blip while building the expire cutoff must not skip the
+	// independent merge/cleanup/orphan steps for the whole interval. Count it like
+	// a failed step and run the rest; expiry retries next cycle. Insert it between
+	// merge and cleanup — cleanup releases the files the expired snapshots pinned.
+	expireSQL, err := m.expireSQL(ctx)
+	if err != nil {
+		maintErrors.WithLabelValues("expire_snapshots").Inc()
+		m.log.Error().Err(err).Str("step", "expire_snapshots").Msg("maintenance step failed")
+		firstErr = fmt.Errorf("expire_snapshots: %w", err)
+	} else {
+		steps = append(steps, maintStep{"expire_snapshots", expireSQL})
+	}
+	steps = append(steps,
+		// Files released by expired snapshots, then crash leftovers.
+		maintStep{"cleanup_old_files", "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"},
+		maintStep{"delete_orphaned_files", "CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL '1 day')"},
+	)
 
 	for _, step := range steps {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		start := time.Now()
-		n, err := m.execCount(ctx, step.sql)
+		stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
+		n, err := m.execCount(stepCtx, step.sql)
+		cancel()
 		maintStepSeconds.WithLabelValues(step.name).Observe(time.Since(start).Seconds())
 		if err != nil {
 			maintErrors.WithLabelValues(step.name).Inc()

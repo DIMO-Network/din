@@ -40,6 +40,15 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 	}
 	defer conn.Close() //nolint:errcheck
 
+	// Pause the maintainer's per-cycle layout re-assert BEFORE we RESET, so a
+	// concurrent maintenance cycle can't re-partition the table out from under the
+	// registration window and abort it. Refreshed per batch below; a crashed
+	// backfill's heartbeat goes stale and the maintainer resumes (SR review #9).
+	if err := l.heartbeatBackfillPause(ctx); err != nil {
+		return res, fmt.Errorf("lake backfill: signaling maintenance pause: %w", err)
+	}
+	defer func() { _ = l.clearBackfillPause(context.WithoutCancel(ctx)) }()
+
 	// Legacy bundles span multiple (type, day) values per file, which a
 	// partitioned table refuses to register. Partitioning only governs
 	// newly written data, so drop it for the registration window and
@@ -61,6 +70,7 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 		if len(pending) == 0 {
 			return nil
 		}
+		_ = l.heartbeatBackfillPause(ctx) // keep the maintenance pause fresh per batch
 		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 			return fmt.Errorf("lake backfill begin: %w", err)
 		}

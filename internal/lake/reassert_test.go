@@ -67,3 +67,50 @@ func TestEnsureSchema_ReassertsPartitioningOnReboot(t *testing.T) {
 	}))
 	require.Len(t, files, 3, "re-asserted partitioning writes one file per (type,day): %v", files)
 }
+
+// TestReassertLayout_PausedByFreshBackfillHeartbeat proves the maintainer's
+// per-cycle layout re-assert defers to a running backfill (fresh heartbeat) but
+// resumes once the heartbeat is stale or cleared — so a live backfill's RESET
+// window is not re-partitioned out from under it, while a crashed backfill is
+// still recovered.
+func TestReassertLayout_PausedByFreshBackfillHeartbeat(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	cfg := Config{CatalogDSN: filepath.Join(dir, "meta.ducklake"), DataPath: filepath.Join(dir, "data")}
+	l, err := Open(ctx, cfg)
+	require.NoError(t, err)
+	defer l.Close() //nolint:errcheck
+
+	// Simulate a backfill's registration window: partitioning RESET.
+	_, err = l.DB().ExecContext(ctx, "ALTER TABLE lake.raw_events RESET PARTITIONED BY")
+	require.NoError(t, err)
+
+	// Fresh heartbeat → reassertLayout must NOT re-partition.
+	require.NoError(t, l.heartbeatBackfillPause(ctx))
+	active, err := l.backfillPauseActive(ctx)
+	require.NoError(t, err)
+	require.True(t, active, "a fresh heartbeat is active")
+	require.NoError(t, l.reassertLayout(ctx))
+	part, err := l.isPartitioned(ctx)
+	require.NoError(t, err)
+	require.False(t, part, "a fresh backfill heartbeat must keep reassertLayout from re-partitioning")
+
+	// Stale heartbeat → reassertLayout resumes and recovers the layout.
+	_, err = l.DB().ExecContext(ctx, "UPDATE meta.lake_backfill_pause SET updated_at = now() - INTERVAL '1 hour'")
+	require.NoError(t, err)
+	active, err = l.backfillPauseActive(ctx)
+	require.NoError(t, err)
+	require.False(t, active, "a stale heartbeat is not active")
+	require.NoError(t, l.reassertLayout(ctx))
+	part, err = l.isPartitioned(ctx)
+	require.NoError(t, err)
+	require.True(t, part, "a stale heartbeat must let reassertLayout recover the layout")
+
+	// Cleared heartbeat is not active either.
+	require.NoError(t, l.heartbeatBackfillPause(ctx))
+	require.NoError(t, l.clearBackfillPause(ctx))
+	active, err = l.backfillPauseActive(ctx)
+	require.NoError(t, err)
+	require.False(t, active, "a cleared heartbeat is not active")
+}

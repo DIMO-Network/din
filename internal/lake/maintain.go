@@ -175,6 +175,7 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	if err := m.lake.reassertLayout(ctx); err != nil {
 		maintErrors.WithLabelValues("reassert_layout").Inc()
 		m.log.Error().Err(err).Str("step", "reassert_layout").Msg("maintenance step failed")
+		// First step in the cycle, so firstErr is still nil — assign directly.
 		firstErr = fmt.Errorf("reassert_layout: %w", err)
 	}
 	maintStepSeconds.WithLabelValues("reassert_layout").Observe(time.Since(start).Seconds())
@@ -196,7 +197,9 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	if err != nil {
 		maintErrors.WithLabelValues("expire_snapshots").Inc()
 		m.log.Error().Err(err).Str("step", "expire_snapshots").Msg("maintenance step failed")
-		firstErr = fmt.Errorf("expire_snapshots: %w", err)
+		if firstErr == nil {
+			firstErr = fmt.Errorf("expire_snapshots: %w", err)
+		}
 	} else {
 		steps = append(steps, maintStep{"expire_snapshots", expireSQL})
 	}

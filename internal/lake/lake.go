@@ -286,6 +286,15 @@ func (l *Lake) tryEnsureSchema(ctx context.Context) error {
 // long-lived maintainer merge into unpartitioned files until the next pod boot
 // (SR review #9).
 func (l *Lake) reassertLayout(ctx context.Context) error {
+	// A running backfill deliberately RESETs the partition layout for its
+	// registration window (legacy bundles span multiple (type,day) per file). Skip
+	// re-asserting while its heartbeat is fresh, so we don't re-partition the table
+	// out from under it and abort the registration. A crashed backfill's heartbeat
+	// goes stale and we resume — recovering the left-RESET layout, which is the
+	// reason this runs every cycle.
+	if paused, err := l.backfillPauseActive(ctx); err == nil && paused {
+		return nil
+	}
 	partitioned, err := l.isPartitioned(ctx)
 	if err != nil {
 		// Can't tell — re-assert defensively (idempotent) rather than risk
@@ -301,6 +310,62 @@ func (l *Lake) reassertLayout(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// backfillPauseStaleness bounds how long a backfill's pause heartbeat is honored
+// without a refresh. A live backfill refreshes it every batch (well under this);
+// a crashed one goes stale within it and the maintainer resumes re-asserting.
+const backfillPauseStaleness = 30 * time.Minute
+
+// ensureBackfillPauseTable creates the single-row heartbeat table in the shared
+// meta catalog (cross-process: the lake-backfill command and the maintenance pod
+// coordinate through it).
+func (l *Lake) ensureBackfillPauseTable(ctx context.Context) error {
+	_, err := l.db.ExecContext(ctx,
+		"CREATE TABLE IF NOT EXISTS meta.lake_backfill_pause (updated_at TIMESTAMP WITH TIME ZONE)")
+	return err
+}
+
+// heartbeatBackfillPause records/refreshes the pause heartbeat. Called before the
+// backfill RESETs partitioning (closing the race where the maintainer sees a
+// RESET table with no pause) and once per batch thereafter.
+func (l *Lake) heartbeatBackfillPause(ctx context.Context) error {
+	if err := l.ensureBackfillPauseTable(ctx); err != nil {
+		return err
+	}
+	tx, err := l.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM meta.lake_backfill_pause"); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO meta.lake_backfill_pause (updated_at) VALUES (now())"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// clearBackfillPause removes the heartbeat when a backfill finishes.
+func (l *Lake) clearBackfillPause(ctx context.Context) error {
+	if err := l.ensureBackfillPauseTable(ctx); err != nil {
+		return err
+	}
+	_, err := l.db.ExecContext(ctx, "DELETE FROM meta.lake_backfill_pause")
+	return err
+}
+
+// backfillPauseActive reports whether a backfill heartbeat exists and is fresh.
+func (l *Lake) backfillPauseActive(ctx context.Context) (bool, error) {
+	if err := l.ensureBackfillPauseTable(ctx); err != nil {
+		return false, err
+	}
+	var active bool
+	err := l.db.QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT EXISTS (SELECT 1 FROM meta.lake_backfill_pause WHERE now() - updated_at < INTERVAL '%d seconds')",
+		int(backfillPauseStaleness.Seconds()))).Scan(&active)
+	return active, err
 }
 
 // isPartitioned reports whether raw_events currently has an active partition

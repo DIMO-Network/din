@@ -13,6 +13,10 @@ import (
 // header fields — the common case. A package const avoids per-row allocation.
 const emptyExtrasJSON = "{}"
 
+// rawEventColumnCount is the raw_events column arity (matches ddl.go's CREATE
+// and fillRowArgs's DDL order). The appender reuses one slice of this length.
+const rawEventColumnCount = 13
+
 // rowArgs maps a StoredEvent onto raw_events columns with the same
 // semantics as cloudevent/parquet.convertEvent, keeping native rows
 // byte-compatible with backfilled DIS bundles: extras carries the
@@ -28,13 +32,27 @@ const emptyExtrasJSON = "{}"
 // (subject, "time", ...) — would treat them as distinct and fail to collapse
 // the native/backfill overlap (SR review #6).
 func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
-	extrasJSON := emptyExtrasJSON
+	args := make([]driver.Value, rawEventColumnCount)
+	if err := fillRowArgs(args, event); err != nil {
+		return nil, err
+	}
+	return args, nil
+}
+
+// fillRowArgs writes event's raw_events column values into dst in DDL order, so
+// the appender can reuse one backing slice across a whole bundle (100k+
+// rows/bundle) instead of heap-allocating a fresh slice per row. The payload
+// columns (data, extras) are passed as []byte to skip a string copy of the
+// largest column — DuckDB's appender validates the UTF-8 VARCHAR contract on the
+// C side whether given a string or []byte, so poison-row detection is unchanged.
+func fillRowArgs(dst []driver.Value, event *cloudevent.StoredEvent) error {
+	var extrasJSON driver.Value = emptyExtrasJSON
 	if extras := cloudevent.AddNonColumnFieldsToExtras(&event.CloudEventHeader); extras != nil {
 		b, err := json.Marshal(extras)
 		if err != nil {
-			return nil, fmt.Errorf("marshaling extras: %w", err)
+			return fmt.Errorf("marshaling extras: %w", err)
 		}
-		extrasJSON = string(b)
+		extrasJSON = b // []byte: avoids the string(b) copy in the rare has-extras case
 	}
 
 	var data, dataBase64, dataIndexKey driver.Value
@@ -42,7 +60,7 @@ func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 	case event.DataBase64 != "":
 		dataBase64 = []byte(event.DataBase64)
 	case len(event.Data) > 0:
-		data = string(event.Data)
+		data = []byte(event.Data) // the largest column — pass bytes, not a string copy
 	}
 	if event.DataIndexKey != "" {
 		dataIndexKey = event.DataIndexKey
@@ -52,19 +70,18 @@ func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 		voidsID = event.VoidsID
 	}
 
-	return []driver.Value{
-		event.Subject,
-		event.Time.UTC().Truncate(time.Millisecond),
-		event.Type,
-		event.ID,
-		event.Source,
-		event.Producer,
-		event.DataContentType,
-		event.DataVersion,
-		string(extrasJSON),
-		data,
-		dataBase64,
-		dataIndexKey,
-		voidsID,
-	}, nil
+	dst[0] = event.Subject
+	dst[1] = event.Time.UTC().Truncate(time.Millisecond)
+	dst[2] = event.Type
+	dst[3] = event.ID
+	dst[4] = event.Source
+	dst[5] = event.Producer
+	dst[6] = event.DataContentType
+	dst[7] = event.DataVersion
+	dst[8] = extrasJSON
+	dst[9] = data
+	dst[10] = dataBase64
+	dst[11] = dataIndexKey
+	dst[12] = voidsID
+	return nil
 }

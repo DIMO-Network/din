@@ -3,6 +3,7 @@ package lake
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"sync"
 
@@ -69,9 +70,12 @@ func (w *Writer) appendAll(ctx context.Context, events []cloudevent.StoredEvent)
 		if err != nil {
 			return fmt.Errorf("lake appender: %w", err)
 		}
+		// Reuse one args slice across the whole bundle — AppendRow reads it during
+		// the call and never retains it, so refilling it per row avoids ~100k slice
+		// allocations on a full bundle.
+		args := make([]driver.Value, rawEventColumnCount)
 		for i := range events {
-			args, err := rowArgs(&events[i])
-			if err != nil {
+			if err := fillRowArgs(args, &events[i]); err != nil {
 				_ = appender.CloseWithCancel(ctx)
 				return fmt.Errorf("lake row %d: %w", i, err)
 			}

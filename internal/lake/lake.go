@@ -115,8 +115,9 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	if cfg.Threads > 0 {
 		setup = append(setup, fmt.Sprintf("SET threads = %d", cfg.Threads))
 	}
-	// Naive timestamps throughout: device times are UTC by contract and
-	// the table column is zone-less TIMESTAMP.
+	// The "time" column is TIMESTAMP WITH TIME ZONE (ddl.go); pinning the session
+	// to UTC means device times (UTC by contract) round-trip unambiguously and
+	// day("time") partitions on the UTC date.
 	setup = append(setup, "SET TimeZone = 'UTC'")
 	setup = append(setup, "INSTALL ducklake", "LOAD ducklake")
 

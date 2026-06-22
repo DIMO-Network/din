@@ -56,8 +56,8 @@ func (c *Client) path(key string) string {
 }
 
 // PutObject durably writes body at key: temp file in the target directory,
-// fsync, atomic rename. Replacing an existing key (e.g. watermark.json) is
-// atomic too.
+// fsync, atomic rename. Replacing an existing key (e.g. a split blob) is atomic
+// too.
 func (c *Client) PutObject(_ context.Context, key string, body []byte) error {
 	target := c.path(key)
 	dir := filepath.Dir(target)

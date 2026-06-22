@@ -91,6 +91,10 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 
 // PutObject uploads body under key. Implements split.ObjectStore.
 func (c *Client) PutObject(ctx context.Context, key string, body []byte) error {
+	// Bound the upload so a stalled S3 endpoint degrades to a fast error (and WAL
+	// redelivery) instead of pinning the ingest request goroutine on a hung conn.
+	ctx, cancel := context.WithTimeout(ctx, putObjectTimeout)
+	defer cancel()
 	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(c.bucket),
 		Key:         aws.String(key),

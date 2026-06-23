@@ -204,7 +204,6 @@ func (s *Sink) Run(ctx context.Context) error {
 	fetchDone := make(chan error, 1)
 	go s.fetchLoop(ctx, msgs, fetchDone)
 
-	var fetchErr error
 loop:
 	for {
 		select {
@@ -219,7 +218,7 @@ loop:
 			s.flushReady(false)
 		}
 	}
-	fetchErr = <-fetchDone
+	fetchErr := <-fetchDone
 
 	// Shutdown: flush the remaining buffer, then wait for workers so all
 	// acks land before the process exits — but only up to DrainTimeout

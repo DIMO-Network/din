@@ -119,6 +119,11 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	// to UTC means device times (UTC by contract) round-trip unambiguously and
 	// day("time") partitions on the UTC date.
 	setup = append(setup, "SET TimeZone = 'UTC'")
+	// preserve_insertion_order=false lets DuckDB reorder rows for lower memory and
+	// better parallelism on large appends/exports (DuckDB OOM guidance). Safe here:
+	// raw_events is SORTED BY (subject,"time") so DuckLake orders rows on write, and
+	// every read uses an explicit ORDER BY — nothing relies on implicit order.
+	setup = append(setup, "SET preserve_insertion_order = false")
 	setup = append(setup, "INSTALL ducklake", "LOAD ducklake")
 
 	if isPostgresDSN(cfg.CatalogDSN) {

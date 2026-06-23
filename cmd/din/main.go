@@ -322,10 +322,22 @@ func run(log zerolog.Logger) error {
 	group.Go(func() error { return serveHTTP(gctx, attestationSrv, false, log) })
 	group.Go(func() error { return serveHTTP(gctx, opsSrv, false, log) })
 
+	// AckWait must clear the sink's worst-case time-to-ack: a low-traffic buffer
+	// isn't flushed until the hard age cap, and is acked only after that flush
+	// commits. If AckWait (or BackOff[0]) were <= the hard cap, every quiet-
+	// partition message would redeliver before its ack — a guaranteed duplicate
+	// row and a false DinSinkRedeliveriesHigh page. Derive it from the configured
+	// hard cap (+ margin for the commit) so the two can't drift apart.
+	hardCap := settings.SinkMaxAgeHard
+	if hardCap <= 0 {
+		hardCap = sink.DefaultMaxAgeHard
+	}
+	ackWait := hardCap + 3*time.Minute
+
 	// One sink per WAL partition: disjoint subjects, independent flush
-	// pipelines — throughput scales with the partition count. Each sink
-	// gets its own writer connection; concurrent DuckLake appends never
-	// conflict.
+	// pipelines — throughput scales with the partition count. Each sink gets its
+	// own writer connections; concurrent raw appends commit independently (a
+	// catalog snapshot collision is resolved by DuckLake's commit retry).
 	for i, rawStream := range rawStreams {
 		durable := "parquet-sink"
 		if len(rawStreams) > 1 {
@@ -334,7 +346,7 @@ func run(log zerolog.Logger) error {
 		sinkConsumer, err := rawStream.CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
 			Durable:       durable,
 			AckPolicy:     jetstream.AckExplicitPolicy,
-			AckWait:       5 * time.Minute,
+			AckWait:       ackWait,
 			MaxAckPending: 250_000,
 			// Backstop a sustained writer/catalog outage. Without these the same
 			// message redelivers forever at the fixed AckWait cadence — a
@@ -342,9 +354,10 @@ func run(log zerolog.Logger) error {
 			// escalating BackOff spaces retries out as an outage drags on; the
 			// (high) MaxDeliver caps total attempts well above the in-sink poison
 			// threshold (10), so genuine poison is Term'd by the sink long before
-			// this fires and only a truly-stuck message is ever shed.
+			// this fires and only a truly-stuck message is ever shed. BackOff[0]
+			// equals AckWait so the first redelivery also clears the hard flush cap.
 			MaxDeliver: 1000,
-			BackOff:    []time.Duration{5 * time.Minute, 10 * time.Minute, 30 * time.Minute},
+			BackOff:    []time.Duration{ackWait, ackWait + 10*time.Minute, 30 * time.Minute},
 		})
 		if err != nil {
 			return err

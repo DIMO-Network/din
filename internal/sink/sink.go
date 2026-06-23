@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
@@ -56,6 +57,13 @@ const poisonRedeliveryThreshold = 10
 // redelivers wholesale anyway. A healthy writer commits something within the
 // first few rows (poison is rare), so this only short-circuits a true outage.
 const isolateProbeLimit = 8
+
+// DefaultMaxAgeHard is the default hard flush cap (Config.MaxAgeHard when unset).
+// Exported so the consumer's AckWait can be sized above it: a buffer is acked only
+// after it flushes, and a low-traffic buffer isn't flushed until MaxAgeHard, so
+// AckWait <= MaxAgeHard would redeliver every quiet-partition message before its
+// ack lands.
+const DefaultMaxAgeHard = 5 * time.Minute
 
 // Config tunes batching. Zero values take the defaults.
 type Config struct {
@@ -110,7 +118,7 @@ func (c *Config) applyDefaults() {
 		c.MinFlushBytes = 16 << 20 // 16 MiB — well above "tiny", well below the 128 MiB target
 	}
 	if c.MaxAgeHard == 0 {
-		c.MaxAgeHard = 5 * time.Minute
+		c.MaxAgeHard = DefaultMaxAgeHard
 	}
 	if c.Workers == 0 {
 		c.Workers = 2
@@ -136,6 +144,16 @@ type Sink struct {
 	jobs chan flushJob
 	wg   sync.WaitGroup
 
+	// inflight is the byte size of every bundle handed to a worker but not yet
+	// committed+acked (queued in jobs or in flight). Backpressure gates on
+	// buffer + inflight so MaxBufferedBytes bounds total un-acked memory, not just
+	// the current buffer — the jobs channel is Workers*8 deep and would otherwise
+	// hold that many full bundles past the ceiling.
+	inflight atomic.Int64
+	// flushed wakes applyBackpressure when a worker finishes a bundle (inflight
+	// dropped). Buffered to Workers so a worker never blocks signaling.
+	flushed chan struct{}
+
 	// drainDeadline bounds the whole shutdown flush; set once by Run.
 	drainDeadline time.Time
 }
@@ -150,6 +168,7 @@ type eventBuffer struct {
 type flushJob struct {
 	events []cloudevent.StoredEvent
 	msgs   []jetstream.Msg
+	bytes  int
 }
 
 // New constructs a Sink reading from consumer and committing via writer.
@@ -161,6 +180,7 @@ func New(cfg Config, consumer jetstream.Consumer, writer BundleWriter, log zerol
 		writer:   writer,
 		log:      log.With().Str("component", "sink").Logger(),
 		jobs:     make(chan flushJob, cfg.Workers*8),
+		flushed:  make(chan struct{}, cfg.Workers),
 	}
 }
 
@@ -309,7 +329,7 @@ func (s *Sink) flushReady(force bool) {
 // the shutdown drain (block=true) waits up to the drain deadline so a
 // wedged writer can't hang exit — whatever doesn't flush redelivers.
 func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
-	job := flushJob{events: buf.events, msgs: buf.msgs}
+	job := flushJob{events: buf.events, msgs: buf.msgs, bytes: buf.bytes}
 	if block {
 		wait := time.Until(s.drainDeadline)
 		if wait <= 0 {
@@ -329,6 +349,7 @@ func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
 			return false
 		}
 	}
+	s.inflight.Add(int64(job.bytes))
 	s.buffer = nil
 	return true
 }
@@ -340,15 +361,30 @@ func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
 // grow it without limit (SR-8). Returns immediately under the ceiling, on
 // hand-off, or when ctx is done (the shutdown drain then flushes what remains).
 func (s *Sink) applyBackpressure(ctx context.Context) {
-	buf := s.buffer
-	if buf == nil || s.cfg.MaxBufferedBytes <= 0 || buf.bytes < s.cfg.MaxBufferedBytes {
+	if s.cfg.MaxBufferedBytes <= 0 {
 		return
 	}
-	job := flushJob{events: buf.events, msgs: buf.msgs}
-	select {
-	case s.jobs <- job:
-		s.buffer = nil
-	case <-ctx.Done():
+	for {
+		bufBytes := 0
+		if s.buffer != nil {
+			bufBytes = s.buffer.bytes
+		}
+		if bufBytes+int(s.inflight.Load()) < s.cfg.MaxBufferedBytes {
+			return
+		}
+		// Over the ceiling: hand the buffer off if a flush slot is free (frees the
+		// Run goroutine's largest single chunk), then wait for a worker to finish a
+		// bundle before accepting more. Blocking here stalls the msgs channel and
+		// propagates backpressure to JetStream — bounding buffer+queue+in-flight at
+		// MaxBufferedBytes, not just the current buffer (SR-8).
+		if s.buffer != nil {
+			s.enqueue(s.buffer, false)
+		}
+		select {
+		case <-s.flushed:
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
@@ -366,6 +402,7 @@ func (s *Sink) worker(ctx context.Context) {
 // unpersistable (no MaxDeliver, no Term on this path), since the bad row
 // re-formed the same failing bundle on every redelivery (SR review #1).
 func (s *Sink) flush(ctx context.Context, job flushJob) {
+	defer s.flushDone(job.bytes)
 	if err := s.writer.WriteBundle(ctx, job.events); err != nil {
 		s.log.Warn().Err(err).Int("events", len(job.events)).
 			Msg("bundle commit failed; isolating per-event")
@@ -374,6 +411,18 @@ func (s *Sink) flush(ctx context.Context, job flushJob) {
 	}
 	s.ackAll(job.msgs)
 	s.log.Info().Int("events", len(job.events)).Msg("bundle committed")
+}
+
+// flushDone releases a finished bundle's bytes from the inflight tally and wakes
+// applyBackpressure (non-blocking — a missed wake is re-checked on the next
+// completion, and there is always a pending completion while inflight is over
+// the ceiling).
+func (s *Sink) flushDone(bytes int) {
+	s.inflight.Add(-int64(bytes))
+	select {
+	case s.flushed <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Sink) ackAll(msgs []jetstream.Msg) {

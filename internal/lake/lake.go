@@ -68,6 +68,10 @@ type Lake struct {
 // Open starts DuckDB, attaches the DuckLake catalog, and bootstraps the
 // schema. Bootstrapping is idempotent and safe to race across replicas:
 // IF NOT EXISTS guards plus retries absorb conflicting catalog commits.
+// lakeConnMaxLifetime recycles pooled DuckDB connections by age so a poisoned
+// catalog attach self-heals rather than persisting until the next deploy (see Open).
+const lakeConnMaxLifetime = 30 * time.Minute
+
 func Open(ctx context.Context, cfg Config) (*Lake, error) {
 	if cfg.CatalogDSN == "" || cfg.DataPath == "" {
 		return nil, fmt.Errorf("lake: CatalogDSN and DataPath are required")
@@ -90,6 +94,14 @@ func Open(ctx context.Context, cfg Config) (*Lake, error) {
 	}
 	db.SetMaxOpenConns(maxConns)
 	db.SetConnMaxIdleTime(0) // pinned writer conns must not be reaped
+	// Recycle pooled connections by age so a maintainer connection whose
+	// DuckLake→Postgres catalog attach is poisoned by a PG blip is dropped and
+	// re-bootstrapped, instead of intermittently failing cycles forever (which
+	// would also keep resetting the consecutive-failure restart backstop). Mirrors
+	// dq's CHD-21. Safe for the writer: its conns are pinned via db.Conn() and stay
+	// checked out, so the age reaper — which only touches idle/returned pool conns —
+	// never reaps one mid-use.
+	db.SetConnMaxLifetime(lakeConnMaxLifetime)
 
 	l := &Lake{db: db}
 	if err := l.bootstrap(ctx, cfg); err != nil {

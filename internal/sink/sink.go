@@ -462,6 +462,18 @@ func (s *Sink) isolate(ctx context.Context, job flushJob) {
 		}
 		committed++
 	}
+	// A canceled context (drain timeout / shutdown) means the remaining WriteBundle
+	// failures are from cancellation, not the writer rejecting poison — so the
+	// "committed > 0 ⇒ this row is poison" heuristic is invalid (the writer was never
+	// really consulted). Leave every failed row un-acked for redelivery rather than
+	// Term'ing healthy, never-persisted data.
+	if ctx.Err() != nil {
+		if len(failed) > 0 {
+			s.log.Warn().Int("events", len(failed)).
+				Msg("isolate: context canceled mid-bundle; leaving failed rows for redelivery")
+		}
+		return
+	}
 	for _, i := range failed {
 		if committed > 0 || redeliveryCount(job.msgs[i]) >= poisonRedeliveryThreshold {
 			s.terminatePoison(job.events[i], job.msgs[i])

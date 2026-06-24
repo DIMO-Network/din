@@ -84,6 +84,57 @@ func TestIsolate_BailsOutOnGlobalFault(t *testing.T) {
 	}
 }
 
+// seqWriter commits the first bundle, then cancels its context and fails the rest —
+// simulating a drain-timeout cancellation arriving mid-isolate after >=1 commit.
+type seqWriter struct {
+	calls  int
+	cancel context.CancelFunc
+}
+
+func (w *seqWriter) WriteBundle(context.Context, []cloudevent.StoredEvent) error {
+	w.calls++
+	if w.calls == 1 {
+		return nil
+	}
+	w.cancel()
+	return context.Canceled
+}
+
+// trackMsg records Term so a test can assert a row was left for redelivery.
+type trackMsg struct {
+	jetstream.Msg
+	delivered  uint64
+	terminated bool
+}
+
+func (m *trackMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{NumDelivered: m.delivered}, nil
+}
+func (m *trackMsg) Term() error { m.terminated = true; return nil }
+func (m *trackMsg) Ack() error  { return nil }
+
+// On a drain-timeout context cancellation, isolate's "committed > 0 ⇒ poison"
+// heuristic is invalid: the remaining writes failed because ctx was canceled, not
+// because the writer rejected them. Healthy never-persisted rows must be left
+// un-acked for JetStream redelivery, NOT Term'd (silent data loss otherwise).
+func TestIsolate_LeavesRowsForRedeliveryOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Sink{writer: &seqWriter{cancel: cancel}, log: zerolog.Nop()}
+	const n = 4
+	msgs := make([]*trackMsg, n)
+	job := flushJob{events: make([]cloudevent.StoredEvent, n), msgs: make([]jetstream.Msg, n)}
+	for i := range msgs {
+		msgs[i] = &trackMsg{delivered: 1} // under the poison threshold
+		job.msgs[i] = msgs[i]
+	}
+	s.isolate(ctx, job)
+	for i, m := range msgs {
+		if m.terminated {
+			t.Fatalf("msg %d Term'd under context cancellation; healthy rows must survive for redelivery", i)
+		}
+	}
+}
+
 // applyBackpressure must block the Run goroutine while the buffer is over the
 // hard byte ceiling and no flush slot is free, so messages stop being pulled
 // from JetStream and buffered memory stays bounded instead of growing until OOM

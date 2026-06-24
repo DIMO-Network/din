@@ -73,7 +73,12 @@ func (c *Converter) Convert(ctx context.Context, sourceAddr string, body []byte)
 			return nil, fmt.Errorf("%w: unsupported cloud event type: %s", ErrValidation, hdr.Type)
 		}
 		if !canonicalizeConnectionHeader(hdr, c.logger) {
-			c.logger.Warn().Msgf("invalid cloud event header for header=%+v", hdr)
+			// Reject (don't warn-and-keep) — a non-canonical subject/producer is
+			// device-asserted and flows unsanitized into buildBlobKey for oversized
+			// payloads; a subject like "../../x" would otherwise control the blob's
+			// object-key prefix (path traversal on fsstore, cross-prefix write on S3).
+			// Parity with the attestation path, which already rejects non-DID subjects.
+			return nil, fmt.Errorf("%w: invalid cloud event header (subject/producer must be a DID, source a hex address): %+v", ErrValidation, hdr)
 		}
 		events[i] = cloudevent.RawEvent{
 			CloudEventHeader: *hdr,

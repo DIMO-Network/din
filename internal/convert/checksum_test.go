@@ -69,3 +69,18 @@ func TestCanonicalizeConnectionHeader_ChecksumsAddresses(t *testing.T) {
 		})
 	}
 }
+
+// A non-DID / path-traversal subject must NOT canonicalize — the caller rejects the
+// event on false, so the traversal-laden subject never reaches buildBlobKey (it would
+// otherwise control the externalized blob's object-key prefix).
+func TestCanonicalizeConnectionHeader_RejectsNonDIDSubject(t *testing.T) {
+	logger := zerolog.Nop()
+	bad := []cloudevent.CloudEventHeader{
+		{Subject: "../../../tenantB/x", Producer: "did:erc721:1:" + checksumAddr + ":1", Source: checksumAddr},
+		{Subject: "did:erc721:1:" + checksumAddr + ":2", Producer: "not-a-did", Source: checksumAddr},
+		{Subject: "did:erc721:1:" + checksumAddr + ":2", Producer: "did:erc721:1:" + checksumAddr + ":1", Source: "../etc"},
+	}
+	for _, hdr := range bad {
+		assert.False(t, canonicalizeConnectionHeader(&hdr, logger), "subject=%q producer=%q source=%q must be rejected", hdr.Subject, hdr.Producer, hdr.Source)
+	}
+}

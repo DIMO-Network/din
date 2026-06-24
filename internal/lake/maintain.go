@@ -254,8 +254,19 @@ func (m *Maintainer) reportConsumerHealth(ctx context.Context) {
 		return
 	}
 	staleConsumers.Set(float64(len(stale)))
+	if len(stale) == 0 {
+		return
+	}
+	// Count against the EFFECTIVE expire cutoff (what this cycle will actually expire),
+	// not pure retention — a *different* live consumer's floor may protect this stale
+	// consumer's backlog, so pure retention would over-count and false-page "data loss".
+	cutoff, _, err := m.expireCutoff(ctx)
+	if err != nil {
+		m.log.Warn().Err(err).Msg("resolving expire cutoff for consumer health failed")
+		return
+	}
 	for _, c := range stale {
-		lost, err := m.lake.UnconsumedExpiringCount(ctx, c.SnapshotID, m.cfg.SnapshotKeep)
+		lost, err := m.lake.UnconsumedExpiringCount(ctx, c.SnapshotID, cutoff)
 		if err != nil {
 			m.log.Warn().Err(err).Str("consumer", c.Name).Msg("checking dropped-consumer backlog failed")
 			continue
@@ -287,50 +298,66 @@ func (m *Maintainer) recordOldestSnapshotAge(ctx context.Context) {
 	}
 }
 
-// expireSQL builds this cycle's expire_snapshots call. The cutoff is the
-// retention horizon (now - SnapshotKeep), pulled back so it never expires
-// at or past the slowest live consumer's cursor — we expire only snapshots
-// strictly older than the first one that consumer has not yet consumed.
-// With no live consumer (none reported within ConsumerStaleness) the floor
-// is absent and the cutoff is pure retention. Sets the floor-binding gauge.
-func (m *Maintainer) expireSQL(ctx context.Context) (string, error) {
+// expireCutoff resolves this cycle's effective expire cutoff: the snapshot_time
+// before which snapshots will be expired, as an epoch. It is the retention horizon
+// (now - SnapshotKeep), pulled back to the slowest live consumer's first-unconsumed
+// snapshot when that floor is more restrictive (older). Returns whether a consumer
+// floor (rather than pure retention) is binding. Shared by expireSQL (to build the
+// CALL) and reportConsumerHealth (to count only what will ACTUALLY be expired — pure
+// retention over-counts when a *different* live consumer's floor protects a stale
+// consumer's backlog, which would false-page "data loss").
+func (m *Maintainer) expireCutoff(ctx context.Context) (cutoffEpoch float64, floorBinding bool, err error) {
 	keepSecs := int64(m.cfg.SnapshotKeep.Seconds())
-	retentionOnly := fmt.Sprintf(
-		"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '%d seconds')", keepSecs)
-
 	floor, ok, err := m.lake.ConsumerFloor(ctx, m.cfg.ConsumerStaleness)
+	if err != nil {
+		return 0, false, err
+	}
+	if !ok {
+		// No live consumer reported within ConsumerStaleness: cutoff is pure retention.
+		var retentionEpoch float64
+		if err = m.lake.db.QueryRowContext(ctx, fmt.Sprintf(
+			"SELECT epoch(now() - INTERVAL '%d seconds')", keepSecs)).Scan(&retentionEpoch); err != nil {
+			return 0, false, fmt.Errorf("expire retention epoch: %w", err)
+		}
+		return retentionEpoch, false, nil
+	}
+	// retention_epoch = the time-based horizon; floor_bound_epoch = time of the first
+	// snapshot the slowest consumer hasn't consumed (NULL when caught up to head).
+	var retentionEpoch float64
+	var floorBoundEpoch sql.NullFloat64
+	if err = m.lake.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT
+			epoch(now() - INTERVAL '%d seconds'),
+			epoch((SELECT MIN(snapshot_time) FROM lake.snapshots() WHERE snapshot_id > %d))`,
+		keepSecs, floor)).Scan(&retentionEpoch, &floorBoundEpoch); err != nil {
+		return 0, false, fmt.Errorf("expire floor bound: %w", err)
+	}
+	// The floor only binds when it is more restrictive (older) than retention; a
+	// consumer keeping up never holds expiry back.
+	if !floorBoundEpoch.Valid || floorBoundEpoch.Float64 >= retentionEpoch {
+		return retentionEpoch, false, nil
+	}
+	return floorBoundEpoch.Float64, true, nil
+}
+
+// expireSQL builds this cycle's expire_snapshots call from the effective cutoff
+// (see expireCutoff) and sets the floor-binding gauge.
+func (m *Maintainer) expireSQL(ctx context.Context) (string, error) {
+	cutoff, floorBinding, err := m.expireCutoff(ctx)
 	if err != nil {
 		return "", err
 	}
-	if !ok {
-		maintFloorBinding.Set(0)
-		return retentionOnly, nil
+	if floorBinding {
+		maintFloorBinding.Set(1)
+		m.log.Warn().Msg("consumer floor is holding expiry back below retention; a consumer is lagging")
+		return fmt.Sprintf(
+			"CALL ducklake_expire_snapshots('lake', older_than => to_timestamp(%f))", cutoff), nil
 	}
-
-	// retention_epoch = the time-based horizon; floor_bound_epoch = time of
-	// the first snapshot the slowest consumer hasn't consumed (NULL when it
-	// is caught up to head, i.e. no constraint).
-	var retentionEpoch float64
-	var floorBoundEpoch sql.NullFloat64
-	err = m.lake.db.QueryRowContext(ctx, fmt.Sprintf(`SELECT
-			epoch(now() - INTERVAL '%d seconds'),
-			epoch((SELECT MIN(snapshot_time) FROM lake.snapshots() WHERE snapshot_id > %d))`,
-		keepSecs, floor)).Scan(&retentionEpoch, &floorBoundEpoch)
-	if err != nil {
-		return "", fmt.Errorf("expire floor bound: %w", err)
-	}
-
-	// The floor only binds when it is more restrictive (older) than
-	// retention; a consumer keeping up never holds expiry back.
-	if !floorBoundEpoch.Valid || floorBoundEpoch.Float64 >= retentionEpoch {
-		maintFloorBinding.Set(0)
-		return retentionOnly, nil
-	}
-	maintFloorBinding.Set(1)
-	m.log.Warn().Int64("floor_snapshot", floor).
-		Msg("consumer floor is holding expiry back below retention; a consumer is lagging")
+	maintFloorBinding.Set(0)
+	// Pure retention: keep now()-INTERVAL (evaluated at CALL time) so the expired set
+	// is byte-identical to the prior behavior.
 	return fmt.Sprintf(
-		"CALL ducklake_expire_snapshots('lake', older_than => to_timestamp(%f))", floorBoundEpoch.Float64), nil
+		"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '%d seconds')",
+		int64(m.cfg.SnapshotKeep.Seconds())), nil
 }
 
 // execCount runs a maintenance CALL and drains its result rows; the row

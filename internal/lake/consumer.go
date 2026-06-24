@@ -110,16 +110,17 @@ func (l *Lake) StaleConsumers(ctx context.Context, staleness time.Duration) ([]S
 	return out, rows.Err()
 }
 
-// UnconsumedExpiringCount counts snapshots newer than cursor that are already
-// older than the retention horizon — snapshots a dropped consumer never
-// consumed that this cycle's time-only expiry will reclaim, permanently
-// truncating that consumer's change feed.
-func (l *Lake) UnconsumedExpiringCount(ctx context.Context, cursor int64, keep time.Duration) (int64, error) {
+// UnconsumedExpiringCount counts snapshots newer than cursor that are older than
+// cutoffEpoch — snapshots a dropped consumer never consumed that this cycle's expiry
+// will actually reclaim, permanently truncating that consumer's change feed. Pass the
+// effective expire cutoff (Maintainer.expireCutoff), not pure retention, so a backlog
+// protected by another live consumer's floor is not falsely counted as lost.
+func (l *Lake) UnconsumedExpiringCount(ctx context.Context, cursor int64, cutoffEpoch float64) (int64, error) {
 	var n sql.NullInt64
 	err := l.db.QueryRowContext(ctx, fmt.Sprintf(
 		`SELECT count(*) FROM lake.snapshots()
-		 WHERE snapshot_id > %d AND snapshot_time < now() - INTERVAL '%d seconds'`,
-		cursor, int64(keep.Seconds()))).Scan(&n)
+		 WHERE snapshot_id > %d AND snapshot_time < to_timestamp(%f)`,
+		cursor, cutoffEpoch)).Scan(&n)
 	if err != nil {
 		return 0, fmt.Errorf("unconsumed expiring count: %w", err)
 	}

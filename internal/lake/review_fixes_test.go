@@ -51,9 +51,11 @@ func TestStaleConsumers_AndUnconsumedExpiring(t *testing.T) {
 	assert.Equal(t, "dq", stale[0].Name)
 	assert.Greater(t, stale[0].AgeSeconds, float64(3000))
 
-	// keep=0 → retention horizon is now, so every snapshot past the dropped
-	// consumer's cursor (0) is reclaimable: this is the loss the counter tracks.
-	lost, err := l.UnconsumedExpiringCount(ctx, stale[0].SnapshotID, 0)
+	// Cutoff = now: every snapshot past the dropped consumer's cursor (0) is older
+	// than now, so all are reclaimable — this is the loss the counter tracks.
+	var nowEpoch float64
+	require.NoError(t, l.DB().QueryRowContext(ctx, "SELECT epoch(now())").Scan(&nowEpoch))
+	lost, err := l.UnconsumedExpiringCount(ctx, stale[0].SnapshotID, nowEpoch)
 	require.NoError(t, err)
 	assert.Positive(t, lost, "snapshots past a dropped consumer's cursor must be counted")
 

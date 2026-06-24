@@ -103,7 +103,7 @@ func TestIngestPerformance(t *testing.T) {
 		Publisher: stream.NewPublisher(js, 1),
 		Log:       zerolog.Nop(),
 	}
-	httpSrv := httptest.NewServer(sourceInjector("0xConnLicense", handlers.Connection()))
+	httpSrv := httptest.NewServer(sourceInjector("0xc0dec0dec0dec0dec0dec0dec0dec0dec0dec0de", handlers.Connection()))
 	t.Cleanup(httpSrv.Close)
 
 	sinkConsumer, err := rawStreams[0].CreateOrUpdateConsumer(ctx, jetstream.ConsumerConfig{
@@ -136,7 +136,7 @@ func TestIngestPerformance(t *testing.T) {
 				payload, _ := json.Marshal(map[string]any{
 					"type":        cloudevent.TypeStatus,
 					"subject":     subject,
-					"source":      "0xConnLicense",
+					"source":      "0xc0dec0dec0dec0dec0dec0dec0dec0dec0dec0de",
 					"producer":    subject,
 					"id":          fmt.Sprintf("perf-%d", i),
 					"specversion": cloudevent.SpecVersion,

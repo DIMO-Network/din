@@ -86,7 +86,7 @@ func TestEndToEnd_DeviceToDuckLakeAndTriggers(t *testing.T) {
 		Publisher: stream.NewPublisher(js, 1),
 		Log:       zerolog.Nop(),
 	}
-	httpSrv := httptest.NewServer(sourceInjector("0xConnLicense", handlers.Connection()))
+	httpSrv := httptest.NewServer(sourceInjector("0xc0dec0dec0dec0dec0dec0dec0dec0dec0dec0de", handlers.Connection()))
 	t.Cleanup(httpSrv.Close)
 
 	// Sink.
@@ -114,7 +114,7 @@ func TestEndToEnd_DeviceToDuckLakeAndTriggers(t *testing.T) {
 	payload, _ := json.Marshal(map[string]any{
 		"type":        cloudevent.TypeStatus,
 		"subject":     subject,
-		"source":      "0xConnLicense",
+		"source":      "0xc0dec0dec0dec0dec0dec0dec0dec0dec0dec0de",
 		"producer":    subject,
 		"id":          "device-msg-1",
 		"specversion": cloudevent.SpecVersion,

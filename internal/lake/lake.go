@@ -65,13 +65,13 @@ type Lake struct {
 	db *sql.DB
 }
 
+// lakeConnMaxLifetime recycles pooled DuckDB connections by age so a poisoned
+// catalog attach self-heals rather than persisting until the next deploy.
+const lakeConnMaxLifetime = 30 * time.Minute
+
 // Open starts DuckDB, attaches the DuckLake catalog, and bootstraps the
 // schema. Bootstrapping is idempotent and safe to race across replicas:
 // IF NOT EXISTS guards plus retries absorb conflicting catalog commits.
-// lakeConnMaxLifetime recycles pooled DuckDB connections by age so a poisoned
-// catalog attach self-heals rather than persisting until the next deploy (see Open).
-const lakeConnMaxLifetime = 30 * time.Minute
-
 func Open(ctx context.Context, cfg Config) (*Lake, error) {
 	if cfg.CatalogDSN == "" || cfg.DataPath == "" {
 		return nil, fmt.Errorf("lake: CatalogDSN and DataPath are required")

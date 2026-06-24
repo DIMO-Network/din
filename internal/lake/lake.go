@@ -453,12 +453,26 @@ func sqlString(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
-// redact hides credential-bearing statements from error messages.
+// redact hides credential-bearing values — the quoted DSN in ATTACH, the secret body
+// in CREATE SECRET — from error messages, while keeping the statement shape (notably
+// the `AS lake` / `AS meta` alias) so a failed bootstrap says WHICH attach failed
+// instead of collapsing both to an identical "ATTACH IF NOT EXISTS (…)".
 func redact(q string) string {
-	if strings.Contains(q, "SECRET") || strings.Contains(q, "ATTACH") {
-		if i := strings.IndexAny(q, "('"); i > 0 {
-			return q[:i] + "(…)"
+	if !strings.Contains(q, "SECRET") && !strings.Contains(q, "ATTACH") {
+		return q
+	}
+	var b strings.Builder
+	inQuote := false
+	for _, r := range q {
+		switch {
+		case r == '\'' && !inQuote:
+			b.WriteString("'…'") // open quote: emit the redacted placeholder once
+			inQuote = true
+		case r == '\'' && inQuote:
+			inQuote = false // close quote: the literal between was dropped
+		case !inQuote:
+			b.WriteRune(r)
 		}
 	}
-	return q
+	return b.String()
 }

@@ -65,3 +65,51 @@ func TestStaleConsumers_AndUnconsumedExpiring(t *testing.T) {
 		assert.NotEqual(t, "dq2", c.Name, "a fresh consumer must not be reported stale")
 	}
 }
+
+// redact must hide the credential-bearing literal (DSN / secret body) from a boot
+// error while keeping the statement shape — notably the AS lake/meta alias — so an
+// operator can tell which attach failed.
+func TestRedact_HidesSecretsKeepsAlias(t *testing.T) {
+	cases := []struct {
+		name        string
+		in          string
+		mustHave    []string
+		mustNotHave []string
+	}{
+		{
+			"attach lake redacts dsn, keeps alias",
+			"ATTACH IF NOT EXISTS 'ducklake:postgres:host=p password=topsecret' AS lake (DATA_PATH 's3://b/lake')",
+			[]string{"AS lake", "…"},
+			[]string{"password", "topsecret", "host=p"},
+		},
+		{
+			"attach meta keeps alias and type",
+			"ATTACH IF NOT EXISTS 'x' AS meta (TYPE postgres)",
+			[]string{"AS meta", "TYPE postgres"},
+			[]string{"'x'"},
+		},
+		{
+			"create secret redacts keys",
+			"CREATE SECRET (TYPE s3, KEY_ID 'AKIAEXAMPLE', SECRET 'shh')",
+			[]string{"CREATE SECRET", "TYPE s3"},
+			[]string{"AKIAEXAMPLE", "shh"},
+		},
+		{
+			"non-secret statement untouched",
+			"SELECT 1",
+			[]string{"SELECT 1"},
+			nil,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := redact(tc.in)
+			for _, s := range tc.mustHave {
+				assert.Contains(t, got, s, "redacted=%q", got)
+			}
+			for _, s := range tc.mustNotHave {
+				assert.NotContains(t, got, s, "redacted=%q LEAKED %q", got, s)
+			}
+		})
+	}
+}

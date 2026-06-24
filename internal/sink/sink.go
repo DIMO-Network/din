@@ -452,7 +452,7 @@ func (s *Sink) isolate(ctx context.Context, job flushJob) {
 			if committed == 0 && len(failed) >= isolateProbeLimit {
 				s.log.Error().Int("probed", len(failed)).Int("remaining", len(job.events)-i-1).
 					Msg("isolate: probe failed with zero commits; treating as global fault, leaving bundle for redelivery")
-				s.termExpiredPoison(job, failed)
+				s.termExpiredPoison(ctx, job, failed)
 				return
 			}
 			continue
@@ -490,7 +490,15 @@ func (s *Sink) isolate(ctx context.Context, job flushJob) {
 // past the redelivery threshold, so a genuinely all-poison bundle still drains
 // over successive redeliveries even when the global-fault bail-out skips full
 // per-event isolation. Rows still under the threshold are left for redelivery.
-func (s *Sink) termExpiredPoison(job flushJob, failed []int) {
+// Under a canceled context (drain/shutdown) it Term's nothing: those write
+// failures are cancellation, not the writer rejecting poison, so even a
+// past-threshold row is left for redelivery — matching isolate's mid-bundle
+// cancel guard (otherwise a pod drain that coincides with a redelivered row would
+// silently drop healthy, never-persisted data).
+func (s *Sink) termExpiredPoison(ctx context.Context, job flushJob, failed []int) {
+	if ctx.Err() != nil {
+		return
+	}
 	for _, i := range failed {
 		if redeliveryCount(job.msgs[i]) >= poisonRedeliveryThreshold {
 			s.terminatePoison(job.events[i], job.msgs[i])

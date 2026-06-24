@@ -135,6 +135,37 @@ func TestIsolate_LeavesRowsForRedeliveryOnCancel(t *testing.T) {
 	}
 }
 
+// cancelAllWriter cancels its context on the first write and fails every write —
+// simulating a drain-timeout cancellation that lands before any commit, driving
+// isolate into the committed==0 global-fault bail-out.
+type cancelAllWriter struct{ cancel context.CancelFunc }
+
+func (w *cancelAllWriter) WriteBundle(context.Context, []cloudevent.StoredEvent) error {
+	w.cancel()
+	return context.Canceled
+}
+
+// The committed==0 global-fault bail-out must ALSO respect cancellation: rows past
+// the redelivery threshold whose write failed only because ctx was canceled
+// (drain/shutdown) must be left for redelivery, not Term'd as expired poison.
+func TestIsolate_BailoutLeavesRowsForRedeliveryOnCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	s := &Sink{writer: &cancelAllWriter{cancel: cancel}, log: zerolog.Nop()}
+	n := isolateProbeLimit + 2 // enough failures to trip the bail-out
+	msgs := make([]*trackMsg, n)
+	job := flushJob{events: make([]cloudevent.StoredEvent, n), msgs: make([]jetstream.Msg, n)}
+	for i := range msgs {
+		msgs[i] = &trackMsg{delivered: poisonRedeliveryThreshold} // past the threshold
+		job.msgs[i] = msgs[i]
+	}
+	s.isolate(ctx, job)
+	for i, m := range msgs {
+		if m.terminated {
+			t.Fatalf("msg %d Term'd via the global-fault bail-out under cancellation; past-threshold rows must survive for redelivery when the failure is cancellation", i)
+		}
+	}
+}
+
 // applyBackpressure must block the Run goroutine while the buffer is over the
 // hard byte ceiling and no flush slot is free, so messages stop being pulled
 // from JetStream and buffered memory stays bounded instead of growing until OOM

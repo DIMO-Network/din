@@ -277,7 +277,9 @@ func run(log zerolog.Logger) error {
 		return err
 	}
 
-	// Conversion + attestation.
+	// Conversion + attestation. Wire the validated time-skew tolerance so the
+	// converter uses the config-validated value rather than re-reading the env.
+	convert.SetAllowableTimeSkew(settings.AllowableTimeSkew)
 	convertCfg := convert.Config{
 		ChainID:               settings.ChainID,
 		VehicleNFTAddress:     settings.VehicleNFTAddress,

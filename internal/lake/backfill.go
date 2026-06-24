@@ -70,7 +70,13 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 		if len(pending) == 0 {
 			return nil
 		}
-		_ = l.heartbeatBackfillPause(ctx) // keep the maintenance pause fresh per batch
+		// Keep the maintenance pause fresh per batch. If the refresh fails the pause
+		// can go stale (>30m), letting the maintainer resume re-asserting partitioning
+		// into this RESET window and abort an in-flight add_data_files (recoverable on
+		// rerun) — so surface a failing heartbeat instead of swallowing it silently.
+		if herr := l.heartbeatBackfillPause(ctx); herr != nil {
+			log.Warn().Err(herr).Msg("backfill pause heartbeat refresh failed; maintainer may resume re-asserting layout")
+		}
 		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 			return fmt.Errorf("lake backfill begin: %w", err)
 		}

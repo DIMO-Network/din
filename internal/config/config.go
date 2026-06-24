@@ -15,8 +15,7 @@ import (
 
 // Settings is the full runtime configuration.
 type Settings struct {
-	Environment string
-	LogLevel    string
+	LogLevel string
 
 	// HTTP servers.
 	ConnectionAddr  string // DIS_CONNECTION_ADDRESS
@@ -108,7 +107,6 @@ type Settings struct {
 // Load reads Settings from the environment, applying defaults.
 func Load() (Settings, error) {
 	s := Settings{
-		Environment:            env("ENVIRONMENT", "dev"),
 		LogLevel:               env("LOG_LEVEL", "info"),
 		ConnectionAddr:         env("DIS_CONNECTION_ADDRESS", "0.0.0.0:9443"),
 		AttestationAddr:        env("DIS_ATTESTATION_ADDRESS", "0.0.0.0:9442"),

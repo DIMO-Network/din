@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"time"
 
@@ -40,7 +39,19 @@ var allowedContentTypes = map[string]struct{}{
 	"application/pdf":  {},
 }
 
-var allowableTimeSkew = getSkew()
+// allowableTimeSkew bounds how far past now() a CloudEvent timestamp may be. It holds
+// the default until SetAllowableTimeSkew wires in the validated config value at boot,
+// so the converter uses the value config.Load already validated rather than
+// independently re-reading (and leniently mis-parsing) the env.
+var allowableTimeSkew = defaultSkew
+
+// SetAllowableTimeSkew sets the future-timestamp tolerance from the validated config
+// (Settings.AllowableTimeSkew). Call once at boot before ingest starts.
+func SetAllowableTimeSkew(d time.Duration) {
+	if d > 0 {
+		allowableTimeSkew = d
+	}
+}
 
 // ValidIdentifier reports whether str only contains characters allowed in
 // CloudEvent identifier fields.
@@ -51,18 +62,6 @@ func ValidIdentifier(str string) bool {
 // IsFutureTimestamp checks if a timestamp is in the future past the allowable time skew.
 func IsFutureTimestamp(ts time.Time) bool {
 	return ts.After(time.Now().Add(allowableTimeSkew))
-}
-
-func getSkew() time.Duration {
-	skew := os.Getenv("ALLOWABLE_TIME_SKEW")
-	if skew == "" {
-		return defaultSkew
-	}
-	dur, err := time.ParseDuration(skew)
-	if err != nil {
-		return defaultSkew
-	}
-	return dur
 }
 
 // ValidateHeadersAndSetDefaults validates the cloud event header and fills in defaults.

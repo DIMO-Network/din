@@ -8,14 +8,45 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/rs/zerolog"
 	"golang.org/x/time/rate"
 )
+
+// httpHandlerPanics counts panics recovered in an HTTP handler (returned as 500).
+var httpHandlerPanics = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "din_http_handler_panics_total",
+	Help: "Panics recovered in an HTTP handler and returned as 500.",
+})
+
+// recoverMiddleware turns a panic in any downstream handler into a logged 500 plus a
+// metric, rather than net/http's default — which dumps the stack to stderr outside the
+// structured log and drops the connection with no response. Apply it as the OUTERMOST
+// wrapper so it also covers the auth / rate-limit / max-bytes middleware.
+func recoverMiddleware(logger zerolog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer func() {
+				if rec := recover(); rec != nil {
+					httpHandlerPanics.Inc()
+					logger.Error().Interface("panic", rec).Str("path", r.URL.Path).
+						Str("remote", r.RemoteAddr).Bytes("stack", debug.Stack()).
+						Msg("recovered from panic in HTTP handler")
+					http.Error(w, "internal server error", http.StatusInternalServerError)
+				}
+			}()
+			next.ServeHTTP(w, r)
+		})
+	}
+}
 
 // ErrInvalidEthAddr reports a JWT whose ethereum_address claim is missing
 // or the zero address.

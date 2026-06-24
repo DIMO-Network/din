@@ -2,10 +2,24 @@ package server
 
 import (
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 )
+
+// recoverMiddleware must turn a handler panic into a 500 (and not let the panic
+// escape ServeHTTP), so a bug in any handler degrades one request, not the connection.
+func TestRecoverMiddleware_TurnsPanicInto500(t *testing.T) {
+	panicker := http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("boom") })
+	h := recoverMiddleware(zerolog.Nop())(panicker)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil)) // must not panic
+	require.Equal(t, http.StatusInternalServerError, rec.Code)
+}
 
 func TestRemoteLimiter_BoundedKeys(t *testing.T) {
 	t.Parallel()

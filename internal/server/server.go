@@ -125,6 +125,7 @@ func NewConnectionServer(cfg ConnectionConfig, handler http.Handler) (*http.Serv
 	h := certSourceHandler(handler)
 	h = maxBytesMiddleware(cfg.MaxBodyBytes)(h)
 	h = rateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, certCNKey)(h)
+	h = recoverMiddleware(cfg.Logger)(h)
 
 	return &http.Server{
 		Addr:    cfg.Addr,
@@ -178,6 +179,7 @@ func NewAttestationServer(cfg AttestationConfig, handler http.Handler) (*http.Se
 
 	h := maxBytesMiddleware(cfg.MaxBodyBytes)(authHandler)
 	h = rateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, remoteIPKey)(h)
+	h = recoverMiddleware(cfg.Logger)(h)
 
 	return &http.Server{
 		Addr:              cfg.Addr,

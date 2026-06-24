@@ -226,7 +226,20 @@ func run(log zerolog.Logger) error {
 			return err
 		}
 	default:
-		if conn, err = nats.Connect(settings.NATSURL); err != nil {
+		// Reconnect forever: nats.go defaults to 60 attempts then closes the
+		// connection permanently, which would leave ingest dead — while /ready stays
+		// latched 200 — until a manual pod restart. Keep retrying so a NATS outage
+		// self-heals; failed publishes meanwhile return 503 so devices retry.
+		opts := []nats.Option{
+			nats.MaxReconnects(-1),
+			nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
+				log.Warn().Err(err).Msg("NATS disconnected; reconnecting")
+			}),
+			nats.ReconnectHandler(func(c *nats.Conn) {
+				log.Info().Str("url", c.ConnectedUrl()).Msg("NATS reconnected")
+			}),
+		}
+		if conn, err = nats.Connect(settings.NATSURL, opts...); err != nil {
 			return err
 		}
 	}

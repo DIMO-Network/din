@@ -81,7 +81,11 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 			return fmt.Errorf("lake backfill begin: %w", err)
 		}
 		for _, f := range pending {
-			q := fmt.Sprintf("CALL ducklake_add_data_files('lake', %s, %s)",
+			// allow_missing tolerates legacy bundles written before a column was
+			// added to raw_events (notably voids_id, the tombstone pointer): the
+			// missing column reads as NULL, which is exactly "not voided". Without
+			// it ducklake_add_data_files hard-fails on any pre-voids_id file.
+			q := fmt.Sprintf("CALL ducklake_add_data_files('lake', %s, %s, allow_missing => true)",
 				sqlString(RawTable), sqlString(f))
 			if _, err := conn.ExecContext(ctx, q); err != nil {
 				if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {

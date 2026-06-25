@@ -64,14 +64,14 @@ type Settings struct {
 	// DuckLake. The catalog database is PostgreSQL in production
 	// (multi-process writes) or a local file for dev/test; DataPath is
 	// where Parquet lands and is immutable once the catalog exists.
-	LakeCatalogDSN     string // LAKE_CATALOG_DSN
-	LakeDataPath       string // LAKE_DATA_PATH: s3://bucket/prefix/ or absolute path
-	LakeTempDirectory  string // LAKE_TEMP_DIRECTORY: DuckDB spill volume (e.g. /tmp/duckdb)
-	LakeMemoryLimit    string // LAKE_MEMORY_LIMIT, e.g. "1GB"
-	LakeThreads        int    // LAKE_THREADS
+	LakeCatalogDSN     string // DUCKLAKE_CATALOG_DSN
+	LakeDataPath       string // DUCKLAKE_DATA_PATH: s3://bucket/prefix/ or absolute path
+	LakeTempDirectory  string // DUCKDB_TEMP_DIRECTORY: DuckDB spill volume (e.g. /tmp/duckdb)
+	LakeMemoryLimit    string // DUCKDB_MEMORY_LIMIT, e.g. "1GB"
+	LakeThreads        int    // DUCKDB_THREADS
 	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
 	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
-	LakeExtensionDir   string // LAKE_EXTENSION_DIR: pre-baked DuckDB extensions
+	LakeExtensionDir   string // DUCKDB_EXTENSION_DIR: pre-baked DuckDB extensions
 
 	// Lake maintenance (compaction, snapshot expiry, file cleanup).
 	// Run exactly one maintenance process per catalog. SnapshotKeep
@@ -119,21 +119,21 @@ func Load() (Settings, error) {
 		TLSCertFile:            os.Getenv("TLS_CERT_FILE"),
 		TLSKeyFile:             os.Getenv("TLS_KEY_FILE"),
 		TLSClientCAFile:        os.Getenv("TLS_CA_CERT_FILE"),
-		TokenExchangeIssuer:    os.Getenv("TOKEN_EXCHANGE_ISSUER"),
-		TokenExchangeKeySetURL: os.Getenv("TOKEN_EXCHANGE_KEY_SET_URL"),
+		TokenExchangeIssuer:    os.Getenv("TOKEN_EXCHANGE_ISSUER_URL"),
+		TokenExchangeKeySetURL: os.Getenv("TOKEN_EXCHANGE_JWK_KEY_SET_URL"),
 		RPCURL:                 os.Getenv("RPC_URL"),
 		NATSMode:               env("NATS_MODE", "external"),
 		NATSURL:                env("NATS_URL", "nats://localhost:4222"),
 		NATSStoreDir:           env("NATS_STORE_DIR", "/data/nats"),
 		BlobBucket:             os.Getenv("BLOB_BUCKET"),
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
-		LakeCatalogDSN:         os.Getenv("LAKE_CATALOG_DSN"),
-		LakeDataPath:           os.Getenv("LAKE_DATA_PATH"),
-		LakeTempDirectory:      os.Getenv("LAKE_TEMP_DIRECTORY"),
-		LakeMemoryLimit:        os.Getenv("LAKE_MEMORY_LIMIT"),
+		LakeCatalogDSN:         os.Getenv("DUCKLAKE_CATALOG_DSN"),
+		LakeDataPath:           os.Getenv("DUCKLAKE_DATA_PATH"),
+		LakeTempDirectory:      os.Getenv("DUCKDB_TEMP_DIRECTORY"),
+		LakeMemoryLimit:        os.Getenv("DUCKDB_MEMORY_LIMIT"),
 		LakeTargetFileSize:     env("LAKE_TARGET_FILE_SIZE", "512MB"),
 		LakeParquetVersion:     env("LAKE_PARQUET_VERSION", "2"),
-		LakeExtensionDir:       os.Getenv("LAKE_EXTENSION_DIR"),
+		LakeExtensionDir:       os.Getenv("DUCKDB_EXTENSION_DIR"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
 		S3SecretAccessKey:      os.Getenv("S3_AWS_SECRET_ACCESS_KEY"),
@@ -202,7 +202,7 @@ func Load() (Settings, error) {
 	s.LakeMaintenanceEnabled = envBool("LAKE_MAINTENANCE_ENABLED", false)
 	s.FingerprintValidation = envBool("FINGERPRINT_VALIDATION", true)
 
-	threads, err := envUint("LAKE_THREADS", 0)
+	threads, err := envUint("DUCKDB_THREADS", 0)
 	if err != nil {
 		return s, err
 	}
@@ -251,14 +251,14 @@ func Load() (Settings, error) {
 	}
 
 	if s.LakeCatalogDSN == "" {
-		return s, errors.New("LAKE_CATALOG_DSN is required (PostgreSQL DSN, or a local catalog file path for single-node)")
+		return s, errors.New("DUCKLAKE_CATALOG_DSN is required (PostgreSQL DSN, or a local catalog file path for single-node)")
 	}
 	if s.LakeDataPath == "" {
-		return s, errors.New("LAKE_DATA_PATH is required (s3://bucket/prefix/ or absolute local path)")
+		return s, errors.New("DUCKLAKE_DATA_PATH is required (s3://bucket/prefix/ or absolute local path)")
 	}
 	// Paths must be unambiguous: relative values would silently resolve
 	// against the working directory.
-	for name, v := range map[string]string{"LAKE_DATA_PATH": s.LakeDataPath, "BLOB_BUCKET": s.BlobBucket} {
+	for name, v := range map[string]string{"DUCKLAKE_DATA_PATH": s.LakeDataPath, "BLOB_BUCKET": s.BlobBucket} {
 		if strings.HasPrefix(v, ".") {
 			return s, fmt.Errorf("%s must not be a relative path, got %q", name, v)
 		}

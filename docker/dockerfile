@@ -20,5 +20,5 @@ LABEL maintainer="DIMO <hello@dimo.zone>"
 USER nonroot:nonroot
 COPY --from=build --chown=nonroot:nonroot /din /
 COPY --from=build --chown=nonroot:nonroot /duckdb-extensions /duckdb-extensions
-ENV LAKE_EXTENSION_DIR=/duckdb-extensions
+ENV DUCKDB_EXTENSION_DIR=/duckdb-extensions
 ENTRYPOINT ["/din"]

@@ -10,7 +10,7 @@ import (
 
 // InstallExtensions downloads the DuckDB extensions din needs into dir.
 // Run at image build time so pods never fetch extensions over the
-// network at startup; point LAKE_EXTENSION_DIR at the same dir.
+// network at startup; point DUCKDB_EXTENSION_DIR at the same dir.
 func InstallExtensions(ctx context.Context, dir string) error {
 	connector, err := duckdb.NewConnector("", nil)
 	if err != nil {

@@ -45,20 +45,20 @@ env:
   VEHICLE_NFT_ADDRESS: '0x45fbCD3ef7361d156e8b16F5538AE36DEdf61Da8'
   AFTERMARKET_NFT_ADDRESS: '0x325b45949C833986bC98e98a49F3CA5C5c4643B5'
   SYNTHETIC_NFT_ADDRESS: '0x78513c8CB4D6B6079f813850376bc9c7fc8aE67f'
-  TOKEN_EXCHANGE_KEY_SET_URL: https://auth.dev.dimo.zone/keys
-  TOKEN_EXCHANGE_ISSUER: https://auth.dev.dimo.zone
+  TOKEN_EXCHANGE_JWK_KEY_SET_URL: https://auth.dev.dimo.zone/keys
+  TOKEN_EXCHANGE_ISSUER_URL: https://auth.dev.dimo.zone
   DOCUMENT_SIZE_THRESHOLD: '1048576'
   BLOB_BUCKET: dimo-blob-storage-dev
   BLOB_PREFIX: cloudevent/blobs/
   S3_AWS_REGION: us-east-2
-  # DuckLake: LAKE_CATALOG_DSN comes from the secret. DATA_PATH is
+  # DuckLake: DUCKLAKE_CATALOG_DSN comes from the secret. DATA_PATH is
   # immutable once the catalog exists — choose deliberately.
-  LAKE_DATA_PATH: s3://dimo-storage-dev/lake/
+  DUCKLAKE_DATA_PATH: s3://dimo-storage-dev/lake/
   # DuckDB spill volume. When set, an emptyDir (duckdbTempSizeLimit) is mounted
   # here on both the ingest and maintenance pods so a large merge/append spills
   # to disk instead of the container root fs. Empty = spill to the default (root fs).
-  LAKE_TEMP_DIRECTORY: /tmp/duckdb
-  LAKE_MEMORY_LIMIT: 512MB
+  DUCKDB_TEMP_DIRECTORY: /tmp/duckdb
+  DUCKDB_MEMORY_LIMIT: 512MB
   # Parquet write tuning (catalog-global; applies to din's raw_events and dq's
   # decoded tables). v2 delta-packs the sorted (subject,"time") layer for a
   # large size win over v1 on top of zstd — only DuckDB reads the lake, so it
@@ -143,8 +143,8 @@ certificate:
   commonName: din.dev.dimo.zone
   issuer: cas-dev-dimo-ca-issuer
   caConfigMap: cae-dev-dimo-ca-certs
-# Size of the emptyDir backing LAKE_TEMP_DIRECTORY (DuckDB spill). Only mounted
-# when env.LAKE_TEMP_DIRECTORY is set. Raise for deep-history maintenance merges.
+# Size of the emptyDir backing DUCKDB_TEMP_DIRECTORY (DuckDB spill). Only mounted
+# when env.DUCKDB_TEMP_DIRECTORY is set. Raise for deep-history maintenance merges.
 duckdbTempSizeLimit: 5Gi
 resources:
   limits:
@@ -180,7 +180,7 @@ maintenance:
   # The maintainer merges/expires across the whole catalog (raw_events + the
   # decoded tables) — memory-heavy parquet rewrites. Undersizing it slows merges
   # and leaves small files that inflate per-query S3 GET cost (CHD-20, R2-H5).
-  # memoryLimit overrides the shared LAKE_MEMORY_LIMIT for the maintainer only.
+  # memoryLimit overrides the shared DUCKDB_MEMORY_LIMIT for the maintainer only.
   memoryLimit: 3GB
   resources:
     limits:

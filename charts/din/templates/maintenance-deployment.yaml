@@ -57,10 +57,10 @@ spec:
           - secretRef:
               name: {{ include "din.fullname" . }}-secret
           {{- if .Values.maintenance.memoryLimit }}
-          # Explicit env overrides the shared configmap's LAKE_MEMORY_LIMIT so
+          # Explicit env overrides the shared configmap's DUCKDB_MEMORY_LIMIT so
           # the maintainer's DuckDB can use the larger merge budget (CHD-20).
           env:
-            - name: LAKE_MEMORY_LIMIT
+            - name: DUCKDB_MEMORY_LIMIT
               value: {{ .Values.maintenance.memoryLimit | quote }}
           {{- end }}
           ports:
@@ -81,12 +81,12 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.maintenance.resources | nindent 12 }}
-          {{- if .Values.env.LAKE_TEMP_DIRECTORY }}
+          {{- if .Values.env.DUCKDB_TEMP_DIRECTORY }}
           volumeMounts:
             - name: duckdb-temp
-              mountPath: {{ .Values.env.LAKE_TEMP_DIRECTORY | quote }}
+              mountPath: {{ .Values.env.DUCKDB_TEMP_DIRECTORY | quote }}
           {{- end }}
-      {{- if .Values.env.LAKE_TEMP_DIRECTORY }}
+      {{- if .Values.env.DUCKDB_TEMP_DIRECTORY }}
       volumes:
         # DuckDB spill target for the maintenance merge/compaction (the heaviest
         # spiller). emptyDir on node ephemeral storage so a large merge spills to

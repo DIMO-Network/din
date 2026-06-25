@@ -282,11 +282,13 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeSignals)
+	// Key() is identical for every decoded name of one raw event — compute once.
+	baseKey := rawEvent.Key()
 	var futures []jetstream.PubAckFuture
 	var pubErrs error
 	for name, group := range groupSignalsByName(signals) {
 		signalCE := vss.PackSignals(header, group)
-		fut, err := b.publishJSONAsync(signalSubjectPrefix+"."+sanitize(name), signalCE, dedupID(rawEvent, name))
+		fut, err := b.publishJSONAsync(signalSubjectPrefix+"."+sanitize(name), signalCE, dedupID(baseKey, name))
 		if err != nil {
 			pubErrs = errors.Join(pubErrs, err)
 			continue
@@ -311,6 +313,8 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeEvents)
+	// Key() is identical for every decoded name of one raw event — compute once.
+	baseKey := rawEvent.Key()
 	byName := map[string][]vss.Event{}
 	for _, ev := range events {
 		byName[ev.Data.Name] = append(byName[ev.Data.Name], ev)
@@ -319,7 +323,7 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 	var pubErrs error
 	for name, group := range byName {
 		eventCE := vss.PackEvents(header, group)
-		fut, err := b.publishJSONAsync(eventSubjectPrefix+"."+sanitize(name), eventCE, dedupID(rawEvent, name))
+		fut, err := b.publishJSONAsync(eventSubjectPrefix+"."+sanitize(name), eventCE, dedupID(baseKey, name))
 		if err != nil {
 			pubErrs = errors.Join(pubErrs, err)
 			continue
@@ -352,10 +356,10 @@ func (b *Bridge) publishJSONAsync(subject string, payload any, dedup string) (je
 	return fut, nil
 }
 
-// dedupID is deterministic per (raw event, decoded name): replays of the
-// same raw message produce the same id.
-func dedupID(rawEvent *cloudevent.RawEvent, name string) string {
-	sum := sha256.Sum256([]byte(rawEvent.Key() + "|" + name))
+// dedupID is deterministic per (raw event key, decoded name): replays of the
+// same raw message produce the same id. baseKey is the raw event's Key().
+func dedupID(baseKey, name string) string {
+	sum := sha256.Sum256([]byte(baseKey + "|" + name))
 	return hex.EncodeToString(sum[:16])
 }
 

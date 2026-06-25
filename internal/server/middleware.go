@@ -56,8 +56,6 @@ var zeroAddress common.Address
 
 // Claims is the token-exchange JWT claim set used for attestation auth.
 type Claims struct {
-	EmailAddress    *string        `json:"email,omitempty"`
-	ProviderID      *string        `json:"provider_id,omitempty"`
 	EthereumAddress common.Address `json:"ethereum_address,omitempty"`
 	jwt.RegisteredClaims
 }

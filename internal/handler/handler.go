@@ -131,7 +131,7 @@ func (h *Handlers) Attestation() http.Handler {
 func (h *Handlers) publishOne(ctx context.Context, event cloudevent.RawEvent, voidsID string) error {
 	stored, err := h.Splitter.MaybeSplit(ctx, event)
 	if err != nil {
-		return err
+		return fmt.Errorf("splitting event %s: %w", event.ID, err)
 	}
 	stored.VoidsID = voidsID
 	return h.Publisher.Publish(ctx, &stored)

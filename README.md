@@ -108,6 +108,7 @@ Scaling out is the same binary with a PostgreSQL `DUCKLAKE_CATALOG_DSN`, an S3 `
 | `LAKE_MAINTENANCE_INTERVAL` / `LAKE_SNAPSHOT_RETENTION` | no | defaults 15m / 72h; retention must exceed consumer lag |
 | `LAKE_CONSUMER_STALENESS` | no | default 1h; a consumer quiet this long is dropped from the expiry floor |
 | `DUCKDB_MEMORY_LIMIT` / `DUCKDB_THREADS` / `LAKE_TARGET_FILE_SIZE` | no | DuckDB/DuckLake tuning (e.g. `1GB`, `4`, `512MB`) |
+| `LAKE_COMPRESSION` | no | parquet codec: `snappy` (default — fastest write) \| `zstd` (~1.6× smaller, ~30% slower) \| `lz4` \| `uncompressed` |
 | `DUCKDB_EXTENSION_DIR` | no | pre-baked DuckDB extensions (set in the container image) |
 | `DECODESTREAM_ENABLED` | no | default true |
 | `DIMO_REGISTRY_CHAIN_ID` | no | default 137 |

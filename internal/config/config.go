@@ -71,6 +71,7 @@ type Settings struct {
 	LakeThreads        int    // DUCKDB_THREADS
 	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
 	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
+	LakeCompression    string // LAKE_COMPRESSION: snappy (default) | zstd | lz4 | uncompressed
 	LakeExtensionDir   string // DUCKDB_EXTENSION_DIR: pre-baked DuckDB extensions
 
 	// Lake maintenance (compaction, snapshot expiry, file cleanup).
@@ -133,6 +134,7 @@ func Load() (Settings, error) {
 		LakeMemoryLimit:        os.Getenv("DUCKDB_MEMORY_LIMIT"),
 		LakeTargetFileSize:     env("LAKE_TARGET_FILE_SIZE", "512MB"),
 		LakeParquetVersion:     env("LAKE_PARQUET_VERSION", "2"),
+		LakeCompression:        env("LAKE_COMPRESSION", "snappy"),
 		LakeExtensionDir:       os.Getenv("DUCKDB_EXTENSION_DIR"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),

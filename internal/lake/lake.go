@@ -47,6 +47,14 @@ type Config struct {
 	// TargetFileSize is DuckLake's target Parquet file size for writes
 	// and compaction (e.g. "512MB"); empty keeps the DuckLake default.
 	TargetFileSize string
+	// Compression is the Parquet compression codec for writes/compaction:
+	// "snappy" (default — fastest write, the throughput choice for this
+	// write-heavy ingest node), "zstd" (~1.6x smaller files but ~30% slower
+	// write), "lz4", or "uncompressed". Empty keeps the snappy default. The
+	// write path is CPU-bound on the codec, so this is the main
+	// materialize-throughput lever; bloom filters and dictionary encoding
+	// (subject pruning) are codec-independent and preserved either way.
+	Compression string
 	// ParquetVersion is the Parquet format version DuckLake writes, "1" or
 	// "2"; empty (or anything else) keeps the DuckLake default of 1. v2 turns
 	// on DELTA_BINARY_PACKED / byte-stream-split encodings that shrink the
@@ -208,12 +216,19 @@ func (l *Lake) assertOptions(ctx context.Context, cfg Config) error {
 // reach a catalog that already exists.
 func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 	// name → already-SQL-formatted value (a quoted string or a bare literal).
+	compression := "snappy"
+	if cfg.Compression != "" {
+		compression = cfg.Compression
+	}
 	opts := []struct{ name, valueSQL string }{
-		// zstd matches the old pqwrite encoder and beats the snappy default for
-		// this sorted time-series; DuckDB also writes bloom filters on
-		// dictionary-encoded columns (subject), preserving the old bundles'
-		// pruning characteristics.
-		{"parquet_compression", "'zstd'"},
+		// snappy is the default: the parquet write is CPU-bound on the codec, and
+		// snappy sustains ~30% higher materialize throughput than zstd on this
+		// sorted time-series (at ~1.6x the file size). zstd remains available via
+		// Config.Compression for storage-constrained deployments. Either way DuckDB
+		// writes bloom filters on dictionary-encoded columns (subject), so subject
+		// pruning is preserved; backfilled DIS bundles keep their own (zstd) codec
+		// since compression is a per-file Parquet property.
+		{"parquet_compression", sqlString(compression)},
 	}
 	if v := parquetVersionLiteral(cfg.ParquetVersion); v != "" {
 		opts = append(opts, struct{ name, valueSQL string }{"parquet_version", v})

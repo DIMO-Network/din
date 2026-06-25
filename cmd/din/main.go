@@ -185,6 +185,7 @@ func lakeConfig(settings config.Settings) lake.Config {
 		Threads:           settings.LakeThreads,
 		TargetFileSize:    settings.LakeTargetFileSize,
 		ParquetVersion:    settings.LakeParquetVersion,
+		Compression:       settings.LakeCompression,
 		ExtensionDir:      settings.LakeExtensionDir,
 		TempDirectory:     settings.LakeTempDirectory,
 		MaxConns:          settings.NATSStreamPartitions*settings.LakeWriterConnections + 2,

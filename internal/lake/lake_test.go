@@ -252,8 +252,10 @@ func TestWriter_PartitionedDataLayout(t *testing.T) {
 		`SELECT count(*) FROM lake.raw_events WHERE type = 'dimo.status' AND "time"::DATE = DATE '2026-06-09'`).Scan(&n))
 	assert.Equal(t, 20, n)
 
-	// Written files keep the old pqwrite bundles' pruning traits: zstd
-	// compression and a usable subject bloom filter.
+	// Written files use the default snappy codec and still carry the subject
+	// bloom filter — pruning traits are codec-independent, so the snappy default
+	// (chosen for materialize throughput) keeps the old pqwrite bundles' subject
+	// pruning even though it no longer matches their zstd codec.
 	file := filepath.Join(dataPath, partitioned[0])
 	var compression string
 	var hasBloom bool
@@ -261,7 +263,7 @@ func TestWriter_PartitionedDataLayout(t *testing.T) {
 		`SELECT compression, bloom_filter_offset IS NOT NULL FROM parquet_metadata(%s)
 		 WHERE path_in_schema = 'subject' AND row_group_id = 0`, sqlString(file))).
 		Scan(&compression, &hasBloom))
-	assert.Equal(t, "ZSTD", compression)
+	assert.Equal(t, "SNAPPY", compression)
 	assert.True(t, hasBloom, "subject column must carry a bloom filter")
 }
 

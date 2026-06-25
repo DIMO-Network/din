@@ -172,7 +172,11 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	// unpartitioned files until the next pod boot (SR review #9). Idempotent and
 	// snapshot-free when the layout is already active.
 	start := time.Now()
-	if err := m.lake.reassertLayout(ctx); err != nil {
+	// Wrap in retryCatalog like the boot path does (lake.go:282, ensureSchema): the ALTERs
+	// can lose a cross-pod metadata-commit race (DuckLake "TransactionContext Error") that
+	// is transient. Boot retries it; the 15-min maintenance loop must too, or it burns a
+	// degraded cycle on a conflict that a retry would clear.
+	if err := retryCatalog(ctx, func() error { return m.lake.reassertLayout(ctx) }); err != nil {
 		maintErrors.WithLabelValues("reassert_layout").Inc()
 		m.log.Error().Err(err).Str("step", "reassert_layout").Msg("maintenance step failed")
 		// First step in the cycle, so firstErr is still nil — assign directly.

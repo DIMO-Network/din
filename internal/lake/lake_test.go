@@ -2,6 +2,7 @@ package lake
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,6 +16,34 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// TestConnInit_AllPooledConnsAreUTC proves the connector's per-connection init
+// runs on every pooled connection, not just the one bootstrap() used. The
+// raw_events partition key is day("time") over a TIMESTAMP WITH TIME ZONE
+// column, so a writer/recycled conn left at the process TimeZone would file
+// near-midnight-UTC events under the wrong (type, day) partition. Hold several
+// conns open at once to force distinct physical connections and assert each is
+// pinned to UTC.
+func TestConnInit_AllPooledConnsAreUTC(t *testing.T) {
+	t.Parallel()
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	db := l.DB()
+
+	const n = 4
+	conns := make([]*sql.Conn, 0, n)
+	for i := 0; i < n; i++ {
+		c, err := db.Conn(ctx) // each held-open checkout forces a fresh physical conn
+		require.NoError(t, err)
+		conns = append(conns, c)
+	}
+	for i, c := range conns {
+		var tz string
+		require.NoError(t, c.QueryRowContext(ctx, "SELECT current_setting('TimeZone')").Scan(&tz))
+		assert.Equal(t, "UTC", tz, "pooled connection %d is not pinned to UTC (connInit did not run)", i)
+		require.NoError(t, c.Close())
+	}
+}
 
 // openTestLake opens a Lake on a DuckDB-file catalog in a temp dir — no
 // Postgres or S3 needed. Returns the lake and its DATA_PATH.

@@ -118,7 +118,15 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 
 func appendAll(ctx context.Context, conn *sql.Conn, table string, events []cloudevent.StoredEvent) error {
 	return conn.Raw(func(driverConn any) error {
-		appender, err := duckdb.NewAppender(driverConn.(*duckdb.Conn), "lake", "main", table)
+		// Comma-ok rather than a bare assertion: a failed assertion here panics on the
+		// pinned writer conn. Unreachable with the current driver (duckdb-go's only
+		// driver.Conn is *duckdb.Conn), but a driver swap should surface an error, not
+		// crash the ingest writer.
+		dc, ok := driverConn.(*duckdb.Conn)
+		if !ok {
+			return fmt.Errorf("lake appender: unexpected driver conn type %T", driverConn)
+		}
+		appender, err := duckdb.NewAppender(dc, "lake", "main", table)
 		if err != nil {
 			return fmt.Errorf("lake appender: %w", err)
 		}

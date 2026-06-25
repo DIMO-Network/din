@@ -87,12 +87,21 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 		return fmt.Errorf("lake write begin: %w", err)
 	}
 	if err := appendAll(ctx, conn, w.table, events); err != nil {
-		if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
+		// Roll back with an uncancellable ctx: duckdb-go short-circuits ExecContext
+		// when ctx is already done, so a ctx-scoped ROLLBACK on a cancelled request
+		// would no-op and leave the transaction open on this pinned, reused
+		// connection — every future BEGIN then fails ("transaction already active"),
+		// wedging the conn for the process lifetime.
+		if _, rbErr := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); rbErr != nil {
 			return fmt.Errorf("%w (rollback also failed: %w)", err, rbErr)
 		}
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		// A failed COMMIT can leave the transaction open; reset it with an
+		// uncancellable ctx so the pinned conn stays reusable. Ignore the rollback
+		// error — DuckDB may have already auto-aborted (ROLLBACK then no-ops).
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		return fmt.Errorf("lake write commit: %w", err)
 	}
 	return nil

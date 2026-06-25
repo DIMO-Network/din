@@ -55,6 +55,12 @@ type Config struct {
 	// ExtensionDir overrides where DuckDB looks for/installs extensions
 	// (pre-baked in the container image); empty uses the default.
 	ExtensionDir string
+	// TempDirectory is where DuckDB spills data that exceeds MemoryLimit
+	// (large maintenance merges/compaction especially). Empty uses the
+	// DuckDB default (the working directory) — point it at a sized spill
+	// volume so a spill can't fill the container root fs and crash-loop the
+	// pod. Mirrors dq's DUCKDB_TEMP_DIRECTORY.
+	TempDirectory string
 	// MaxConns bounds the embedded DuckDB connection pool. Zero means
 	// a small default; size to writer count + maintenance.
 	MaxConns int
@@ -123,6 +129,11 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	}
 	if cfg.MemoryLimit != "" {
 		setup = append(setup, "SET memory_limit = "+sqlString(cfg.MemoryLimit))
+	}
+	if cfg.TempDirectory != "" {
+		// Spill to the sized volume, not the container root fs (a full root fs
+		// crash-loops the pod). Pairs with memory_limit on the maintenance merge.
+		setup = append(setup, "SET temp_directory = "+sqlString(cfg.TempDirectory))
 	}
 	if cfg.Threads > 0 {
 		setup = append(setup, fmt.Sprintf("SET threads = %d", cfg.Threads))

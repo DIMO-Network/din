@@ -81,6 +81,20 @@ spec:
             periodSeconds: 10
           resources:
             {{- toYaml .Values.maintenance.resources | nindent 12 }}
+          {{- if .Values.env.LAKE_TEMP_DIRECTORY }}
+          volumeMounts:
+            - name: duckdb-temp
+              mountPath: {{ .Values.env.LAKE_TEMP_DIRECTORY | quote }}
+          {{- end }}
+      {{- if .Values.env.LAKE_TEMP_DIRECTORY }}
+      volumes:
+        # DuckDB spill target for the maintenance merge/compaction (the heaviest
+        # spiller). emptyDir on node ephemeral storage so a large merge spills to
+        # disk instead of filling the container root fs and crash-looping the pod.
+        - name: duckdb-temp
+          emptyDir:
+            sizeLimit: {{ .Values.duckdbTempSizeLimit | default "5Gi" }}
+      {{- end }}
 ---
 # Carries din.labels so the existing ServiceMonitor matches it and scrapes
 # the maintenance pod's /metrics; selects only the maintenance pod.

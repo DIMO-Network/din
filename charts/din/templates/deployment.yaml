@@ -82,6 +82,10 @@ spec:
             - name: external-http-server-tls
               mountPath: /etc/ssl/certs/din
               readOnly: true
+          {{- if .Values.env.LAKE_TEMP_DIRECTORY }}
+            - name: duckdb-temp
+              mountPath: {{ .Values.env.LAKE_TEMP_DIRECTORY | quote }}
+          {{- end }}
       volumes:
         - name: external-http-server-tls
           projected:
@@ -98,3 +102,10 @@ spec:
                   items:
                     - key: root_ca.crt
                       path: root_ca.crt
+        {{- if .Values.env.LAKE_TEMP_DIRECTORY }}
+        # DuckDB spill target. emptyDir on node ephemeral storage so a large
+        # sort/append spills to disk instead of filling the container root fs.
+        - name: duckdb-temp
+          emptyDir:
+            sizeLimit: {{ .Values.duckdbTempSizeLimit | default "5Gi" }}
+        {{- end }}

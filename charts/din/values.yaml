@@ -51,6 +51,10 @@ env:
   # DuckLake: LAKE_CATALOG_DSN comes from the secret. DATA_PATH is
   # immutable once the catalog exists — choose deliberately.
   LAKE_DATA_PATH: s3://dimo-storage-dev/lake/
+  # DuckDB spill volume. When set, an emptyDir (duckdbTempSizeLimit) is mounted
+  # here on both the ingest and maintenance pods so a large merge/append spills
+  # to disk instead of the container root fs. Empty = spill to the default (root fs).
+  LAKE_TEMP_DIRECTORY: /tmp/duckdb
   LAKE_MEMORY_LIMIT: 512MB
   # Parquet write tuning (catalog-global; applies to din's raw_events and dq's
   # decoded tables). v2 delta-packs the sorted (subject,"time") layer for a
@@ -136,6 +140,9 @@ certificate:
   commonName: din.dev.dimo.zone
   issuer: cas-dev-dimo-ca-issuer
   caConfigMap: cae-dev-dimo-ca-certs
+# Size of the emptyDir backing LAKE_TEMP_DIRECTORY (DuckDB spill). Only mounted
+# when env.LAKE_TEMP_DIRECTORY is set. Raise for deep-history maintenance merges.
+duckdbTempSizeLimit: 5Gi
 resources:
   limits:
     cpu: '1'

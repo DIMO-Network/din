@@ -62,6 +62,7 @@ type Settings struct {
 	// where Parquet lands and is immutable once the catalog exists.
 	LakeCatalogDSN     string // LAKE_CATALOG_DSN
 	LakeDataPath       string // LAKE_DATA_PATH: s3://bucket/prefix/ or absolute path
+	LakeTempDirectory  string // LAKE_TEMP_DIRECTORY: DuckDB spill volume (e.g. /tmp/duckdb)
 	LakeMemoryLimit    string // LAKE_MEMORY_LIMIT, e.g. "1GB"
 	LakeThreads        int    // LAKE_THREADS
 	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
@@ -124,6 +125,7 @@ func Load() (Settings, error) {
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
 		LakeCatalogDSN:         os.Getenv("LAKE_CATALOG_DSN"),
 		LakeDataPath:           os.Getenv("LAKE_DATA_PATH"),
+		LakeTempDirectory:      os.Getenv("LAKE_TEMP_DIRECTORY"),
 		LakeMemoryLimit:        os.Getenv("LAKE_MEMORY_LIMIT"),
 		LakeTargetFileSize:     env("LAKE_TARGET_FILE_SIZE", "512MB"),
 		LakeParquetVersion:     env("LAKE_PARQUET_VERSION", "2"),

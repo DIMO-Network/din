@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -11,6 +12,14 @@ import (
 	"github.com/DIMO-Network/cloudevent"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 )
+
+// ErrPoisonRow marks a deterministic, row-level rejection — the row's own data
+// is unpersistable (marshal failure, or DuckDB rejecting bad UTF-8/precision in
+// AppendRow): retrying the identical row will always fail. Transient errors
+// (BEGIN/COMMIT, appender creation, the flush's S3 upload + catalog commit,
+// connection loss) are NOT wrapped, so the sink can leave them un-acked for
+// redelivery instead of permanently dropping healthy, never-persisted events.
+var ErrPoisonRow = errors.New("poison row")
 
 // Writer appends raw cloudevents to one lake table. Each WriteBundle is a
 // single DuckLake transaction — one snapshot, one or more Parquet files
@@ -118,13 +127,18 @@ func appendAll(ctx context.Context, conn *sql.Conn, table string, events []cloud
 		// allocations on a full bundle.
 		args := make([]driver.Value, rawEventColumnCount)
 		for i := range events {
+			// fillRowArgs (marshal) and AppendRow (DuckDB rejecting bad
+			// UTF-8/precision) are deterministic per-row rejections: tag them
+			// ErrPoisonRow so the sink isolates/terminates the row instead of
+			// treating it like a transient outage. The flush below (Close) is the
+			// only I/O here and is deliberately left untagged (transient).
 			if err := fillRowArgs(args, &events[i]); err != nil {
 				_ = appender.CloseWithCancel(ctx)
-				return fmt.Errorf("lake row %d: %w", i, err)
+				return fmt.Errorf("lake row %d: %w: %w", i, ErrPoisonRow, err)
 			}
 			if err := appender.AppendRow(args...); err != nil {
 				_ = appender.CloseWithCancel(ctx)
-				return fmt.Errorf("lake append row %d: %w", i, err)
+				return fmt.Errorf("lake append row %d: %w: %w", i, ErrPoisonRow, err)
 			}
 		}
 		// CloseWithCancel threads the caller's ctx through the final flush — the

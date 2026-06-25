@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/DIMO-Network/din/internal/natsembed"
 	"github.com/DIMO-Network/din/internal/sink"
 	"github.com/DIMO-Network/din/internal/stream"
@@ -27,7 +28,11 @@ type memWriter struct {
 	mu      sync.Mutex
 	bundles [][]cloudevent.StoredEvent
 	fail    error
-	failID  string
+	failID  string // deterministic poison: rejected with lake.ErrPoisonRow
+	// transientID models an infra blip on one row: a NON-poison error, so the
+	// sink must leave it for redelivery (never terminate it), even when siblings
+	// in the same bundle commit.
+	transientID string
 }
 
 func (m *memWriter) WriteBundle(_ context.Context, events []cloudevent.StoredEvent) error {
@@ -38,7 +43,10 @@ func (m *memWriter) WriteBundle(_ context.Context, events []cloudevent.StoredEve
 	}
 	for _, ev := range events {
 		if m.failID != "" && ev.ID == m.failID {
-			return fmt.Errorf("poison row %s", ev.ID)
+			return fmt.Errorf("poison row %s: %w", ev.ID, lake.ErrPoisonRow)
+		}
+		if m.transientID != "" && ev.ID == m.transientID {
+			return fmt.Errorf("transient outage on %s", ev.ID) // NOT ErrPoisonRow
 		}
 	}
 	m.bundles = append(m.bundles, append([]cloudevent.StoredEvent(nil), events...))
@@ -264,4 +272,50 @@ func TestSink_PoisonRowQuarantined(t *testing.T) {
 	}
 	assert.Equal(t, map[string]bool{"good1": true, "good2": true}, ids,
 		"good events commit, poison row excluded")
+}
+
+// TestSink_TransientRowAmongCommittedNotDropped is the data-loss regression: a
+// row that fails with a TRANSIENT (non-poison) error must be left for redelivery
+// even when sibling rows in the same bundle commit. The old isolate Term'd any
+// failure once committed>0 ("a sibling committed, so the writer is healthy, so
+// this row is poison") — which permanently dropped healthy, never-persisted
+// events on a mid-bundle S3/catalog blip. The bisect now keys the Term decision
+// on lake.ErrPoisonRow, so a transient single-row failure survives.
+func TestSink_TransientRowAmongCommittedNotDropped(t *testing.T) {
+	t.Parallel()
+	js, cons := setup(t)
+	writer := &memWriter{transientID: "blip"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pub := stream.NewPublisher(js, 1)
+	ts := time.Date(2026, 6, 10, 10, 0, 0, 0, time.UTC)
+	require.NoError(t, pub.Publish(ctx, event("good1", "dimo.status", "did:erc721:137:0xA:1", ts)))
+	require.NoError(t, pub.Publish(ctx, event("blip", "dimo.status", "did:erc721:137:0xA:1", ts)))
+	require.NoError(t, pub.Publish(ctx, event("good2", "dimo.status", "did:erc721:137:0xA:1", ts)))
+
+	s := sink.New(sink.Config{MaxAge: 200 * time.Millisecond, MinFlushBytes: 1}, cons, writer, zerolog.Nop())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	// The two good rows commit; the transient row is NOT terminated — it stays
+	// pending (un-acked) for redelivery. Under the old code it would have been
+	// Term'd (committed>0), so NumAckPending would drop to 0 and it would be lost.
+	require.Eventually(t, func() bool {
+		info, err := cons.Info(context.Background())
+		return err == nil && writer.totalEvents() == 2 && info.NumAckPending == 1
+	}, 15*time.Second, 100*time.Millisecond)
+
+	cancel()
+	require.NoError(t, <-done)
+
+	// The transient row never committed and was never terminated.
+	ids := map[string]bool{}
+	for _, b := range writer.snapshot() {
+		for _, ev := range b {
+			ids[ev.ID] = true
+		}
+	}
+	assert.Equal(t, map[string]bool{"good1": true, "good2": true}, ids,
+		"good rows commit; the transient row is neither committed nor dropped")
 }

@@ -11,12 +11,12 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.18.45
 	github.com/aws/aws-sdk-go-v2/credentials v1.13.43
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.103.3
+	github.com/duckdb/duckdb-go/v2 v2.10504.0
 	github.com/ethereum/go-ethereum v1.17.1
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats-server/v2 v2.14.2
 	github.com/nats-io/nats.go v1.52.0
-	github.com/oklog/ulid/v2 v2.1.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/rs/zerolog v1.35.1
 	github.com/segmentio/ksuid v1.0.4
@@ -55,13 +55,12 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/deckarep/golang-set/v2 v2.6.0 // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.2.0 // indirect
-	github.com/duckdb/duckdb-go-bindings v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.10503.0 // indirect
-	github.com/duckdb/duckdb-go/v2 v2.10503.1 // indirect
+	github.com/duckdb/duckdb-go-bindings v0.10504.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10504.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10504.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.10504.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.10504.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.10504.0 // indirect
 	github.com/ethereum/c-kzg-4844/v2 v2.1.6 // indirect
 	github.com/fsnotify/fsnotify v1.6.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect

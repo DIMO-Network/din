@@ -2,12 +2,9 @@
 
 Single Go binary replacing dis + dps + parquet-processor: HTTP ingest (mTLS + JWT) → NATS JetStream WAL → [DuckLake](https://ducklake.select) `raw_events` table (partitioned parquet on object storage, tracked by a SQL catalog), with built-in lake maintenance and an optional decoded-stream bridge for vehicle-triggers-api.
 
-## Clone layout (required until cloudevent is released)
-
-din builds against a local cloudevent checkout via a `replace` directive. Clone them as siblings:
+## Build
 
 ```bash
-git clone git@github.com:DIMO-Network/cloudevent.git
 git clone git@github.com:DIMO-Network/din.git
 cd din && go build ./... && go test ./...
 ```

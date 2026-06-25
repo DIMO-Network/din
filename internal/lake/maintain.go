@@ -359,11 +359,15 @@ func (m *Maintainer) expireSQL(ctx context.Context) (string, error) {
 			"CALL ducklake_expire_snapshots('lake', older_than => to_timestamp(%f))", cutoff), nil
 	}
 	maintFloorBinding.Set(0)
-	// Pure retention: keep now()-INTERVAL (evaluated at CALL time) so the expired set
-	// is byte-identical to the prior behavior.
+	// Use the FROZEN retention cutoff (the value the floor decision at line 341 was made
+	// against), not now()-INTERVAL re-evaluated at CALL time. This CALL runs only after the
+	// merge steps, each budgeted up to maintStepTimeout (30m), so a re-evaluated now() drifts
+	// minutes past the decision cutoff and can expire snapshot floor+1 — un-consumed
+	// change-feed data a reader parked at the retention edge still needs (it then hits
+	// maybeRecoverExpired and permanently skips that prefix). Freezing can only expire less,
+	// and matches the floor-binding branch above.
 	return fmt.Sprintf(
-		"CALL ducklake_expire_snapshots('lake', older_than => now() - INTERVAL '%d seconds')",
-		int64(m.cfg.SnapshotKeep.Seconds())), nil
+		"CALL ducklake_expire_snapshots('lake', older_than => to_timestamp(%f))", cutoff), nil
 }
 
 // execCount runs a maintenance CALL and drains its result rows; the row

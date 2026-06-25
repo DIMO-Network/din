@@ -417,12 +417,24 @@ func run(log zerolog.Logger) error {
 		group.Go(func() error { return maintainer.Run(gctx) })
 	}
 	if settings.DecodeStreamEnabled {
+		// The bridge gets its own JetStream context so its per-signal-name async
+		// publishes draw from a separate WithPublishAsyncMaxPending budget. Sharing
+		// the ingest js coupled a decoded-stream backup to ingest availability: a
+		// stall on the bridge's publishes could exhaust the shared pending budget and
+		// block/err the ingest hot path. Same nats.Conn, independent publish budget.
+		bridgeJS, err := jetstream.New(conn,
+			jetstream.WithPublishAsyncMaxPending(4096),
+			jetstream.WithPublishAsyncTimeout(publishAckTimeout),
+		)
+		if err != nil {
+			return err
+		}
 		bridge := decodestream.New(decodestream.Config{
 			ChainID:           settings.ChainID,
 			VehicleNFTAddress: settings.VehicleNFTAddress,
 			Replicas:          settings.NATSReplicas,
 			StreamPartitions:  settings.NATSStreamPartitions,
-		}, js, log)
+		}, bridgeJS, log)
 		if err := bridge.EnsureStreams(ctx); err != nil {
 			return err
 		}

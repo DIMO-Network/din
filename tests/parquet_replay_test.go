@@ -3,15 +3,15 @@
 // throughput in events/sec, the gate being 100k/s. It has three benches,
 // each gated by -replay so a normal `go test` skips them:
 //
-//   TestReplayHTTP    end-to-end HTTP → convert → JetStream-ack → sink → DuckLake,
-//                     swept over WAL partitions and poster concurrency. This is
-//                     "as http calls": the number a device fleet actually sees.
-//   TestReplayLake    the pure DuckLake parquet-write ceiling on the REAL dump
-//                     bytes (bypasses HTTP+NATS) — the steady-state floor that
-//                     caps everything downstream of the WAL.
-//   TestReplayStages  per-stage attribution: convert-only, per-event sync ack
-//                     (today's handler model), and batched async ack (the
-//                     pipelining headroom a batch endpoint would unlock).
+//	TestReplayHTTP    end-to-end HTTP → convert → JetStream-ack → sink → DuckLake,
+//	                  swept over WAL partitions and poster concurrency. This is
+//	                  "as http calls": the number a device fleet actually sees.
+//	TestReplayLake    the pure DuckLake parquet-write ceiling on the REAL dump
+//	                  bytes (bypasses HTTP+NATS) — the steady-state floor that
+//	                  caps everything downstream of the WAL.
+//	TestReplayStages  per-stage attribution: convert-only, per-event sync ack
+//	                  (today's handler model), and batched async ack (the
+//	                  pipelining headroom a batch endpoint would unlock).
 //
 // The stored dump is POST-conversion (data carries signals as an object map,
 // which the source-specific Ruptela/AutoPi modules produced from raw wire
@@ -86,24 +86,24 @@ type loadedEvent struct {
 	data     []byte
 }
 
-func dumpRoot(t *testing.T) string {
-	t.Helper()
+func dumpRoot(tb testing.TB) string {
+	tb.Helper()
 	if *replayDump != "" {
 		return *replayDump
 	}
 	home, err := os.UserHomeDir()
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	return filepath.Join(home, "prod-dump-parquet")
 }
 
 // loadEvents reads up to n real rows from the dump via a bare DuckDB connection.
 // It walks the tree for just enough files to cover n (≈128 rows/file) and reads
 // them in one read_parquet() call.
-func loadEvents(t *testing.T, n int) []loadedEvent {
-	t.Helper()
-	root := dumpRoot(t)
+func loadEvents(tb testing.TB, n int) []loadedEvent {
+	tb.Helper()
+	root := dumpRoot(tb)
 	if _, err := os.Stat(root); err != nil {
-		t.Skipf("dump dir %s not present: %v", root, err)
+		tb.Skipf("dump dir %s not present: %v", root, err)
 	}
 
 	maxFiles := n/100 + 50
@@ -120,15 +120,15 @@ func loadEvents(t *testing.T, n int) []loadedEvent {
 		}
 		return nil
 	})
-	require.NoError(t, err)
-	require.NotEmpty(t, files, "no parquet files under %s", root)
+	require.NoError(tb, err)
+	require.NotEmpty(tb, files, "no parquet files under %s", root)
 
 	quoted := make([]string, len(files))
 	for i, f := range files {
 		quoted[i] = "'" + strings.ReplaceAll(f, "'", "''") + "'"
 	}
 	connector, err := duckdb.NewConnector("", nil)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	db := sql.OpenDB(connector)
 	defer db.Close() //nolint:errcheck
 
@@ -137,20 +137,20 @@ func loadEvents(t *testing.T, n int) []loadedEvent {
 		WHERE data IS NOT NULL AND data_content_type = 'application/json'
 		LIMIT %d`, strings.Join(quoted, ","), n)
 	rows, err := db.QueryContext(context.Background(), q)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 	defer rows.Close() //nolint:errcheck
 
 	var out []loadedEvent
 	for rows.Next() {
 		var e loadedEvent
 		var data string
-		require.NoError(t, rows.Scan(&e.subject, &e.producer, &e.id, &e.typ, &e.dct, &e.dver, &e.t, &data))
+		require.NoError(tb, rows.Scan(&e.subject, &e.producer, &e.id, &e.typ, &e.dct, &e.dver, &e.t, &data))
 		e.data = []byte(data)
 		out = append(out, e)
 	}
-	require.NoError(t, rows.Err())
-	require.NotEmpty(t, out, "loaded zero events")
-	t.Logf("loaded %d real events from %d files under %s", len(out), len(files), root)
+	require.NoError(tb, rows.Err())
+	require.NotEmpty(tb, out, "loaded zero events")
+	tb.Logf("loaded %d real events from %d files under %s", len(out), len(files), root)
 	return out
 }
 
@@ -304,11 +304,13 @@ func (p *pipeline) waitDurable(t *testing.T, expected int, start time.Time, dead
 		if rows >= expected {
 			break
 		}
-		if rows == prev {
+		if rows > 0 && rows == prev {
 			if stable++; stable >= 8 { // ~2s with no new rows ⇒ drained
 				break
 			}
 		} else {
+			// rows==0 is cold start (ingest hasn't committed yet), not "drained":
+			// don't let the stable-count fire before the first batch lands.
 			stable, prev = 0, rows
 		}
 		select {
@@ -328,6 +330,15 @@ done:
 }
 
 func (p *pipeline) close() {
+	// Cancel ingest and wait for the sinks to finish before tearing down the lake
+	// and NATS — otherwise the sink goroutines keep running Run(ctx) against a
+	// closed lake/connection (goroutine + DuckDB-conn leak, plus spurious errors).
+	// Idempotent: callers that already ran waitDurable (which cancels + joins) see
+	// an already-cancelled ctx and already-closed sinkDone channels here.
+	p.cancel()
+	for _, d := range p.sinkDone {
+		<-d
+	}
 	p.httpSrv.Close()
 	if p.batchSrv != nil {
 		p.batchSrv.Close()
@@ -620,16 +631,24 @@ func TestReplayLake(t *testing.T) {
 		start := time.Now()
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, writerConns)
+		errs := make(chan error, len(bundles))
 		for _, b := range bundles {
 			wg.Add(1)
 			sem <- struct{}{}
 			go func(b []cloudevent.StoredEvent) {
 				defer wg.Done()
 				defer func() { <-sem }()
-				require.NoError(t, writer.WriteBundle(context.Background(), b))
+				// Don't require.* inside the goroutine: a failure calls runtime.Goexit
+				// on this goroutine only, so wg.Wait would hang and the lake/writer
+				// would leak. Report the error and assert on the main goroutine.
+				errs <- writer.WriteBundle(context.Background(), b)
 			}(b)
 		}
 		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
 		eps := float64(len(stored)) / time.Since(start).Seconds()
 		t.Logf("lake write ceiling: %d writer-conns → %.0f events/s (%d events, %d bundles)",
 			writerConns, eps, len(stored), len(bundles))

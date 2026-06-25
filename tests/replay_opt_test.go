@@ -62,16 +62,23 @@ func writeBundles(t *testing.T, w *lake.Writer, stored []cloudevent.StoredEvent,
 	start := time.Now()
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, conns)
+	errs := make(chan error, len(bundles))
 	for _, b := range bundles {
 		wg.Add(1)
 		sem <- struct{}{}
 		go func(b []cloudevent.StoredEvent) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			require.NoError(t, w.WriteBundle(context.Background(), b))
+			// require.* inside a goroutine would Goexit only this goroutine and hang
+			// wg.Wait; collect and assert on the caller's goroutine instead.
+			errs <- w.WriteBundle(context.Background(), b)
 		}(b)
 	}
 	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
 	return time.Since(start)
 }
 
@@ -200,11 +207,7 @@ func validIdentFast(s string) bool {
 // identStrings returns the header fields ValidIdentifier actually checks (id,
 // subject, producer, type, specversion, dataversion) from real rows.
 func identStrings(tb testing.TB) []string {
-	t := &testing.T{}
-	if *replayN < 1 {
-		tb.Skip("need -replay-n")
-	}
-	evs := loadEvents(t, 20_000)
+	evs := loadEvents(tb, 20_000)
 	out := make([]string, 0, len(evs)*4)
 	for _, e := range evs {
 		out = append(out, e.id, e.subject, e.producer, e.typ, "1.0", e.dver)

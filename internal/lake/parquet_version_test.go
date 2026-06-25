@@ -97,6 +97,25 @@ func TestWriter_ParquetVersion(t *testing.T) {
 	assert.Less(t, v2bytes, v1bytes, "parquet v2 must shrink the sorted raw layer vs v1")
 }
 
+// TestCompressionLiteral pins the codec allow-list: known codecs pass (case-
+// folded), and empty/unknown values fall back to snappy rather than reaching
+// set_option and wedging boot.
+func TestCompressionLiteral(t *testing.T) {
+	t.Parallel()
+	for in, want := range map[string]string{
+		"":             "snappy",
+		"snappy":       "snappy",
+		"zstd":         "zstd",
+		"ZSTD":         "zstd",
+		"lz4":          "lz4",
+		"uncompressed": "uncompressed",
+		"snapy":        "snappy", // typo → default, not a boot wedge
+		"gzip":         "snappy", // not in the documented allow-list → default
+	} {
+		assert.Equal(t, want, compressionLiteral(in), "compressionLiteral(%q)", in)
+	}
+}
+
 // TestWriter_CompressionOverride proves Config.Compression reaches the writer:
 // the snappy default is overridable back to zstd (storage-constrained deploys),
 // so the throughput/size tradeoff is not a one-way door.

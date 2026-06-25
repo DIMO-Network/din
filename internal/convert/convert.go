@@ -28,7 +28,6 @@ const (
 // distinguish them.
 var ErrValidation = errors.New("validation error")
 
-
 // allowedContentTypes is the whitelist of MIME types accepted for CloudEvent data.
 var allowedContentTypes = map[string]struct{}{
 	"application/json": {},

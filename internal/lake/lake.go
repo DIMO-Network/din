@@ -216,10 +216,6 @@ func (l *Lake) assertOptions(ctx context.Context, cfg Config) error {
 // reach a catalog that already exists.
 func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 	// name → already-SQL-formatted value (a quoted string or a bare literal).
-	compression := "snappy"
-	if cfg.Compression != "" {
-		compression = cfg.Compression
-	}
 	opts := []struct{ name, valueSQL string }{
 		// snappy is the default: the parquet write is CPU-bound on the codec, and
 		// snappy sustains ~30% higher materialize throughput than zstd on this
@@ -228,7 +224,7 @@ func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 		// writes bloom filters on dictionary-encoded columns (subject), so subject
 		// pruning is preserved; backfilled DIS bundles keep their own (zstd) codec
 		// since compression is a per-file Parquet property.
-		{"parquet_compression", sqlString(compression)},
+		{"parquet_compression", sqlString(compressionLiteral(cfg.Compression))},
 	}
 	if v := parquetVersionLiteral(cfg.ParquetVersion); v != "" {
 		opts = append(opts, struct{ name, valueSQL string }{"parquet_version", v})
@@ -255,6 +251,20 @@ func parquetVersionLiteral(v string) string {
 		return v
 	default:
 		return ""
+	}
+}
+
+// compressionLiteral validates the configured Parquet codec and returns a known
+// value, defaulting empty/unknown to "snappy". Like parquetVersionLiteral this
+// keeps a typo'd LAKE_COMPRESSION from reaching set_option and wedging boot
+// (a deterministic error retryCatalog would otherwise retry then crash on);
+// sqlString already blocks injection, this blocks the unknown-codec footgun.
+func compressionLiteral(v string) string {
+	switch strings.ToLower(v) {
+	case "zstd", "lz4", "snappy", "uncompressed":
+		return strings.ToLower(v)
+	default:
+		return "snappy"
 	}
 }
 

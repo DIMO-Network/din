@@ -2,6 +2,7 @@ package attest
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -20,6 +21,38 @@ import (
 
 func newTestVerifier() *Verifier {
 	return NewVerifierWithBackend(nil, zerolog.Nop())
+}
+
+// TestVerifySignature_DataBase64HashesWireBytes pins that a data_base64 payload
+// (images, PDFs, documents) is verified against the bytes the producer actually
+// signed — the base64 wire string (cloudevent.BytesForSignature) — not the
+// decoded Data. Before the fix, verifySignature hashed event.Data, so a
+// correctly-signed document attestation failed EOA recovery (and fell through to
+// ERC-1271). Signed over the wire bytes, the EOA path now recovers the source.
+func TestVerifySignature_DataBase64HashesWireBytes(t *testing.T) {
+	t.Parallel()
+	const privHex = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
+	privKey, err := crypto.HexToECDSA(privHex)
+	require.NoError(t, err)
+	source := crypto.PubkeyToAddress(privKey.PublicKey)
+
+	rawBytes := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x01, 0x02}
+	b64 := base64.StdEncoding.EncodeToString(rawBytes)
+
+	// The producer signs the wire form — the base64 string, per BytesForSignature.
+	sig, err := crypto.Sign(accounts.TextHash([]byte(b64)), privKey)
+	require.NoError(t, err)
+	sig[64] += 27
+
+	ev := &cloudevent.RawEvent{
+		CloudEventHeader: cloudevent.CloudEventHeader{Signature: "0x" + common.Bytes2Hex(sig)},
+		Data:             json.RawMessage(rawBytes), // decoder also keeps the decoded bytes
+		DataBase64:       b64,
+	}
+
+	ok, err := newTestVerifier().verifySignature(context.Background(), ev, source)
+	require.NoError(t, err)
+	assert.True(t, ok, "data_base64 attestation signed over the base64 wire bytes must verify via EOA")
 }
 
 func TestParse(t *testing.T) {

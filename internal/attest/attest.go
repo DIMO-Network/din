@@ -200,7 +200,12 @@ func isValidAttestationType(t string) bool {
 func (v *Verifier) verifySignature(ctx context.Context, event *cloudevent.RawEvent, source common.Address) (bool, error) {
 	signature := common.FromHex(event.Signature)
 
-	msgHashWithPrfx := accounts.TextHash(event.Data)
+	// Hash the bytes that were actually signed: for a data_base64 payload (images,
+	// PDFs, dimo.document.*/dimo.raw.*) the producer signs the base64 wire string,
+	// not the decoded bytes. cloudevent.BytesForSignature returns DataBase64 when
+	// set, else Data — so JSON attestations are unaffected and binary/document
+	// attestations verify against the correct representation.
+	msgHashWithPrfx := accounts.TextHash(cloudevent.BytesForSignature(*event))
 	eoaSigner, errEoa := verifyEOASignature(signature, msgHashWithPrfx, source)
 	if errEoa != nil || !eoaSigner {
 		erc1271Signer, errErc := v.verifyERC1271Signature(ctx, signature, common.BytesToHash(msgHashWithPrfx), source)

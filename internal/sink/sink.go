@@ -58,6 +58,16 @@ const poisonRedeliveryThreshold = 10
 // first few rows (poison is rare), so this only short-circuits a true outage.
 const isolateProbeLimit = 8
 
+// maxConsecutiveFetchErrs / fetchRetryBackoff bound how a JetStream Fetch error is
+// handled: a transient NATS disconnect is retried with backoff (the connection
+// reconnects forever) rather than crash-looping the pod, but a persistently failing
+// fetch trips the backstop (~maxConsecutiveFetchErrs * fetchRetryBackoff) and exits so
+// the pod restarts and re-asserts its consumer.
+const (
+	maxConsecutiveFetchErrs = 30
+	fetchRetryBackoff       = 2 * time.Second
+)
+
 // DefaultMaxAgeHard is the default hard flush cap (Config.MaxAgeHard when unset).
 // Exported so the consumer's AckWait can be sized above it: a buffer is acked only
 // after it flushes, and a low-traffic buffer isn't flushed until MaxAgeHard, so
@@ -252,6 +262,7 @@ loop:
 
 func (s *Sink) fetchLoop(ctx context.Context, out chan<- jetstream.Msg, done chan<- error) {
 	defer close(out)
+	consecutiveErrs := 0
 	for {
 		if ctx.Err() != nil {
 			done <- ctx.Err()
@@ -262,9 +273,26 @@ func (s *Sink) fetchLoop(ctx context.Context, out chan<- jetstream.Msg, done cha
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				continue
 			}
-			done <- err
-			return
+			// A transient NATS disconnect (the connection reconnects forever) surfaces
+			// here, not as a context error. Crashing the pod on it would churn a
+			// recoverable condition — log, back off, and retry. Only a persistently
+			// failing fetch (e.g. the consumer was deleted) trips the backstop and
+			// exits so the pod restarts and re-asserts the consumer.
+			consecutiveErrs++
+			if consecutiveErrs >= maxConsecutiveFetchErrs {
+				done <- fmt.Errorf("sink fetch failed %dx consecutively: %w", consecutiveErrs, err)
+				return
+			}
+			s.log.Warn().Err(err).Int("consecutive", consecutiveErrs).Msg("sink fetch failed; retrying")
+			select {
+			case <-ctx.Done():
+				done <- ctx.Err()
+				return
+			case <-time.After(fetchRetryBackoff):
+			}
+			continue
 		}
+		consecutiveErrs = 0
 		for msg := range batch.Messages() {
 			select {
 			case out <- msg:

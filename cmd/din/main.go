@@ -37,6 +37,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// publishAckTimeout bounds the wait for each JetStream publish ack (see jetstream.New).
+const publishAckTimeout = 10 * time.Second
+
 func main() {
 	log := zerolog.New(os.Stdout).With().Timestamp().Str("app", "din").Logger()
 
@@ -248,7 +251,15 @@ func run(log zerolog.Logger) error {
 	// Bound in-flight async publishes: when JetStream stalls, publishers
 	// queue here instead of growing the client buffer without limit; the
 	// HTTP write timeout is the backstop that turns the stall into 503s.
-	js, err := jetstream.New(conn, jetstream.WithPublishAsyncMaxPending(4096))
+	// Bound the wait for each publish ack: without WithPublishAsyncTimeout a lost ack
+	// (leaderless R3, half-open socket where NATS is connected but JetStream isn't
+	// acking) leaves the async future pending forever, pinning the ingest handler
+	// goroutine — the HTTP WriteTimeout sets a socket-write deadline but does NOT
+	// cancel the request context, so the handler never observes the stall.
+	js, err := jetstream.New(conn,
+		jetstream.WithPublishAsyncMaxPending(4096),
+		jetstream.WithPublishAsyncTimeout(publishAckTimeout),
+	)
 	if err != nil {
 		return err
 	}

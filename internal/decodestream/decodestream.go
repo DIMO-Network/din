@@ -130,6 +130,14 @@ func (b *Bridge) Run(ctx context.Context) error {
 	return g.Wait()
 }
 
+// maxDecodeFetchRetries / decodeFetchRetryBackoff bound how a JetStream Fetch error is
+// handled: a transient NATS disconnect is retried with backoff rather than crashing
+// the binary; a persistent failure trips the backstop and exits so the pod restarts.
+const (
+	maxDecodeFetchRetries   = 30
+	decodeFetchRetryBackoff = 2 * time.Second
+)
+
 func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) error {
 	streamName := stream.StreamNameFor(partition, partitions)
 	raw, err := b.js.Stream(ctx, streamName)
@@ -154,6 +162,7 @@ func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) er
 		return fmt.Errorf("creating %s consumer: %w", durable, err)
 	}
 
+	consecutiveErrs := 0
 	for {
 		if ctx.Err() != nil {
 			return nil
@@ -163,8 +172,23 @@ func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) er
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				continue
 			}
-			return fmt.Errorf("fetching raw messages: %w", err)
+			// Retry a transient NATS disconnect with backoff rather than crash the whole
+			// binary — this bridge is non-essential, but a fatal here takes ingest down
+			// with it. Backstop on persistent failure so a deleted consumer still
+			// restarts (and re-asserts) the pod.
+			consecutiveErrs++
+			if consecutiveErrs >= maxDecodeFetchRetries {
+				return fmt.Errorf("fetching raw messages failed %dx consecutively: %w", consecutiveErrs, err)
+			}
+			b.log.Warn().Err(err).Int("consecutive", consecutiveErrs).Msg("decodestream fetch failed; retrying")
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(decodeFetchRetryBackoff):
+			}
+			continue
 		}
+		consecutiveErrs = 0
 		for msg := range batch.Messages() {
 			b.handle(ctx, msg)
 		}

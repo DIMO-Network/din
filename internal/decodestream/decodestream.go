@@ -176,7 +176,7 @@ func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) er
 	consecutiveErrs := 0
 	for {
 		if ctx.Err() != nil {
-			return nil
+			return nil //nolint:nilerr // ctx cancellation is a clean shutdown, not an error
 		}
 		batch, err := cons.Fetch(500, jetstream.FetchMaxWait(5*time.Second))
 		if err != nil {

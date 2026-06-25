@@ -85,7 +85,7 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 				sqlString(RawTable), sqlString(f))
 			if _, err := conn.ExecContext(ctx, q); err != nil {
 				if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
-					return fmt.Errorf("registering %s: %w (rollback also failed: %v)", f, err, rbErr)
+					return fmt.Errorf("registering %s: %w (rollback also failed: %w)", f, err, rbErr)
 				}
 				return fmt.Errorf("registering %s: %w", f, err)
 			}

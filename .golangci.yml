@@ -1,0 +1,20 @@
+# golangci-lint policy for din — the correctness/maintainability linters that must stay
+# green (CI gate). gosec is intentionally NOT gated: it fires almost entirely on
+# inherent-to-domain or test-only patterns here — bounded int conversions (G115), the
+# local-dev fsstore's file/dir perms (G301/G302), validated path reads (G304), and
+# test-file perms/subprocess/TLS (G306/G204/G402). Run `golangci-lint run -E gosec`
+# ad-hoc for a security audit instead of gating on its noise.
+version: "2"
+linters:
+  default: none
+  enable:
+    - bodyclose      # response/HTTP bodies are closed
+    - errcheck       # returned errors are checked
+    - errorlint      # error wrapping (%w) and errors.Is/As use
+    - govet
+    - ineffassign    # no ineffectual assignments
+    - nilerr         # don't return nil after observing a non-nil error
+    - rowserrcheck   # sql.Rows.Err() is checked
+    - sqlclosecheck  # sql.Rows/Stmt are closed
+    - staticcheck
+    - unused

@@ -88,7 +88,7 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 	}
 	if err := appendAll(ctx, conn, w.table, events); err != nil {
 		if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
-			return fmt.Errorf("%w (rollback also failed: %v)", err, rbErr)
+			return fmt.Errorf("%w (rollback also failed: %w)", err, rbErr)
 		}
 		return err
 	}

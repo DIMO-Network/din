@@ -281,6 +281,7 @@ func run(log zerolog.Logger) error {
 	streamCfg := stream.DefaultConfig()
 	streamCfg.Replicas = settings.NATSReplicas
 	streamCfg.Partitions = settings.NATSStreamPartitions
+	streamCfg.MaxBytes = settings.NATSStreamMaxBytes
 	rawStreams, err := stream.EnsureStreams(ctx, js, streamCfg)
 	if err != nil {
 		return err

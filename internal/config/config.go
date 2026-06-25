@@ -47,6 +47,10 @@ type Settings struct {
 	// NATSStreamPartitions splits INGEST_RAW into N streams by subject
 	// hash. Changing it re-routes subjects; drain the old streams first.
 	NATSStreamPartitions int
+	// NATSStreamMaxBytes caps each partition stream's on-disk size (bytes), a
+	// hard backstop so a prolonged sink stall can't grow the WAL without bound
+	// before MaxAge (48h) reclaims it. 0 (default) = unlimited.
+	NATSStreamMaxBytes int64
 
 	// Storage.
 	BlobBucket        string
@@ -187,6 +191,12 @@ func Load() (Settings, error) {
 		return s, fmt.Errorf("NATS_STREAM_PARTITIONS must be 1..256, got %d", parts)
 	}
 	s.NATSStreamPartitions = int(parts)
+
+	maxBytes, err := envUint("NATS_STREAM_MAX_BYTES", 0)
+	if err != nil {
+		return s, err
+	}
+	s.NATSStreamMaxBytes = int64(maxBytes)
 
 	s.DecodeStreamEnabled = envBool("DECODESTREAM_ENABLED", true)
 	s.LakeMaintenanceEnabled = envBool("LAKE_MAINTENANCE_ENABLED", false)

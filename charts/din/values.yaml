@@ -35,6 +35,9 @@ env:
   NATS_MODE: external
   NATS_URL: nats://nats-dev:4222
   NATS_REPLICAS: '1'
+  # Per-partition WAL size backstop (bytes); 0 = unlimited (MaxAge 48h still applies).
+  # Set to bound disk use if the sink stalls for a long time. Size to the NATS volume / N partitions.
+  NATS_STREAM_MAX_BYTES: '0'
   DECODESTREAM_ENABLED: 'true'
   FINGERPRINT_VALIDATION: 'true'
   ALLOWABLE_TIME_SKEW: 5m

@@ -1,12 +1,14 @@
-# Requires the cloudevent repo checked out as a sibling until its parquet
-# options branch is released: build context must be the parent directory.
-#   docker build -f din/docker/dockerfile <parent-dir>
+# Build context is the din repo itself (cloudevent is a published public module now —
+# no sibling checkout, no replace). Build from the repo root:
+#   docker build -f docker/dockerfile .
 FROM golang:1.26 AS build
 RUN useradd -u 10001 dimo
 WORKDIR /src
-COPY cloudevent/ ./cloudevent/
-COPY din/ ./din/
-WORKDIR /src/din
+# Resolve modules first so the dep layer caches across source changes (cloudevent is
+# public — no auth needed to fetch it).
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . ./
 # CGO for the embedded DuckDB (duckdb-go ships prebuilt static bindings).
 RUN CGO_ENABLED=1 go build -o /din ./cmd/din
 # Bake DuckDB extensions into the image so pods never download them.

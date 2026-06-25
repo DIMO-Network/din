@@ -10,6 +10,7 @@ package lake
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"fmt"
 	"net/url"
 	"os"
@@ -89,7 +90,17 @@ func Open(ctx context.Context, cfg Config) (*Lake, error) {
 		}
 	}
 
-	connector, err := duckdb.NewConnector("", nil)
+	// TimeZone is SESSION-local in DuckDB and does NOT persist across pool/writer conns
+	// the way the global pragmas (memory_limit, threads) and instance-global ATTACH/LOAD
+	// do. Set it on EVERY connection via this init hook: without it a fresh or pinned
+	// writer conn inherits the host tz, so day("time") partitioning is evaluated in that
+	// tz and mis-partitions rows straddling a UTC day boundary — correct in prod only
+	// because distroless defaults to UTC, but wrong on any non-UTC host (incl. local dev).
+	// Mirrors dq's connInitFn (duck.go).
+	connector, err := duckdb.NewConnector("", func(execer driver.ExecerContext) error {
+		_, err := execer.ExecContext(context.Background(), "SET TimeZone = 'UTC'", nil)
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("lake: opening duckdb: %w", err)
 	}
@@ -138,10 +149,9 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	if cfg.Threads > 0 {
 		setup = append(setup, fmt.Sprintf("SET threads = %d", cfg.Threads))
 	}
-	// The "time" column is TIMESTAMP WITH TIME ZONE (ddl.go); pinning the session
-	// to UTC means device times (UTC by contract) round-trip unambiguously and
-	// day("time") partitions on the UTC date.
-	setup = append(setup, "SET TimeZone = 'UTC'")
+	// TimeZone (UTC) is set per-connection in the NewConnector init hook above — it is
+	// session-local, so it must apply to every writer/pool conn, not just this bootstrap
+	// one. day("time") then partitions on the UTC date regardless of host tz.
 	// preserve_insertion_order=false lets DuckDB reorder rows for lower memory and
 	// better parallelism on large appends/exports (DuckDB OOM guidance). Safe here:
 	// raw_events is SORTED BY (subject,"time") so DuckLake orders rows on write, and

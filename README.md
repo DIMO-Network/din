@@ -119,6 +119,7 @@ Scaling out is the same binary with a PostgreSQL `LAKE_CATALOG_DSN`, an S3 `LAKE
 
 ```bash
 din maintain                          # run the lake maintenance service (ops server + loop)
+din lake-backfill <source>            # register existing objects from a source into the lake
 din install-duckdb-extensions <dir>   # bake extensions into the image at build time
 ```
 

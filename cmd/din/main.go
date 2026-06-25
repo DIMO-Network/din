@@ -240,7 +240,9 @@ func run(log zerolog.Logger) error {
 				log.Warn().Err(err).Msg("NATS disconnected; reconnecting")
 			}),
 			nats.ReconnectHandler(func(c *nats.Conn) {
-				log.Info().Str("url", c.ConnectedUrl()).Msg("NATS reconnected")
+				// Redacted: NATS_URL may carry userinfo (user:pass@host) and this logs
+				// the live server URL on every reconnect.
+				log.Info().Str("url", c.ConnectedUrlRedacted()).Msg("NATS reconnected")
 			}),
 		}
 		if conn, err = nats.Connect(settings.NATSURL, opts...); err != nil {

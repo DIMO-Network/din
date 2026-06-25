@@ -1,0 +1,43 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go build ./...
+      - run: go vet ./...
+      # PG/S3/MinIO integration tests skip cleanly without their env vars.
+      - run: go test ./...
+
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Plain -race works since duckdb-go v2.10504.0 (fixes the checkptr/getBytes crash).
+      - run: go test -race ./...
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # Pin golangci-lint v2 (matches .golangci.yml's `version: "2"`) via go install —
+      # avoids the action's version matrix.
+      - run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.9.0
+      - run: golangci-lint run --timeout=5m ./...

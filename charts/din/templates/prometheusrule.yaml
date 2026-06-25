@@ -136,4 +136,24 @@ spec:
               The sink is repeatedly failing to commit bundles (NATS redelivery),
               an early indicator of catalog Postgres / S3 trouble before the WAL
               backs up. Check the lake writer and catalog connectivity.
+        # The decodestream bridge retries transient NATS fetch errors with backoff; a
+        # sustained rate means it is flapping (and silently restarts every ~60s when the
+        # backstop trips), stalling vehicle-triggers downstream.
+        - alert: DinDecodestreamFetchErrors
+          expr: rate(din_decodestream_fetch_errors_total[5m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: decodestream bridge fetch errors sustained
+            description: The decoded-stream bridge is repeatedly failing to fetch from JetStream (NATS distress); triggers downstream may be stalling.
+        # A recovered HTTP handler panic (returned as 500). Any sustained rate is a bug.
+        - alert: DinHTTPHandlerPanics
+          expr: increase(din_http_handler_panics_total[1h]) > 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: din recovered from an HTTP handler panic
+            description: An ingest HTTP handler panicked and was recovered as a 500. Investigate the offending request path.
 {{- end }}

@@ -27,9 +27,20 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog"
 	"golang.org/x/sync/errgroup"
 )
+
+// decodestreamFetchErrors counts JetStream Fetch errors in the bridge. They're retried
+// with backoff, so without this counter a NATS-disconnect storm is invisible (the only
+// other signal is a silent ~60s pod restart when the backstop trips) — and this bridge
+// feeds vehicle-triggers-api, so a flapping bridge silently stalls triggers.
+var decodestreamFetchErrors = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "din_decodestream_fetch_errors_total",
+	Help: "JetStream Fetch errors in the decodestream bridge (retried with backoff before the restart backstop).",
+})
 
 const (
 	// SignalsStreamName / EventsStreamName match vehicle-triggers-api's
@@ -176,6 +187,7 @@ func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) er
 			// binary — this bridge is non-essential, but a fatal here takes ingest down
 			// with it. Backstop on persistent failure so a deleted consumer still
 			// restarts (and re-asserts) the pod.
+			decodestreamFetchErrors.Inc()
 			consecutiveErrs++
 			if consecutiveErrs >= maxDecodeFetchRetries {
 				return fmt.Errorf("fetching raw messages failed %dx consecutively: %w", consecutiveErrs, err)

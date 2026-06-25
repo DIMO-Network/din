@@ -5,7 +5,7 @@ go 1.26
 toolchain go1.26.4
 
 require (
-	github.com/DIMO-Network/cloudevent v0.2.12
+	github.com/DIMO-Network/cloudevent v0.2.13
 	github.com/DIMO-Network/model-garage v1.0.12
 	github.com/DIMO-Network/shared v1.1.9
 	github.com/MicahParks/keyfunc/v3 v3.8.0

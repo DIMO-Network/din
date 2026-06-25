@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/DIMO-Network/din/internal/stream"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/prometheus/client_golang/prometheus"
@@ -465,78 +466,74 @@ func (s *Sink) ackAll(msgs []jetstream.Msg) {
 	}
 }
 
-// isolate retries a failed bundle one event at a time so a single poison row
-// can't take the bundle's good events or the partition's progress down with it.
-// An event that commits alone is acked. An event that fails while another in the
-// same bundle succeeds is poison (the writer is healthy, the row is bad) and is
-// terminated. If NOTHING commits, the fault is treated as transient and the
-// failures are left for redelivery — except messages that have already cycled
-// poisonRedeliveryThreshold times, which are terminated to bound an all-poison
-// or single-row-poison bundle that would otherwise redeliver forever.
+// isolate re-drives a bundle that failed to commit whole. It bisects: commit a
+// range; on failure split and recurse; at a single row decide poison-vs-transient.
+// This (a) preserves the bundle's healthy events — only a row that fails ALONE
+// with a deterministic rejection is dropped — and (b) localizes poison in
+// O(log n) commits instead of minting up to one DuckLake snapshot per row.
+//
+// The poison decision keys on lake.ErrPoisonRow, NOT on "did a sibling commit":
+// a transient mid-bundle outage (an S3/catalog blip after some rows already
+// committed) must never terminate healthy, never-persisted events. Only a
+// deterministic per-row rejection — or a row that has redelivered past
+// poisonRedeliveryThreshold — is Term'd.
 func (s *Sink) isolate(ctx context.Context, job flushJob) {
-	committed := 0
-	var failed []int
-	for i := range job.events {
-		if err := s.writer.WriteBundle(ctx, job.events[i:i+1]); err != nil {
-			failed = append(failed, i)
-			// Global-fault bail-out: nothing has committed after probing the first
-			// isolateProbeLimit rows → treat as a transient outage, not poison.
-			// Leave the rest un-acked for redelivery instead of grinding the bundle.
-			if committed == 0 && len(failed) >= isolateProbeLimit {
-				s.log.Error().Int("probed", len(failed)).Int("remaining", len(job.events)-i-1).
-					Msg("isolate: probe failed with zero commits; treating as global fault, leaving bundle for redelivery")
-				s.termExpiredPoison(ctx, job, failed)
-				return
-			}
-			continue
-		}
-		if err := job.msgs[i].Ack(); err != nil {
-			s.log.Warn().Err(err).Msg("ack failed after isolated commit; duplicate rows possible")
-		}
-		committed++
-	}
-	// A canceled context (drain timeout / shutdown) means the remaining WriteBundle
-	// failures are from cancellation, not the writer rejecting poison — so the
-	// "committed > 0 ⇒ this row is poison" heuristic is invalid (the writer was never
-	// really consulted). Leave every failed row un-acked for redelivery rather than
-	// Term'ing healthy, never-persisted data.
-	if ctx.Err() != nil {
-		if len(failed) > 0 {
-			s.log.Warn().Int("events", len(failed)).
-				Msg("isolate: context canceled mid-bundle; leaving failed rows for redelivery")
-		}
-		return
-	}
-	for _, i := range failed {
-		if committed > 0 || redeliveryCount(job.msgs[i]) >= poisonRedeliveryThreshold {
-			s.terminatePoison(job.events[i], job.msgs[i])
-		}
-		// else: not acked, not terminated → JetStream redelivers (likely transient).
-	}
-	if committed == 0 && len(failed) > 0 {
-		s.log.Error().Int("events", len(failed)).
-			Msg("no event in bundle committed; treating as transient, leaving for redelivery")
+	st := &isolateState{}
+	s.isolateRange(ctx, job, 0, len(job.events), st)
+	if st.committed == 0 && st.attempts > 0 && ctx.Err() == nil {
+		s.log.Error().Int("attempts", st.attempts).
+			Msg("isolate: nothing committed; treating as transient, leaving bundle for redelivery")
 	}
 }
 
-// termExpiredPoison terminates only the probed failures that have already cycled
-// past the redelivery threshold, so a genuinely all-poison bundle still drains
-// over successive redeliveries even when the global-fault bail-out skips full
-// per-event isolation. Rows still under the threshold are left for redelivery.
-// Under a canceled context (drain/shutdown) it Term's nothing: those write
-// failures are cancellation, not the writer rejecting poison, so even a
-// past-threshold row is left for redelivery — matching isolate's mid-bundle
-// cancel guard (otherwise a pod drain that coincides with a redelivered row would
-// silently drop healthy, never-persisted data).
-func (s *Sink) termExpiredPoison(ctx context.Context, job flushJob, failed []int) {
-	if ctx.Err() != nil {
+// isolateState threads commit/attempt counts through the bisection so the
+// global-fault short-circuit can stop grinding: a healthy writer commits SOME
+// range within the first few attempts, so zero commits after isolateProbeLimit
+// write attempts ⇒ the writer/catalog is down, not a poison row.
+type isolateState struct {
+	committed int // rows durably committed this isolate pass
+	attempts  int // WriteBundle calls this pass (bounds the global-fault grind)
+}
+
+// isolateRange commits job.events[lo:hi], bisecting on failure. A whole-range
+// commit acks every message in it. A size-1 failure is terminated only when it
+// is deterministic poison (lake.ErrPoisonRow) or has already cycled past
+// poisonRedeliveryThreshold; any other (transient) failure is left un-acked so
+// JetStream redelivers it.
+func (s *Sink) isolateRange(ctx context.Context, job flushJob, lo, hi int, st *isolateState) {
+	if lo >= hi || ctx.Err() != nil {
 		return
 	}
-	for _, i := range failed {
-		if redeliveryCount(job.msgs[i]) >= poisonRedeliveryThreshold {
-			s.terminatePoison(job.events[i], job.msgs[i])
-		}
+	// Global-fault short-circuit: isolateProbeLimit write attempts with nothing
+	// committed ⇒ the writer/catalog is down, not a poison row (a healthy writer
+	// would have committed some range by now). Stop; untouched rows stay un-acked
+	// and redeliver wholesale after AckWait. Once any range commits the bisection
+	// runs to completion to localize a real poison row.
+	if st.committed == 0 && st.attempts >= isolateProbeLimit {
+		return
 	}
+	st.attempts++
+	err := s.writer.WriteBundle(ctx, job.events[lo:hi])
+	if err == nil {
+		st.committed += hi - lo
+		for i := lo; i < hi; i++ {
+			if ackErr := job.msgs[i].Ack(); ackErr != nil {
+				s.log.Warn().Err(ackErr).Msg("ack failed after isolated commit; duplicate rows possible")
+			}
+		}
+		return
+	}
+	if hi-lo == 1 {
+		if errors.Is(err, lake.ErrPoisonRow) || redeliveryCount(job.msgs[lo]) >= poisonRedeliveryThreshold {
+			s.terminatePoison(job.events[lo], job.msgs[lo])
+		}
+		// else: transient single-row failure → not acked, not terminated →
+		// JetStream redelivers (the row is healthy; the writer was unavailable).
+		return
+	}
+	mid := lo + (hi-lo)/2
+	s.isolateRange(ctx, job, lo, mid, st)
+	s.isolateRange(ctx, job, mid, hi, st)
 }
 
 func (s *Sink) terminatePoison(event cloudevent.StoredEvent, msg jetstream.Msg) {

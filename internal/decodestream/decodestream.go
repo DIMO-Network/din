@@ -400,7 +400,9 @@ func groupSignalsByName(signals []vss.Signal) map[string][]vss.Signal {
 // Pruning marks an entry by renaming it rather than deleting in place, so the
 // final pass filters them out.
 func dropPruned(signals []vss.Signal) []vss.Signal {
-	var out []vss.Signal
+	// Filter in place: reuse the input's backing array instead of allocating a second
+	// []vss.Signal (360B/elem) per decoded batch.
+	out := signals[:0]
 	for _, sig := range signals {
 		if sig.Data.Name != pruneSignalName {
 			out = append(out, sig)

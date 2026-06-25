@@ -3,7 +3,6 @@ package lake
 import (
 	"context"
 	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -23,7 +22,7 @@ func TestConsumerProgress_Postgres(t *testing.T) {
 		t.Skip("set LAKE_TEST_PG_DSN to a throwaway Postgres to run the catalog-transport test")
 	}
 	ctx := context.Background()
-	l, err := Open(ctx, Config{CatalogDSN: dsn, DataPath: filepath.Join(t.TempDir(), "data")})
+	l, err := Open(ctx, Config{CatalogDSN: dsn, DataPath: pgCatalogDataPath(t)})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = l.Close() })
 

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -42,6 +43,17 @@ const publishAckTimeout = 10 * time.Second
 
 func main() {
 	log := zerolog.New(os.Stdout).With().Timestamp().Str("app", "din").Logger()
+	// Stamp the build commit on every log line so a running pod reports its version
+	// (mirrors dq). Populated by the Go toolchain's vcs.revision (the image build copies
+	// .git in), no -ldflags needed.
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, s := range info.Settings {
+			if s.Key == "vcs.revision" && len(s.Value) == 40 {
+				log = log.With().Str("commit", s.Value[:7]).Logger()
+				break
+			}
+		}
+	}
 
 	// Build-time/ops subcommands; the bare binary runs the service.
 	if len(os.Args) > 1 {

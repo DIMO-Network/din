@@ -22,7 +22,7 @@ func TestLake_EveryConnPinnedUTC(t *testing.T) {
 	// not the same one reused — every one must report UTC.
 	const n = 4
 	conns := make([]*sql.Conn, 0, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		c, err := l.DB().Conn(ctx)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = c.Close() })

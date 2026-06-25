@@ -322,6 +322,11 @@ func (s *Sink) add(msg jetstream.Msg) {
 		s.log.Debug().Err(err).Msg("redelivery metadata unavailable; duplicate-volume metric may undercount")
 	} else if meta.NumDelivered > 1 {
 		redeliveries.Inc()
+		// Debug, not a label: the DinSinkRedeliveriesHigh alert says redeliveries are
+		// happening, but only this names which subject flaps. Debug keeps it off the hot
+		// path by default (no storm) and out of metric cardinality, available on demand.
+		s.log.Debug().Str("subject", msg.Subject()).Uint64("delivery", meta.NumDelivered).
+			Msg("redelivered message")
 	}
 
 	if s.buffer == nil {

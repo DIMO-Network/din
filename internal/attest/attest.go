@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/DIMO-Network/cloudevent"
 	"github.com/DIMO-Network/din/internal/convert"
@@ -240,12 +241,21 @@ func verifyEOASignature(signature []byte, msgHash []byte, source common.Address)
 	return source == recoveredAddress, nil
 }
 
+// erc1271CallTimeout bounds the on-chain ERC-1271 eth_call. It runs on the
+// request ctx, but the HTTP WriteTimeout only sets a socket write deadline — it
+// does not cancel ctx — so without an explicit bound a slow or unresponsive
+// RPC_URL pins the ingest handler goroutine indefinitely, letting one client
+// amplify each cheap request into an unbounded upstream wait.
+const erc1271CallTimeout = 5 * time.Second
+
 func (v *Verifier) verifyERC1271Signature(ctx context.Context, signature []byte, msgHash common.Hash, source common.Address) (bool, error) {
 	contract, err := web3.NewErc1271(source, v.backend)
 	if err != nil {
 		return false, fmt.Errorf("failed to connect to address: %s: %w", source, err)
 	}
 
+	ctx, cancel := context.WithTimeout(ctx, erc1271CallTimeout)
+	defer cancel()
 	result, err := contract.IsValidSignature(&bind.CallOpts{Context: ctx}, msgHash, signature)
 	if err != nil {
 		return false, fmt.Errorf("failed to validate signature with contract: %w", err)

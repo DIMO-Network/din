@@ -107,10 +107,6 @@ func (m *mockAuthServer) createToken(t *testing.T, ethereumAddress common.Addres
 	return tokenString
 }
 
-func (m *mockAuthServer) URL() string {
-	return m.server.URL
-}
-
 func (m *mockAuthServer) Close() {
 	m.server.Close()
 }

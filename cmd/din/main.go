@@ -233,7 +233,7 @@ func run(log zerolog.Logger) error {
 	var conn *nats.Conn
 	switch settings.NATSMode {
 	case "embedded":
-		srv, err := natsembed.Run(natsembed.Config{StoreDir: settings.NATSStoreDir, Port: -1})
+		srv, err := natsembed.Run(natsembed.Config{StoreDir: settings.NATSStoreDir, Port: 0})
 		if err != nil {
 			return err
 		}

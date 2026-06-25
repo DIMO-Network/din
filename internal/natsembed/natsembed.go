@@ -15,8 +15,11 @@ import (
 type Config struct {
 	// StoreDir is the JetStream file-store directory. Required.
 	StoreDir string
-	// Port is the client listen port. Use -1 for a random port (tests) or
-	// 0 to disable the network listener entirely (in-process clients only).
+	// Port, when > 0, opens a TCP client listener (advanced/debug only). The
+	// default (<= 0) runs in-process only with NO network listener: din's
+	// sink/publisher reach the server via Connect (net.Pipe), so no port is
+	// needed, and listening would default to 0.0.0.0 and expose an
+	// unauthenticated JetStream server on the pod network.
 	Port int
 	// StartTimeout bounds how long to wait for the server to come up.
 	StartTimeout time.Duration
@@ -41,13 +44,15 @@ func Run(cfg Config) (*natsserver.Server, error) {
 		JetStream: true,
 		StoreDir:  cfg.StoreDir,
 		Port:      cfg.Port,
-		// The embedded server is reached in-process; do not advertise.
-		NoSigs: true,
+		NoSigs:    true, // din owns signal handling; the server must not install its own
 	}
 	if cfg.MaxStore > 0 {
 		opts.JetStreamMaxStore = cfg.MaxStore
 	}
-	if cfg.Port == 0 {
+	// In-process only unless a positive port is explicitly requested: din's clients use
+	// the net.Pipe transport (Connect), so the server must not open a network listener
+	// (which defaults to 0.0.0.0 — an unauthenticated JetStream server on the pod net).
+	if cfg.Port <= 0 {
 		opts.DontListen = true
 	}
 
@@ -59,6 +64,7 @@ func Run(cfg Config) (*natsserver.Server, error) {
 	go srv.Start()
 	if !srv.ReadyForConnections(timeout) {
 		srv.Shutdown()
+		srv.WaitForShutdown() // release the store-dir lock before a caller retries
 		return nil, fmt.Errorf("embedded nats server not ready after %s", timeout)
 	}
 	return srv, nil

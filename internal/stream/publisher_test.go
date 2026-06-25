@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -96,4 +97,31 @@ func TestPublish_AsyncErrorIsUnavailable(t *testing.T) {
 	if !errors.Is(err, stream.ErrUnavailable) {
 		t.Fatalf("async-error publish: want ErrUnavailable, got %v", err)
 	}
+}
+
+// A max-payload rejection is deterministic — the identical event always fails —
+// so it must map to ErrPayloadTooLarge (handler → non-retryable 413), NOT the
+// retryable ErrUnavailable (which would make the device resend the same
+// oversized payload forever). Both the synchronous reject and the async-future
+// arm must classify it.
+func TestPublish_MaxPayloadIsPayloadTooLarge(t *testing.T) {
+	t.Run("sync reject", func(t *testing.T) {
+		p := stream.NewPublisher(&fakeJS{asyncErr: fmt.Errorf("publish: %w", nats.ErrMaxPayload)}, 1)
+		err := p.Publish(context.Background(), testStoredEvent())
+		if !errors.Is(err, stream.ErrPayloadTooLarge) {
+			t.Fatalf("sync max-payload: want ErrPayloadTooLarge, got %v", err)
+		}
+		if errors.Is(err, stream.ErrUnavailable) {
+			t.Fatalf("max-payload must not be retryable ErrUnavailable: %v", err)
+		}
+	})
+	t.Run("async future arm", func(t *testing.T) {
+		fut := newFuture()
+		fut.err <- fmt.Errorf("publish: %w", nats.ErrMaxPayload)
+		p := stream.NewPublisher(&fakeJS{future: fut}, 1)
+		err := p.Publish(context.Background(), testStoredEvent())
+		if !errors.Is(err, stream.ErrPayloadTooLarge) {
+			t.Fatalf("async max-payload: want ErrPayloadTooLarge, got %v", err)
+		}
+	})
 }

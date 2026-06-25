@@ -145,6 +145,11 @@ func (h *Handlers) writeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.As(err, &maxBytes):
 		http.Error(w, "payload too large", http.StatusRequestEntityTooLarge)
+	case errors.Is(err, stream.ErrPayloadTooLarge):
+		// Deterministic — the event exceeds NATS max_payload. Map to 413, not the
+		// retryable 503, so the device doesn't re-send the identical oversized
+		// payload forever.
+		http.Error(w, "event exceeds maximum payload size", http.StatusRequestEntityTooLarge)
 	case errors.Is(err, convert.ErrValidation):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, stream.ErrUnavailable):

@@ -28,6 +28,12 @@ const (
 // time. Handlers map it to 503 so devices retry.
 var ErrUnavailable = errors.New("jetstream publish not acknowledged")
 
+// ErrPayloadTooLarge reports that the marshaled event exceeds NATS max_payload.
+// Unlike ErrUnavailable this is deterministic — the identical event will always
+// be rejected — so handlers map it to a non-retryable 413; mapping it to 503
+// (the old behavior) made a device retry the same oversized payload forever.
+var ErrPayloadTooLarge = errors.New("event exceeds max NATS payload")
+
 // Publisher writes raw cloudevents to the INGEST_RAW stream and waits for
 // the JetStream ack — the durability point of the ingest path.
 type Publisher struct {
@@ -73,17 +79,28 @@ func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) 
 
 	future, err := p.js.PublishMsgAsync(msg)
 	if err != nil {
-		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return classifyPublishErr(err)
 	}
 
 	select {
 	case <-future.Ok():
 		return nil
 	case err := <-future.Err():
-		return fmt.Errorf("%w: %w", ErrUnavailable, err)
+		return classifyPublishErr(err)
 	case <-ctx.Done():
 		return fmt.Errorf("%w: %w", ErrUnavailable, ctx.Err())
 	}
+}
+
+// classifyPublishErr maps a NATS publish error to retry semantics: a max-payload
+// rejection is deterministic (the identical event always fails) → the
+// non-retryable ErrPayloadTooLarge; anything else is a transient un-acked
+// publish → ErrUnavailable (503, device retries).
+func classifyPublishErr(err error) error {
+	if errors.Is(err, nats.ErrMaxPayload) {
+		return fmt.Errorf("%w: %w", ErrPayloadTooLarge, err)
+	}
+	return fmt.Errorf("%w: %w", ErrUnavailable, err)
 }
 
 // ParseMsg reconstructs a StoredEvent from a consumed JetStream message.

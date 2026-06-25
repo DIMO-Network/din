@@ -144,8 +144,9 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	if strings.HasPrefix(cfg.DataPath, "s3://") {
 		setup = append(setup, "INSTALL httpfs", "LOAD httpfs", s3SecretSQL(cfg))
 	}
+	catalogDSN := withCatalogConnectTimeout(cfg.CatalogDSN)
 	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (DATA_PATH %s)",
-		sqlString(catalogURI(cfg.CatalogDSN)), sqlString(cfg.DataPath)))
+		sqlString(catalogURI(catalogDSN)), sqlString(cfg.DataPath)))
 
 	// Consumer progress lives in a plain table in the catalog database —
 	// not a DuckLake table (which would snapshot every cursor update). In
@@ -153,7 +154,7 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	// as `meta`; for a file catalog it's a sibling DuckDB file. See
 	// consumer.go for how the expiry floor reads it.
 	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS meta%s",
-		sqlString(metaTarget(cfg.CatalogDSN)), metaAttachOpts(cfg.CatalogDSN)))
+		sqlString(metaTarget(catalogDSN)), metaAttachOpts(catalogDSN)))
 
 	for _, q := range setup {
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
@@ -415,6 +416,27 @@ func catalogURI(dsn string) string {
 func isPostgresDSN(dsn string) bool {
 	return strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") ||
 		strings.Contains(dsn, "host=") || strings.Contains(dsn, "dbname=")
+}
+
+// pgCatalogConnectTimeout bounds the libpq connect on the catalog/meta ATTACH (seconds).
+const pgCatalogConnectTimeout = 10
+
+// withCatalogConnectTimeout adds a libpq connect_timeout to a Postgres catalog DSN so a
+// boot against an unreachable catalog fails in seconds — letting the pod restart and
+// retry — instead of blocking on the OS TCP timeout. A no-op when the operator already
+// set one or for a file catalog, and it preserves isPostgresDSN (it only appends).
+func withCatalogConnectTimeout(dsn string) string {
+	if !isPostgresDSN(dsn) || strings.Contains(dsn, "connect_timeout") {
+		return dsn
+	}
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		sep := "?"
+		if strings.ContainsRune(dsn, '?') {
+			sep = "&"
+		}
+		return fmt.Sprintf("%s%sconnect_timeout=%d", dsn, sep, pgCatalogConnectTimeout)
+	}
+	return fmt.Sprintf("%s connect_timeout=%d", dsn, pgCatalogConnectTimeout)
 }
 
 // s3SecretSQL builds the DuckDB secret for the DataPath bucket. Static

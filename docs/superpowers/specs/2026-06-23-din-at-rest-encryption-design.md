@@ -190,37 +190,34 @@ and deliberately left as-is, with its preconditions deferred to ops.
 - DuckDB's encryption isn't NIST-validated. The KMS layer underneath it is
   FIPS-capable, which is why this is acceptable.
 
-## Coverage and residual gaps
+## Coverage (gaps the review surfaced, now closed)
 
-What this protects and what it deliberately doesn't, stated plainly so nobody
-over-trusts it.
+The first review left four gaps. All are addressed; what remains is stated plainly.
 
-- **Blobs are weaker than parquet.** Layer A (DuckLake `ENCRYPTED`) makes parquet
-  proof against both a raw-object leak *and* a leaked S3 read credential —
-  decrypting needs the Postgres catalog, not just bucket access. Blobs (payloads
-  over 1MB in `BLOB_BUCKET`) get only S3 SSE: bucket-default SSE-S3 by default
-  (`S3_KMS_KEY_ID` is empty), or SSE-KMS if it's set. SSE defeats a raw-disk/object
-  leak but is transparent to anything holding an S3 GET credential, so a leaked IAM
-  role reads blob payloads in plaintext. Bringing blobs to parquet parity
-  (leaked-credential-proof) needs client-side encryption before `PutObject`, which
-  is out of scope here. If blob payloads are sensitive: at minimum set
-  `S3_KMS_KEY_ID` and lock the KMS key policy; for true parity, add client-side
-  blob encryption.
-- **The reader (dq) is a separate repo and unverified here.** dq attaches the same
-  catalog and should decrypt transparently (per-file keys live in the catalog), but
-  that isn't tested against dq in this change. Verify dq reads the encrypted lake
-  before enabling encryption in any shared environment.
-- **Only the local-path encryption path is tested.** `TestWriter_Encrypted` uses a
-  local file catalog + local DataPath, which never loads httpfs. The prod path
-  (`s3://` → INSTALL httpfs + CREATE SECRET + ATTACH `ENCRYPTED`) has no test.
-  DuckLake `ENCRYPTED` is client-side and works against MinIO, so an `s3_minio`
-  encrypted round-trip test is feasible and worth adding before prod.
-- **Backfill registers by reference.** Legacy DIS bundles added via
-  `ducklake_add_data_files` into an encrypted catalog stay unencrypted at their
-  source path (verified: registration and read-back both work, with a null
-  `encryption_key` for those files) until the maintainer compacts them into
-  encrypted files. Moot while nothing is backfilled, but it's a window where
-  backfilled data is unencrypted.
+- **Blobs — FIXED (client-side encryption).** Layer A makes parquet proof against a
+  raw-object leak *and* a leaked S3 read credential (decrypt needs the catalog).
+  Blobs aren't in the lake, so they used to get only S3 SSE — transparent to an S3
+  GET credential. Now `internal/blobcrypt` seals blob payloads with AES-256-GCM
+  before upload (key in the pod secret, never the bucket), bringing blobs to parquet
+  parity. Gated by `BLOB_ENCRYPTION_KEY`; empty leaves the old SSE-only behavior.
+- **Reader (dq) — FIXED (separate PR).** dq reads the encrypted catalog
+  transparently and decrypts blobs with a byte-identical `blobcrypt` (pinned by a
+  shared golden vector). Its materializer attaches `ENCRYPTED` so it can't create a
+  plaintext catalog din would reject; read-only query pods read transparently. See
+  the dq branch `feat/at-rest-encryption`.
+- **Prod s3:// path — FIXED (tested + verified).** `TestMinIO_EncryptedLake_RoundTrip`
+  drives the real `s3://` → httpfs + CREATE SECRET + ATTACH `ENCRYPTED` path against
+  a live MinIO: the lake reads its data back, but the parquet object in the bucket
+  won't read as plain parquet. Passes locally where the `minio` binary is present.
+- **Backfill — flagged.** Legacy DIS bundles added via `ducklake_add_data_files`
+  into an encrypted catalog stay unencrypted at their source path (verified:
+  registration + read-back work, null `encryption_key`) until the maintainer
+  compacts them. `Backfill` now logs a warning when the catalog is encrypted. Moot
+  while nothing is backfilled; inherent to register-by-reference otherwise.
+
+Residual (unchanged): a leaked S3 *write* credential can still tamper (encryption is
+confidentiality, not write-authz); KMS-on-the-DuckLake-secret remains deferred (see
+below); the PG catalog backup is data-critical.
 
 ## Resolved during implementation
 

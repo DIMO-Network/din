@@ -50,6 +50,12 @@ env:
   DOCUMENT_SIZE_THRESHOLD: '1048576'
   BLOB_BUCKET: dimo-blob-storage-dev
   BLOB_PREFIX: cloudevent/blobs/
+  # BLOB_ENCRYPTION_KEY (base64 of 32 bytes, AES-256) seals externalized blob
+  # payloads client-side so a leaked blob-bucket credential yields ciphertext —
+  # the at-rest parity DuckLake ENCRYPTED gives the lake. It is a SECRET: supply
+  # it via the din-secret (like DUCKLAKE_CATALOG_DSN), not here, and it MUST equal
+  # dq's BLOB_ENCRYPTION_KEY or dq can't read the payloads. Empty = blobs get only
+  # bucket-default SSE.
   S3_AWS_REGION: us-east-2
   # DuckLake: DUCKLAKE_CATALOG_DSN comes from the secret. DATA_PATH is
   # immutable once the catalog exists — choose deliberately.

@@ -90,6 +90,9 @@ type Config struct {
 // Lake is one embedded DuckDB instance with the catalog attached as "lake".
 type Lake struct {
 	db *sql.DB
+	// encrypted records whether the catalog was attached ENCRYPTED, so paths like
+	// backfill can warn when they register data that won't be encrypted at rest.
+	encrypted bool
 }
 
 // lakeConnMaxLifetime recycles pooled DuckDB connections by age so a poisoned
@@ -140,7 +143,7 @@ func Open(ctx context.Context, cfg Config) (*Lake, error) {
 	// never reaps one mid-use.
 	db.SetConnMaxLifetime(lakeConnMaxLifetime)
 
-	l := &Lake{db: db}
+	l := &Lake{db: db, encrypted: cfg.Encrypted}
 	if err := l.bootstrap(ctx, cfg); err != nil {
 		_ = db.Close()
 		return nil, err

@@ -155,15 +155,31 @@ on a representative bundle.
 
 ## Rollout
 
-Greenfield, so there's no phased cutover to manage — `LAKE_ENCRYPTION_ENABLED` is
-on in both `values.yaml` and `values-prod.yaml` from the first deploy. The flag
-still exists for instant rollback: flip it off and new files write plaintext;
-files already encrypted stay readable as long as their keys are in the catalog.
-Never purge `encryption_key` rows.
+Greenfield, so there's no phased cutover — `LAKE_ENCRYPTION_ENABLED` is on in both
+`values.yaml` and `values-prod.yaml` from the first deploy.
 
-`S3_KMS_KEY_ID` is empty in the charts by default (SSE-KMS is inert, bucket-default
-SSE-S3 applies). Set it to a customer-managed key ARN per environment to turn on
-Layer B; Layer A (DuckLake `ENCRYPTED`) does the heavy lifting regardless.
+`ENCRYPTED` is sticky to the catalog, not a runtime toggle. Verified empirically
+against DuckDB 1.5.x:
+
+- Turning it **on** for a catalog that was first created plaintext fails the
+  ATTACH hard — `Failed to set encryption - the database is not encrypted but we
+  requested an encrypted database` — so the pod CrashLoops. The flag must be set
+  before the catalog is first created.
+- Turning it **off** on a catalog created encrypted is a silent no-op: DuckLake
+  keeps writing encrypted files. You cannot roll back to plaintext by flipping the
+  flag. (Upside: the maintainer can never silently downgrade compacted files to
+  plaintext, even if it somehow attached without the flag — the catalog forces
+  encryption.)
+
+So real rollback is a catalog migration (fresh unencrypted catalog + re-ingest),
+not a flag flip. It's moot while nothing is deployed, but don't carry a
+"flip-to-roll-back" assumption into any environment that already has a catalog —
+flipping the base-chart default to `true` over a pre-existing plaintext catalog
+CrashLoops every pod.
+
+`S3_KMS_KEY_ID` is empty in the charts by default (SSE-KMS inert, bucket-default
+SSE applies). See "Before enabling S3_KMS_KEY_ID" below — that path was reviewed
+and deliberately left as-is, with its preconditions deferred to ops.
 
 ### Risks
 
@@ -183,16 +199,42 @@ Layer B; Layer A (DuckLake `ENCRYPTED`) does the heavy lifting regardless.
 - The SSE-KMS test uses the in-package `fakeAPI` to assert the PutObjectInput
   headers — no MinIO/KES needed.
 
-## Still open (needs validation against a real environment)
+## Before enabling `S3_KMS_KEY_ID` (reviewed, deferred to ops)
 
-- Confirm DuckDB 1.5.3's S3 secret accepts `KMS_KEY_ID` as written (the option is
-  config-guarded, so an empty `S3_KMS_KEY_ID` can't break anything; the path only
-  exercises when an operator sets a key). Layer A is independently verified.
+The KMS_KEY_ID on the DuckLake secret was reviewed and left as-is: it's
+config-guarded and empty by default, so it can't break the default deploy. But
+the parquet path carries real landmines that must be cleared before any operator
+sets the key in a real environment. The blob path (s3client) is native AWS SDK
+and unaffected by these.
+
+- **Boot CrashLoop risk.** The `CREATE OR REPLACE SECRET` carrying `KMS_KEY_ID`
+  runs in the bootstrap loop *outside* `retryCatalog`. If the pinned DuckDB build
+  rejects the option, `Open()` returns an error and every pod (ingest + the
+  maintenance Deployment) CrashLoops the moment the key is populated. Validate the
+  option against the exact DuckDB build first; there is no SSE-S3 fallback.
+- **REGION + PROVIDER.** DuckDB's documented SSE-KMS recipe carries `REGION` and
+  uses the credential chain. din emits `KMS_KEY_ID` under `PROVIDER config` and
+  omits `REGION` when `S3Region` is unset — set `S3_AWS_REGION` whenever the KMS
+  key is set, or expect runtime 400s on the Parquet flush.
+- **Custom endpoint incompatibility.** Don't set `S3_KMS_KEY_ID` together with a
+  MinIO/LocalStack `S3_ENDPOINT` — httpfs will send `aws:kms` headers a non-AWS
+  endpoint can't honor and writes wedge.
+- **Redundancy + read coupling.** On the parquet objects this is a *second*
+  at-rest layer on top of Layer A (already AES-GCM encrypted), and it makes every
+  read depend on the KMS key staying enabled and the reader holding `kms:Decrypt`.
+  Consider covering the parquet storage layer with S3 bucket-default SSE instead,
+  and reserving `S3_KMS_KEY_ID` for the blob path that has no other at-rest layer.
+
+Other ops items:
+
 - Set the real KMS key ARN in `values-prod.yaml` (or via secret/overlay).
 - Put `sslmode=verify-full` on the catalog DSN secret and confirm managed PG
   at-rest encryption is on — the catalog is the trust root now.
-- Verify SSE-KMS PutObject failure behavior under a KMS outage doesn't wedge the
-  sink (Bucket Keys + existing retry/timeout should cover it).
+- Confirm the prod container image links OpenSSL (DuckDB's encrypted-write path
+  needs it; the MbedTLS build can't write encrypted files). Local tests encrypt
+  fine, so the dev toolchain already links it.
+- Consider validating `S3_KMS_KEY_ID` looks like a KMS ARN at config load so a
+  typo fails fast instead of as a runtime PutObject 400.
 
 ## Appendix — why the PIN / user-sovereign idea was dropped
 

@@ -54,6 +54,14 @@ type BackfillResult struct {
 // originals.
 func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger) (BackfillResult, error) {
 	var res BackfillResult
+	if l.encrypted {
+		// ducklake_add_data_files registers legacy parquet by reference: those files
+		// keep their original (unencrypted) bytes at their source path and read with
+		// a null encryption_key until the maintainer rewrites them into encrypted
+		// files during compaction. Flag the window so it isn't mistaken for at-rest
+		// coverage of the backfilled data.
+		log.Warn().Msg("backfilling into an ENCRYPTED catalog: registered legacy files stay unencrypted at their source until the maintainer compacts them")
+	}
 	existing, err := l.registeredFiles(ctx)
 	if err != nil {
 		return res, err

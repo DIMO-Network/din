@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -59,9 +60,15 @@ type Settings struct {
 	EventsMaxBytes  int64
 
 	// Storage.
-	BlobBucket        string
-	BlobPrefix        string
-	DocumentSizeLimit int // DOCUMENT_SIZE_THRESHOLD
+	BlobBucket string
+	BlobPrefix string
+	// BlobEncryptionKey is a base64-encoded 32-byte key. When set, externalized
+	// blob payloads are AES-256-GCM sealed before upload so a leaked blob-bucket
+	// credential yields ciphertext — the at-rest parity for blobs that DuckLake
+	// ENCRYPTED gives the lake. Must match dq's key. Empty leaves blobs as-is
+	// (only whatever bucket-default SSE applies).
+	BlobEncryptionKey string // BLOB_ENCRYPTION_KEY
+	DocumentSizeLimit int    // DOCUMENT_SIZE_THRESHOLD
 	S3Region          string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
@@ -144,6 +151,7 @@ func Load() (Settings, error) {
 		NATSStoreDir:           env("NATS_STORE_DIR", "/data/nats"),
 		BlobBucket:             os.Getenv("BLOB_BUCKET"),
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
+		BlobEncryptionKey:      os.Getenv("BLOB_ENCRYPTION_KEY"),
 		LakeCatalogDSN:         os.Getenv("DUCKLAKE_CATALOG_DSN"),
 		LakeDataPath:           os.Getenv("DUCKLAKE_DATA_PATH"),
 		LakeTempDirectory:      os.Getenv("DUCKDB_TEMP_DIRECTORY"),
@@ -300,6 +308,14 @@ func Load() (Settings, error) {
 		// consumers), so require that form. Catches a pasted bare key-id or a typo
 		// here instead of as a runtime PutObject 400 / a CrashLooping write tier.
 		return s, fmt.Errorf("S3_KMS_KEY_ID must be a KMS key ARN (arn:aws:kms:...), got %q", s.S3KMSKeyID)
+	}
+	if s.BlobEncryptionKey != "" {
+		// Fail fast: a malformed key means blobs would silently fall back to
+		// plaintext or crash on first write. Must be base64 of exactly 32 bytes
+		// (AES-256), and must match dq's BLOB_ENCRYPTION_KEY.
+		if key, err := base64.StdEncoding.DecodeString(s.BlobEncryptionKey); err != nil || len(key) != 32 {
+			return s, fmt.Errorf("BLOB_ENCRYPTION_KEY must be base64 of exactly 32 bytes (AES-256)")
+		}
 	}
 	if err := s.validateMaintenance(); err != nil {
 		return s, err

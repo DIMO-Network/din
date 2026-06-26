@@ -175,6 +175,80 @@ func TestMinIO_S3ClientParity(t *testing.T) {
 	assert.Empty(t, objects)
 }
 
+// TestMinIO_EncryptedLake_RoundTrip exercises the production encryption path the
+// unit tests can't reach: an s3:// DATA_PATH driving INSTALL httpfs + CREATE
+// SECRET + ATTACH ... ENCRYPTED. The lake reads its own data back over the wire
+// (the per-file key comes from the catalog), but the parquet object sitting in
+// MinIO does not read as plain parquet — proving at-rest encryption on real S3.
+func TestMinIO_EncryptedLake_RoundTrip(t *testing.T) {
+	endpoint := startMinIO(t)
+	const bucket = "din-enc"
+	createMinIOBucket(t, endpoint, bucket)
+	ctx := context.Background()
+
+	lk, err := lake.Open(ctx, lake.Config{
+		CatalogDSN:        filepath.Join(t.TempDir(), "meta.ducklake"),
+		DataPath:          "s3://" + bucket + "/lake/",
+		S3Region:          minioRegion,
+		S3AccessKeyID:     minioCreds,
+		S3SecretAccessKey: minioCreds,
+		S3Endpoint:        endpoint,
+		Encrypted:         true,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = lk.Close() })
+
+	w, err := lk.NewWriter(ctx, lake.RawTable)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
+
+	base := time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC)
+	bundle := make([]cloudevent.StoredEvent, 0, 3000)
+	for i := range 3000 {
+		bundle = append(bundle, cloudevent.StoredEvent{RawEvent: cloudevent.RawEvent{
+			CloudEventHeader: cloudevent.CloudEventHeader{
+				SpecVersion: cloudevent.SpecVersion,
+				Type:        "dimo.status",
+				Subject:     fmt.Sprintf("did:erc721:137:0xVeh:%d", i%64),
+				Source:      "0xConn", Producer: "0xDev",
+				ID:   fmt.Sprintf("evt-%05d", i),
+				Time: base.Add(time.Duration(i) * time.Second),
+			},
+			Data: json.RawMessage(`{"v":1}`),
+		}})
+	}
+	require.NoError(t, w.WriteBundle(ctx, bundle))
+
+	// Flush inlined data out to parquet objects on MinIO.
+	require.NoError(t, lake.NewMaintainer(lk, lake.MaintConfig{}, zerolog.Nop()).Cycle(ctx))
+
+	// Transparent read through the catalog decrypts.
+	var n int
+	require.NoError(t, lk.DB().QueryRowContext(ctx, "SELECT count(*) FROM lake.raw_events").Scan(&n))
+	assert.Equal(t, 3000, n, "encrypted lake must read its own data back over httpfs")
+
+	// Find a parquet object on MinIO and prove it's encrypted at rest: reading it
+	// directly (the catalog key isn't used) must fail specifically on encryption.
+	s3Client := newMinIOClient(t, endpoint, bucket)
+	objects, err := s3Client.ListObjectsV2(ctx, "lake/")
+	require.NoError(t, err)
+	var parquetKey string
+	for _, obj := range objects {
+		if strings.HasSuffix(obj.Key, ".parquet") {
+			parquetKey = obj.Key
+			break
+		}
+	}
+	require.NotEmpty(t, parquetKey, "maintenance must write a parquet object to the lake DATA_PATH")
+
+	var dummy int
+	rerr := lk.DB().QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT count(*) FROM read_parquet('s3://%s/%s')", bucket, parquetKey)).Scan(&dummy)
+	require.Error(t, rerr, "the parquet object in the bucket must not read as plain parquet")
+	assert.Contains(t, strings.ToLower(rerr.Error()), "encrypt",
+		"raw read must fail specifically because the file is encrypted")
+}
+
 // TestMinIO_EndToEnd_DeviceToDuckLake is the din e2e (device POST → convert
 // → split → JetStream → sink → DuckLake commit) with the lake's DATA_PATH
 // on MinIO: the row must be queryable after ack, and a maintenance cycle

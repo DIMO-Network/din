@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/DIMO-Network/din/internal/attest"
+	"github.com/DIMO-Network/din/internal/blobcrypt"
 	"github.com/DIMO-Network/din/internal/config"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/decodestream"
@@ -181,10 +182,13 @@ func lakeConfig(settings config.Settings) lake.Config {
 		S3AccessKeyID:     settings.S3AccessKeyID,
 		S3SecretAccessKey: settings.S3SecretAccessKey,
 		S3Endpoint:        settings.S3Endpoint,
+		S3KMSKeyID:        settings.S3KMSKeyID,
+		Encrypted:         settings.LakeEncryptionEnabled,
 		MemoryLimit:       settings.LakeMemoryLimit,
 		Threads:           settings.LakeThreads,
 		TargetFileSize:    settings.LakeTargetFileSize,
 		ParquetVersion:    settings.LakeParquetVersion,
+		Compression:       settings.LakeCompression,
 		ExtensionDir:      settings.LakeExtensionDir,
 		TempDirectory:     settings.LakeTempDirectory,
 		MaxConns:          settings.NATSStreamPartitions*settings.LakeWriterConnections + 2,
@@ -460,9 +464,26 @@ func postOnly(next http.Handler) http.Handler {
 	})
 }
 
-// newObjectStore picks the storage backend from the bucket value: local
-// filesystem for path-like values, S3 otherwise.
+// newObjectStore builds the storage backend and, when BLOB_ENCRYPTION_KEY is set,
+// wraps it so externalized blob payloads are sealed before upload.
 func newObjectStore(ctx context.Context, settings config.Settings, bucket string) (objstore.Store, error) {
+	store, err := newBaseObjectStore(ctx, settings, bucket)
+	if err != nil {
+		return nil, err
+	}
+	// Client-side seal so a leaked blob-bucket credential yields ciphertext, the
+	// at-rest parity for blobs that DuckLake ENCRYPTED gives the lake. No-op when
+	// BLOB_ENCRYPTION_KEY is unset.
+	cipher, err := blobcrypt.NewCipher(settings.BlobEncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return blobcrypt.WrapStore(store, cipher), nil
+}
+
+// newBaseObjectStore picks the storage backend: local filesystem for path-like
+// bucket values, S3 otherwise.
+func newBaseObjectStore(ctx context.Context, settings config.Settings, bucket string) (objstore.Store, error) {
 	if objstore.IsLocalPath(bucket) {
 		return fsstore.New(objstore.LocalRoot(bucket))
 	}
@@ -472,6 +493,7 @@ func newObjectStore(ctx context.Context, settings config.Settings, bucket string
 		AccessKeyID:     settings.S3AccessKeyID,
 		SecretAccessKey: settings.S3SecretAccessKey,
 		Endpoint:        settings.S3Endpoint,
+		KMSKeyID:        settings.S3KMSKeyID,
 	})
 }
 

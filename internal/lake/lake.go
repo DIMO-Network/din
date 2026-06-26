@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -38,6 +39,17 @@ type Config struct {
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3Endpoint        string
+	// S3KMSKeyID, when set, adds KMS_KEY_ID to the DuckDB S3 secret so httpfs
+	// writes Parquet with S3 SSE-KMS (server-side, AWS-held key, CloudTrail
+	// audited). Empty keeps the bucket default (SSE-S3). Independent of
+	// Encrypted, which is client-side Parquet encryption.
+	S3KMSKeyID string
+
+	// Encrypted adds the ENCRYPTED flag to the DuckLake ATTACH: every data file is
+	// written with Parquet AES-GCM encryption, its per-file key stored in the
+	// catalog. Sticky to the catalog once created — see the operational notes on
+	// config.Settings.LakeEncryptionEnabled.
+	Encrypted bool
 
 	// MemoryLimit caps DuckDB memory (e.g. "1GB"); empty uses the
 	// DuckDB default. Size to the pod limit: inserts buffer + sort.
@@ -47,6 +59,14 @@ type Config struct {
 	// TargetFileSize is DuckLake's target Parquet file size for writes
 	// and compaction (e.g. "512MB"); empty keeps the DuckLake default.
 	TargetFileSize string
+	// Compression is the Parquet compression codec for writes/compaction:
+	// "snappy" (default — fastest write, the throughput choice for this
+	// write-heavy ingest node), "zstd" (~1.6x smaller files but ~30% slower
+	// write), "lz4", or "uncompressed". Empty keeps the snappy default. The
+	// write path is CPU-bound on the codec, so this is the main
+	// materialize-throughput lever; bloom filters and dictionary encoding
+	// (subject pruning) are codec-independent and preserved either way.
+	Compression string
 	// ParquetVersion is the Parquet format version DuckLake writes, "1" or
 	// "2"; empty (or anything else) keeps the DuckLake default of 1. v2 turns
 	// on DELTA_BINARY_PACKED / byte-stream-split encodings that shrink the
@@ -70,6 +90,9 @@ type Config struct {
 // Lake is one embedded DuckDB instance with the catalog attached as "lake".
 type Lake struct {
 	db *sql.DB
+	// encrypted records whether the catalog was attached ENCRYPTED, so paths like
+	// backfill can warn when they register data that won't be encrypted at rest.
+	encrypted bool
 }
 
 // lakeConnMaxLifetime recycles pooled DuckDB connections by age so a poisoned
@@ -120,7 +143,7 @@ func Open(ctx context.Context, cfg Config) (*Lake, error) {
 	// never reaps one mid-use.
 	db.SetConnMaxLifetime(lakeConnMaxLifetime)
 
-	l := &Lake{db: db}
+	l := &Lake{db: db, encrypted: cfg.Encrypted}
 	if err := l.bootstrap(ctx, cfg); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -166,8 +189,17 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 		setup = append(setup, "INSTALL httpfs", "LOAD httpfs", s3SecretSQL(cfg))
 	}
 	catalogDSN := withCatalogConnectTimeout(cfg.CatalogDSN)
-	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (DATA_PATH %s)",
-		sqlString(catalogURI(catalogDSN)), sqlString(cfg.DataPath)))
+	// Same parts/Join shape as s3SecretSQL so adding a third ATTACH option later
+	// can't trip on a hand-managed separator.
+	attachParts := []string{"DATA_PATH " + sqlString(cfg.DataPath)}
+	if cfg.Encrypted {
+		// ENCRYPTED makes DuckLake write every data file with Parquet AES-GCM
+		// encryption and keep its per-file key in the catalog. Pass it on every
+		// attach (not just creation) so the session writes/reads encrypted files.
+		attachParts = append(attachParts, "ENCRYPTED")
+	}
+	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (%s)",
+		sqlString(catalogURI(catalogDSN)), strings.Join(attachParts, ", ")))
 
 	// Consumer progress lives in a plain table in the catalog database —
 	// not a DuckLake table (which would snapshot every cursor update). In
@@ -179,7 +211,7 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 
 	for _, q := range setup {
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("lake bootstrap %q: %w", redact(q), err)
+			return fmt.Errorf("lake bootstrap %q: %w", redact(q), redactErr(q, err))
 		}
 	}
 	if _, err := l.db.ExecContext(ctx, consumerProgressDDL); err != nil {
@@ -209,11 +241,14 @@ func (l *Lake) assertOptions(ctx context.Context, cfg Config) error {
 func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 	// name → already-SQL-formatted value (a quoted string or a bare literal).
 	opts := []struct{ name, valueSQL string }{
-		// zstd matches the old pqwrite encoder and beats the snappy default for
-		// this sorted time-series; DuckDB also writes bloom filters on
-		// dictionary-encoded columns (subject), preserving the old bundles'
-		// pruning characteristics.
-		{"parquet_compression", "'zstd'"},
+		// snappy is the default: the parquet write is CPU-bound on the codec, and
+		// snappy sustains ~30% higher materialize throughput than zstd on this
+		// sorted time-series (at ~1.6x the file size). zstd remains available via
+		// Config.Compression for storage-constrained deployments. Either way DuckDB
+		// writes bloom filters on dictionary-encoded columns (subject), so subject
+		// pruning is preserved; backfilled DIS bundles keep their own (zstd) codec
+		// since compression is a per-file Parquet property.
+		{"parquet_compression", sqlString(compressionLiteral(cfg.Compression))},
 	}
 	if v := parquetVersionLiteral(cfg.ParquetVersion); v != "" {
 		opts = append(opts, struct{ name, valueSQL string }{"parquet_version", v})
@@ -240,6 +275,24 @@ func parquetVersionLiteral(v string) string {
 		return v
 	default:
 		return ""
+	}
+}
+
+// compressionLiteral validates the configured Parquet codec and returns a known
+// value, defaulting empty/unknown to "snappy". Like parquetVersionLiteral this
+// keeps a typo'd LAKE_COMPRESSION from reaching set_option and wedging boot
+// (a deterministic error retryCatalog would otherwise retry then crash on);
+// sqlString already blocks injection, this blocks the unknown-codec footgun.
+// Unlike parquetVersionLiteral (which returns "" so the option is omitted and
+// DuckLake keeps its own default), this always returns a codec: snappy is din's
+// deliberate default and must be pinned even when the operator sets nothing.
+func compressionLiteral(v string) string {
+	c := strings.ToLower(v)
+	switch c {
+	case "zstd", "lz4", "snappy", "uncompressed":
+		return c
+	default:
+		return "snappy"
 	}
 }
 
@@ -476,6 +529,12 @@ func s3SecretSQL(cfg Config) string {
 	if cfg.S3Region != "" {
 		parts = append(parts, "REGION "+sqlString(cfg.S3Region))
 	}
+	if cfg.S3KMSKeyID != "" {
+		// SSE-KMS for httpfs Parquet writes: DuckDB sets the
+		// x-amz-server-side-encryption headers on PutObject. Server-side and
+		// independent of DuckLake's own ENCRYPTED (client-side) layer.
+		parts = append(parts, "KMS_KEY_ID "+sqlString(cfg.S3KMSKeyID))
+	}
 	if cfg.S3Endpoint != "" {
 		host := cfg.S3Endpoint
 		useSSL := true
@@ -496,17 +555,44 @@ func sqlString(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
+// credentialBearing reports whether a bootstrap statement carries a secret that
+// must be kept out of logs: the quoted DSN (with its catalog password) in ATTACH,
+// or the key material in CREATE SECRET.
+func credentialBearing(q string) bool {
+	return strings.Contains(q, "SECRET") || strings.Contains(q, "ATTACH")
+}
+
 // redact hides credential-bearing values — the quoted DSN in ATTACH, the secret body
 // in CREATE SECRET — from error messages, while keeping the statement shape (notably
 // the `AS lake` / `AS meta` alias) so a failed bootstrap says WHICH attach failed
 // instead of collapsing both to an identical "ATTACH IF NOT EXISTS (…)".
 func redact(q string) string {
-	if !strings.Contains(q, "SECRET") && !strings.Contains(q, "ATTACH") {
+	if !credentialBearing(q) {
 		return q
 	}
+	return scrubQuotedLiterals(q)
+}
+
+// redactErr scrubs single-quoted literals from a driver error when the failing
+// statement carries credentials. DuckDB often echoes the offending statement —
+// including the secret body or catalog password — back in its error text, which
+// redact(q) on the wrapper alone would not catch. Non-credential statements keep
+// their original wrapped error for debuggability.
+func redactErr(q string, err error) error {
+	if err == nil || !credentialBearing(q) {
+		return err
+	}
+	return errors.New(scrubQuotedLiterals(err.Error()))
+}
+
+// scrubQuotedLiterals replaces the body of every single-quoted SQL string literal
+// with an ellipsis. The SQL escape ” reads as close-then-open, so an escaped quote
+// inside a value leaves the literal body hidden (escapes come in pairs, so quote
+// parity is preserved) — a value like O'Brien can't unmask the rest of the secret.
+func scrubQuotedLiterals(s string) string {
 	var b strings.Builder
 	inQuote := false
-	for _, r := range q {
+	for _, r := range s {
 		switch {
 		case r == '\'' && !inQuote:
 			b.WriteString("'…'") // open quote: emit the redacted placeholder once

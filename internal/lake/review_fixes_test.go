@@ -2,6 +2,7 @@ package lake
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -97,6 +98,14 @@ func TestRedact_HidesSecretsKeepsAlias(t *testing.T) {
 			[]string{"AKIAEXAMPLE", "shh"},
 		},
 		{
+			// A SQL-escaped quote ('') inside a value must not desync the scrubber
+			// and unmask the rest of the secret (or the following literal).
+			"escaped quote inside value stays hidden",
+			"CREATE SECRET (KEY_ID 'AK''IA', SECRET 'sh''hh')",
+			[]string{"CREATE SECRET"},
+			[]string{"AK", "IA", "shh", "hh"},
+		},
+		{
 			"non-secret statement untouched",
 			"SELECT 1",
 			[]string{"SELECT 1"},
@@ -114,4 +123,28 @@ func TestRedact_HidesSecretsKeepsAlias(t *testing.T) {
 			}
 		})
 	}
+}
+
+// redactErr scrubs quoted literals out of a DuckDB driver error for
+// credential-bearing statements (the driver often echoes the offending
+// statement), while leaving ordinary statement errors intact.
+func TestRedactErr_ScrubsCredentialErrors(t *testing.T) {
+	secretStmt := "CREATE SECRET (KEY_ID 'AKIAEXAMPLE', SECRET 'shh')"
+	driverErr := errors.New("Parser Error near 'AKIAEXAMPLE': bad secret")
+	got := redactErr(secretStmt, driverErr)
+	require.Error(t, got)
+	assert.NotContains(t, got.Error(), "AKIAEXAMPLE", "credential leaked via wrapped driver error: %q", got)
+
+	// ATTACH carries the catalog DSN password; when the driver echoes the quoted
+	// statement fragment (the common leak vector) it's scrubbed too. Unquoted
+	// echoes are out of scope — this is defense-in-depth, not a guarantee.
+	attachErr := redactErr("ATTACH 'postgres:password=topsecret' AS lake", errors.New("Binder Error: near 'postgres:password=topsecret'"))
+	assert.NotContains(t, attachErr.Error(), "topsecret")
+
+	// A non-credential statement keeps its original error untouched.
+	plain := errors.New("boom 'literal'")
+	assert.Equal(t, plain, redactErr("SELECT 1", plain))
+
+	// nil stays nil.
+	assert.NoError(t, redactErr(secretStmt, nil))
 }

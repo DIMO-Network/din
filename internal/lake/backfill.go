@@ -54,6 +54,14 @@ type BackfillResult struct {
 // originals.
 func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger) (BackfillResult, error) {
 	var res BackfillResult
+	if l.encrypted {
+		// ducklake_add_data_files registers legacy parquet by reference: those files
+		// keep their original (unencrypted) bytes at their source path and read with
+		// a null encryption_key until the maintainer rewrites them into encrypted
+		// files during compaction. Flag the window so it isn't mistaken for at-rest
+		// coverage of the backfilled data.
+		log.Warn().Msg("backfilling into an ENCRYPTED catalog: registered legacy files stay unencrypted at their source until the maintainer compacts them")
+	}
 	existing, err := l.registeredFiles(ctx)
 	if err != nil {
 		return res, err
@@ -153,12 +161,20 @@ func (l *Lake) registerGlob(ctx context.Context, conn *sql.Conn, prefix string, 
 	q := fmt.Sprintf("CALL ducklake_add_data_files('lake', %s, %s, allow_missing => true)",
 		sqlString(RawTable), sqlString(prefix+"*.parquet"))
 	if _, err := conn.ExecContext(ctx, q); err != nil {
-		if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
+		// ROLLBACK under an uncancellable ctx: duckdb-go short-circuits ExecContext
+		// once ctx is done, so a ctx-scoped ROLLBACK on an interrupted backfill would
+		// no-op and leave the txn open on this conn — wedging the deferred partition
+		// restore (mirrors writer.go's WriteBundle).
+		if _, rbErr := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); rbErr != nil {
 			return fmt.Errorf("registering glob %s: %w (rollback also failed: %w)", prefix, err, rbErr)
 		}
 		return fmt.Errorf("registering glob %s: %w", prefix, err)
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		// A failed COMMIT can leave the txn open; reset it (uncancellable) so the
+		// conn — and the deferred SET PARTITIONED BY restore that runs on it — isn't
+		// left wedged. Ignore the rollback error (DuckDB may have auto-aborted).
+		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 		return fmt.Errorf("lake backfill commit: %w", err)
 	}
 	return nil
@@ -182,13 +198,17 @@ func (l *Lake) registerFiles(ctx context.Context, conn *sql.Conn, files []string
 			q := fmt.Sprintf("CALL ducklake_add_data_files('lake', %s, %s, allow_missing => true)",
 				sqlString(RawTable), sqlString(f))
 			if _, err := conn.ExecContext(ctx, q); err != nil {
-				if _, rbErr := conn.ExecContext(ctx, "ROLLBACK"); rbErr != nil {
+				// Uncancellable ROLLBACK — see registerGlob; a ctx-scoped ROLLBACK
+				// no-ops once ctx is done and leaves the txn open on this conn.
+				if _, rbErr := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); rbErr != nil {
 					return registered, fmt.Errorf("registering %s: %w (rollback also failed: %w)", f, err, rbErr)
 				}
 				return registered, fmt.Errorf("registering %s: %w", f, err)
 			}
 		}
 		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			// Reset a possibly-open txn (uncancellable) so the conn stays reusable.
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
 			return registered, fmt.Errorf("lake backfill commit: %w", err)
 		}
 		registered += len(batch)

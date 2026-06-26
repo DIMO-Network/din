@@ -3,6 +3,7 @@
 package config
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"os"
@@ -53,13 +54,23 @@ type Settings struct {
 	NATSStreamMaxBytes int64
 
 	// Storage.
-	BlobBucket        string
-	BlobPrefix        string
-	DocumentSizeLimit int // DOCUMENT_SIZE_THRESHOLD
+	BlobBucket string
+	BlobPrefix string
+	// BlobEncryptionKey is a base64-encoded 32-byte key. When set, externalized
+	// blob payloads are AES-256-GCM sealed before upload so a leaked blob-bucket
+	// credential yields ciphertext — the at-rest parity for blobs that DuckLake
+	// ENCRYPTED gives the lake. Must match dq's key. Empty leaves blobs as-is
+	// (only whatever bucket-default SSE applies).
+	BlobEncryptionKey string // BLOB_ENCRYPTION_KEY
+	DocumentSizeLimit int    // DOCUMENT_SIZE_THRESHOLD
 	S3Region          string
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3Endpoint        string
+	// S3KMSKeyID is the customer-managed KMS key ARN for S3 SSE-KMS, applied to
+	// both the blob-store PutObject and DuckLake's httpfs Parquet writes. Empty
+	// leaves the bucket default (SSE-S3) in place — no per-object KMS key.
+	S3KMSKeyID string // S3_KMS_KEY_ID
 
 	// DuckLake. The catalog database is PostgreSQL in production
 	// (multi-process writes) or a local file for dev/test; DataPath is
@@ -71,7 +82,14 @@ type Settings struct {
 	LakeThreads        int    // DUCKDB_THREADS
 	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
 	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
+	LakeCompression    string // LAKE_COMPRESSION: snappy (default) | zstd | lz4 | uncompressed
 	LakeExtensionDir   string // DUCKDB_EXTENSION_DIR: pre-baked DuckDB extensions
+	// LakeEncryptionEnabled turns on DuckLake's ENCRYPTED mode: every data file
+	// is written with Parquet AES-GCM encryption and its per-file key is kept in
+	// the catalog, so a leaked DataPath bucket is useless ciphertext without
+	// catalog access. The catalog is the trust root once this is on. Decided at
+	// creation; treat as immutable for a given catalog.
+	LakeEncryptionEnabled bool // LAKE_ENCRYPTION_ENABLED
 
 	// Lake maintenance (compaction, snapshot expiry, file cleanup).
 	// Run exactly one maintenance process per catalog. SnapshotKeep
@@ -127,17 +145,20 @@ func Load() (Settings, error) {
 		NATSStoreDir:           env("NATS_STORE_DIR", "/data/nats"),
 		BlobBucket:             os.Getenv("BLOB_BUCKET"),
 		BlobPrefix:             env("BLOB_PREFIX", "cloudevent/blobs/"),
+		BlobEncryptionKey:      os.Getenv("BLOB_ENCRYPTION_KEY"),
 		LakeCatalogDSN:         os.Getenv("DUCKLAKE_CATALOG_DSN"),
 		LakeDataPath:           os.Getenv("DUCKLAKE_DATA_PATH"),
 		LakeTempDirectory:      os.Getenv("DUCKDB_TEMP_DIRECTORY"),
 		LakeMemoryLimit:        os.Getenv("DUCKDB_MEMORY_LIMIT"),
 		LakeTargetFileSize:     env("LAKE_TARGET_FILE_SIZE", "512MB"),
 		LakeParquetVersion:     env("LAKE_PARQUET_VERSION", "2"),
+		LakeCompression:        env("LAKE_COMPRESSION", "snappy"),
 		LakeExtensionDir:       os.Getenv("DUCKDB_EXTENSION_DIR"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
 		S3SecretAccessKey:      os.Getenv("S3_AWS_SECRET_ACCESS_KEY"),
 		S3Endpoint:             os.Getenv("S3_ENDPOINT"),
+		S3KMSKeyID:             os.Getenv("S3_KMS_KEY_ID"),
 	}
 
 	var err error
@@ -200,6 +221,7 @@ func Load() (Settings, error) {
 
 	s.DecodeStreamEnabled = envBool("DECODESTREAM_ENABLED", true)
 	s.LakeMaintenanceEnabled = envBool("LAKE_MAINTENANCE_ENABLED", false)
+	s.LakeEncryptionEnabled = envBool("LAKE_ENCRYPTION_ENABLED", false)
 	s.FingerprintValidation = envBool("FINGERPRINT_VALIDATION", true)
 
 	threads, err := envUint("DUCKDB_THREADS", 0)
@@ -263,10 +285,31 @@ func Load() (Settings, error) {
 			return s, fmt.Errorf("%s must not be a relative path, got %q", name, v)
 		}
 	}
+	if s.S3KMSKeyID != "" && !isKMSKeyARN(s.S3KMSKeyID) {
+		// DuckLake's S3 secret KMS_KEY_ID wants a full ARN (the stricter of the two
+		// consumers), so require that form. Catches a pasted bare key-id or a typo
+		// here instead of as a runtime PutObject 400 / a CrashLooping write tier.
+		return s, fmt.Errorf("S3_KMS_KEY_ID must be a KMS key ARN (arn:aws:kms:...), got %q", s.S3KMSKeyID)
+	}
+	if s.BlobEncryptionKey != "" {
+		// Fail fast: a malformed key means blobs would silently fall back to
+		// plaintext or crash on first write. Must be base64 of exactly 32 bytes
+		// (AES-256), and must match dq's BLOB_ENCRYPTION_KEY.
+		if key, err := base64.StdEncoding.DecodeString(s.BlobEncryptionKey); err != nil || len(key) != 32 {
+			return s, fmt.Errorf("BLOB_ENCRYPTION_KEY must be base64 of exactly 32 bytes (AES-256)")
+		}
+	}
 	if err := s.validateMaintenance(); err != nil {
 		return s, err
 	}
 	return s, nil
+}
+
+// isKMSKeyARN reports whether v looks like a KMS key or alias ARN
+// (arn:<partition>:kms:...). Deliberately loose on the tail so key and alias
+// ARNs across aws / aws-us-gov / aws-cn partitions all pass.
+func isKMSKeyARN(v string) bool {
+	return strings.HasPrefix(v, "arn:") && strings.Contains(v, ":kms:")
 }
 
 // validateMaintenance checks maintenance-tuning invariants. ConsumerStaleness

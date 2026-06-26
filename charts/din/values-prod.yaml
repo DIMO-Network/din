@@ -27,6 +27,15 @@ env:
   # so it also applies to the already-created prod catalog going forward.
   LAKE_PARQUET_VERSION: '2'
   LAKE_TARGET_FILE_SIZE: 512MB
+  # At-rest encryption (full note in values.yaml). On from the first write; the
+  # Postgres catalog holds the per-file keys, so its backup is data-critical.
+  # The catalog DSN secret should also use sslmode=verify-full now that the
+  # catalog is the trust root.
+  LAKE_ENCRYPTION_ENABLED: 'true'
+  # Customer-managed KMS key ARN for SSE-KMS on blob + Parquet writes. Set the
+  # prod key ARN here (or via overlay/secret); empty falls back to the bucket
+  # default (SSE-S3).
+  S3_KMS_KEY_ID: ''
   # replicaCount is 2: maintenance must not run in the ingest pods — the
   # dedicated maintenance Deployment (maintenance.enabled) is the one
   # maintenance process.

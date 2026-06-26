@@ -64,6 +64,38 @@ func TestPutObject(t *testing.T) {
 	assert.Equal(t, body, got)
 }
 
+// TestPutObject_SSEKMS proves a configured KMSKeyID turns every blob PutObject
+// into an SSE-KMS request with a Bucket Key. The blob path is not covered by
+// DuckLake's ENCRYPTED, so this is its only at-rest layer.
+func TestPutObject_SSEKMS(t *testing.T) {
+	t.Parallel()
+	const keyARN = "arn:aws:kms:us-east-2:1:key/abc"
+	api := &fakeAPI{}
+	c := &Client{s3: api, bucket: "test-bucket", kmsKeyID: keyARN}
+
+	require.NoError(t, c.PutObject(context.Background(), "blob", []byte("payload")))
+	require.Len(t, api.putInputs, 1)
+	in := api.putInputs[0]
+	assert.Equal(t, s3types.ServerSideEncryptionAwsKms, in.ServerSideEncryption)
+	assert.Equal(t, keyARN, aws.ToString(in.SSEKMSKeyId))
+	assert.True(t, aws.ToBool(in.BucketKeyEnabled), "Bucket Key must be enabled to amortize KMS calls")
+}
+
+// TestPutObject_NoKMS leaves the SSE headers unset when no key is configured,
+// so the bucket default (SSE-S3) applies instead of failing closed.
+func TestPutObject_NoKMS(t *testing.T) {
+	t.Parallel()
+	api := &fakeAPI{}
+	c := newTestClient(api)
+
+	require.NoError(t, c.PutObject(context.Background(), "blob", []byte("payload")))
+	require.Len(t, api.putInputs, 1)
+	in := api.putInputs[0]
+	assert.Equal(t, s3types.ServerSideEncryption(""), in.ServerSideEncryption)
+	assert.Nil(t, in.SSEKMSKeyId)
+	assert.Nil(t, in.BucketKeyEnabled)
+}
+
 func TestPutObject_ErrorWrapped(t *testing.T) {
 	t.Parallel()
 	api := &fakeAPI{putErr: errors.New("denied")}

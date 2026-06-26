@@ -1,7 +1,7 @@
 # din — At-Rest Encryption Design
 
-**Status:** Plan (design approved, implementation not yet scheduled)
-**Date:** 2026-06-23
+**Status:** Implemented on branch `feat/at-rest-encryption`
+**Date:** 2026-06-23 (design), 2026-06-26 (implemented)
 **Scope:** din ingest write path → DuckLake-on-S3, the blob store, and the Postgres catalog
 
 ## Problem
@@ -31,7 +31,7 @@ user-sovereign or zero-knowledge design, and it isn't trying to be.
 |---|---|---|
 | Threat model | At-rest / leaked storage | Platform keeps transparent reads; no per-user keys. |
 | Key custody | Layered: DuckLake `ENCRYPTED` plus SSE-KMS | A leaked bucket on its own is useless ciphertext; KMS adds a storage-layer defense and an audit trail. The PG catalog becomes the trust root. |
-| Migration | Forward plus natural compaction | New writes are encrypted at cutover; the maintainer's compaction rewrites recent partitions encrypted; cold partitions age out under retention. No expensive one-time rewrite. |
+| Migration | None — greenfield | din and dq aren't deployed anywhere yet, so there's no plaintext backlog. Encryption is on from the first write. No phased rollout, no compaction migration, no backlog gauge. |
 
 ### Out of scope
 
@@ -120,46 +120,50 @@ there's no backup, the encrypted parquet is gone for good. Catalog backups stop
 being a convenience and become the thing standing between you and permanent data
 loss.
 
-## Migration: forward plus natural compaction
+## Migration: none (greenfield)
 
-New writes are encrypted from cutover. The maintainer's existing merge and
-compaction cycles rewrite recent partitions, and those rewrites come out
-encrypted. Cold partitions that never get re-merged stay plaintext until
-retention deletes them. Reads don't care either way: DuckLake handles each file
-according to whether it has a key.
-
-To watch the plaintext backlog drain, add a `din_lake_unencrypted_files` gauge
-counting `ducklake_data_file` rows with a null or empty `encryption_key`.
+din and dq haven't been deployed anywhere, so there's no plaintext backlog to
+migrate. Encryption is on from the first write. That kills the whole phased-rollout
+and natural-compaction story the earlier draft carried: there's nothing to drain,
+so no `din_lake_unencrypted_files` gauge either. Set `LAKE_ENCRYPTION_ENABLED`
+before the first catalog is created and leave it on. The flag stays in the code as
+a safety valve and to keep the existing tests (which inspect raw parquet) running
+unencrypted, but operationally it's on everywhere from day one.
 
 ## Testing
 
 din has a `./tests/` integration package, so run `go test ./...`, not just
 `./internal/... ./cmd/...`.
 
-- ATTACH with `ENCRYPTED`, write a bundle, then check the raw S3 object doesn't
-  parse as plaintext parquet, that DuckLake reads it back correctly, and that
-  `ducklake_data_file.encryption_key` is populated.
-- Read a table that has one plaintext file and one encrypted file. Both should
-  come back fine.
-- Check that s3client's PutObjectInput carries the SSE params. MinIO isn't AWS
-  KMS, so the `s3_minio` path probably needs a mock or fake for that assertion;
-  sort that out during implementation.
-- Confirm `ENCRYPTED` on the ATTACH doesn't churn snapshots, the way
-  `TestOpen_BootstrapIdempotent` already checks.
-- Measure the ~2.5x crypto overhead against the sink flush knobs
-  (`MinFlushBytes`, `MaxAgeHard`) so it doesn't surprise the write hot path.
+What's implemented:
+
+- `TestWriter_Encrypted` (`internal/lake/encryption_test.go`): writes a bundle
+  with `Encrypted: true`, confirms the lake reads it back through the catalog
+  (3000 rows), and confirms the raw parquet file on disk does *not* read as plain
+  parquet (`read_parquet` on it errors). A non-encrypted control proves the error
+  is the encryption, not an unrelated read failure. This is the at-rest proof.
+- `TestPutObject_SSEKMS` / `TestPutObject_NoKMS` (`internal/s3client`): a
+  configured `KMSKeyID` puts SSE-KMS + Bucket Key on the PutObjectInput; an empty
+  one leaves the SSE fields unset so the bucket default applies. Uses the existing
+  `fakeAPI`, no live MinIO needed (MinIO isn't AWS KMS).
+- Existing `TestOpen_BootstrapIdempotent` still passes, so `ENCRYPTED` on the
+  ATTACH doesn't churn snapshots.
+
+Still worth doing before heavy prod load: measure the ~2.5x parquet crypto
+overhead against the sink flush knobs (`SINK_MIN_FLUSH_BYTES`, `SINK_MAX_AGE_HARD`)
+on a representative bundle.
 
 ## Rollout
 
-Two phases, both behind env flags so we can back either one out fast.
+Greenfield, so there's no phased cutover to manage — `LAKE_ENCRYPTION_ENABLED` is
+on in both `values.yaml` and `values-prod.yaml` from the first deploy. The flag
+still exists for instant rollback: flip it off and new files write plaintext;
+files already encrypted stay readable as long as their keys are in the catalog.
+Never purge `encryption_key` rows.
 
-1. SSE-KMS first. Bucket default, the s3client PutObject params, and the
-   DuckLake secret `KMS_KEY_ID`. This covers everything (blobs included)
-   server-side right away and carries essentially no risk.
-2. DuckLake `ENCRYPTED` plus the PG hardening. This is the layer that does the
-   real work. To roll back, flip the flag off and new files write plaintext
-   again; files already encrypted stay readable as long as their keys are in the
-   catalog. Never purge `encryption_key` rows.
+`S3_KMS_KEY_ID` is empty in the charts by default (SSE-KMS is inert, bucket-default
+SSE-S3 applies). Set it to a customer-managed key ARN per environment to turn on
+Layer B; Layer A (DuckLake `ENCRYPTED`) does the heavy lifting regardless.
 
 ### Risks
 
@@ -170,13 +174,25 @@ Two phases, both behind env flags so we can back either one out fast.
 - DuckDB's encryption isn't NIST-validated. The KMS layer underneath it is
   FIPS-capable, which is why this is acceptable.
 
-## Open questions for implementation
+## Resolved during implementation
 
-- One `S3_KMS_KEY_ID` shared by parquet and blob, or separate keys?
-- Default for `LAKE_ENCRYPTION_ENABLED` in the non-prod overlays.
-- Do we want an alert if `din_lake_unencrypted_files` stops draining, or is the
-  gauge enough?
-- The exact MinIO approach for the SSE-KMS test (mock vs KES).
+- One shared `S3_KMS_KEY_ID` for both parquet and blob writes (not separate keys).
+  Simpler, and there's no threat-model reason to split them here.
+- `LAKE_ENCRYPTION_ENABLED` defaults off in code (so the parquet-inspecting unit
+  tests stay unencrypted) and is set on in both chart values.
+- The SSE-KMS test uses the in-package `fakeAPI` to assert the PutObjectInput
+  headers — no MinIO/KES needed.
+
+## Still open (needs validation against a real environment)
+
+- Confirm DuckDB 1.5.3's S3 secret accepts `KMS_KEY_ID` as written (the option is
+  config-guarded, so an empty `S3_KMS_KEY_ID` can't break anything; the path only
+  exercises when an operator sets a key). Layer A is independently verified.
+- Set the real KMS key ARN in `values-prod.yaml` (or via secret/overlay).
+- Put `sslmode=verify-full` on the catalog DSN secret and confirm managed PG
+  at-rest encryption is on — the catalog is the trust root now.
+- Verify SSE-KMS PutObject failure behavior under a KMS outage doesn't wedge the
+  sink (Bucket Keys + existing retry/timeout should cover it).
 
 ## Appendix — why the PIN / user-sovereign idea was dropped
 

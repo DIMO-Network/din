@@ -66,6 +66,10 @@ type Settings struct {
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3Endpoint        string
+	// S3KMSKeyID is the customer-managed KMS key ARN for S3 SSE-KMS, applied to
+	// both the blob-store PutObject and DuckLake's httpfs Parquet writes. Empty
+	// leaves the bucket default (SSE-S3) in place — no per-object KMS key.
+	S3KMSKeyID string // S3_KMS_KEY_ID
 
 	// DuckLake. The catalog database is PostgreSQL in production
 	// (multi-process writes) or a local file for dev/test; DataPath is
@@ -79,6 +83,12 @@ type Settings struct {
 	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
 	LakeCompression    string // LAKE_COMPRESSION: snappy (default) | zstd | lz4 | uncompressed
 	LakeExtensionDir   string // DUCKDB_EXTENSION_DIR: pre-baked DuckDB extensions
+	// LakeEncryptionEnabled turns on DuckLake's ENCRYPTED mode: every data file
+	// is written with Parquet AES-GCM encryption and its per-file key is kept in
+	// the catalog, so a leaked DataPath bucket is useless ciphertext without
+	// catalog access. The catalog is the trust root once this is on. Decided at
+	// creation; treat as immutable for a given catalog.
+	LakeEncryptionEnabled bool // LAKE_ENCRYPTION_ENABLED
 
 	// Lake maintenance (compaction, snapshot expiry, file cleanup).
 	// Run exactly one maintenance process per catalog. SnapshotKeep
@@ -146,6 +156,7 @@ func Load() (Settings, error) {
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
 		S3SecretAccessKey:      os.Getenv("S3_AWS_SECRET_ACCESS_KEY"),
 		S3Endpoint:             os.Getenv("S3_ENDPOINT"),
+		S3KMSKeyID:             os.Getenv("S3_KMS_KEY_ID"),
 	}
 
 	var err error
@@ -220,6 +231,7 @@ func Load() (Settings, error) {
 
 	s.DecodeStreamEnabled = envBool("DECODESTREAM_ENABLED", true)
 	s.LakeMaintenanceEnabled = envBool("LAKE_MAINTENANCE_ENABLED", false)
+	s.LakeEncryptionEnabled = envBool("LAKE_ENCRYPTION_ENABLED", false)
 	s.FingerprintValidation = envBool("FINGERPRINT_VALIDATION", true)
 
 	threads, err := envUint("DUCKDB_THREADS", 0)

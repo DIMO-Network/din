@@ -14,6 +14,7 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // putObjectTimeout bounds a single blob externalization on the ingest hot path,
@@ -38,6 +39,10 @@ type Config struct {
 	// Endpoint overrides the S3 endpoint (MinIO, localstack); when set,
 	// path-style addressing is enabled.
 	Endpoint string
+	// KMSKeyID, when set, makes every PutObject request S3 SSE-KMS with this
+	// customer-managed key (CloudTrail audited) and enables an S3 Bucket Key to
+	// cut KMS request volume. Empty leaves the bucket default (SSE-S3) in place.
+	KMSKeyID string
 }
 
 // ObjectInfo describes a listed object. Alias of objstore.ObjectInfo so
@@ -52,8 +57,9 @@ type api interface {
 
 // Client is a bucket-bound S3 wrapper.
 type Client struct {
-	s3     api
-	bucket string
+	s3       api
+	bucket   string
+	kmsKeyID string
 }
 
 // New builds a Client from cfg, loading the AWS config chain.
@@ -86,7 +92,7 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 		}
 	})
 
-	return &Client{s3: s3Client, bucket: cfg.Bucket}, nil
+	return &Client{s3: s3Client, bucket: cfg.Bucket, kmsKeyID: cfg.KMSKeyID}, nil
 }
 
 // PutObject uploads body under key. Implements split.ObjectStore.
@@ -95,12 +101,20 @@ func (c *Client) PutObject(ctx context.Context, key string, body []byte) error {
 	// redelivery) instead of pinning the ingest request goroutine on a hung conn.
 	ctx, cancel := context.WithTimeout(ctx, putObjectTimeout)
 	defer cancel()
-	_, err := c.s3.PutObject(ctx, &s3.PutObjectInput{
+	in := &s3.PutObjectInput{
 		Bucket:      aws.String(c.bucket),
 		Key:         aws.String(key),
 		Body:        bytes.NewReader(body),
 		ContentType: aws.String("application/octet-stream"),
-	})
+	}
+	if c.kmsKeyID != "" {
+		// SSE-KMS with a customer-managed key; the Bucket Key amortizes the KMS
+		// GenerateDataKey call across many objects to cut request cost.
+		in.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		in.SSEKMSKeyId = aws.String(c.kmsKeyID)
+		in.BucketKeyEnabled = aws.Bool(true)
+	}
+	_, err := c.s3.PutObject(ctx, in)
 	if err != nil {
 		return fmt.Errorf("put object %s/%s: %w", c.bucket, key, err)
 	}

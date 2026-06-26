@@ -190,6 +190,38 @@ and deliberately left as-is, with its preconditions deferred to ops.
 - DuckDB's encryption isn't NIST-validated. The KMS layer underneath it is
   FIPS-capable, which is why this is acceptable.
 
+## Coverage and residual gaps
+
+What this protects and what it deliberately doesn't, stated plainly so nobody
+over-trusts it.
+
+- **Blobs are weaker than parquet.** Layer A (DuckLake `ENCRYPTED`) makes parquet
+  proof against both a raw-object leak *and* a leaked S3 read credential —
+  decrypting needs the Postgres catalog, not just bucket access. Blobs (payloads
+  over 1MB in `BLOB_BUCKET`) get only S3 SSE: bucket-default SSE-S3 by default
+  (`S3_KMS_KEY_ID` is empty), or SSE-KMS if it's set. SSE defeats a raw-disk/object
+  leak but is transparent to anything holding an S3 GET credential, so a leaked IAM
+  role reads blob payloads in plaintext. Bringing blobs to parquet parity
+  (leaked-credential-proof) needs client-side encryption before `PutObject`, which
+  is out of scope here. If blob payloads are sensitive: at minimum set
+  `S3_KMS_KEY_ID` and lock the KMS key policy; for true parity, add client-side
+  blob encryption.
+- **The reader (dq) is a separate repo and unverified here.** dq attaches the same
+  catalog and should decrypt transparently (per-file keys live in the catalog), but
+  that isn't tested against dq in this change. Verify dq reads the encrypted lake
+  before enabling encryption in any shared environment.
+- **Only the local-path encryption path is tested.** `TestWriter_Encrypted` uses a
+  local file catalog + local DataPath, which never loads httpfs. The prod path
+  (`s3://` → INSTALL httpfs + CREATE SECRET + ATTACH `ENCRYPTED`) has no test.
+  DuckLake `ENCRYPTED` is client-side and works against MinIO, so an `s3_minio`
+  encrypted round-trip test is feasible and worth adding before prod.
+- **Backfill registers by reference.** Legacy DIS bundles added via
+  `ducklake_add_data_files` into an encrypted catalog stay unencrypted at their
+  source path (verified: registration and read-back both work, with a null
+  `encryption_key` for those files) until the maintainer compacts them into
+  encrypted files. Moot while nothing is backfilled, but it's a window where
+  backfilled data is unencrypted.
+
 ## Resolved during implementation
 
 - One shared `S3_KMS_KEY_ID` for both parquet and blob writes (not separate keys).

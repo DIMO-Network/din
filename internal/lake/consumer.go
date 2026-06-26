@@ -40,7 +40,10 @@ func (l *Lake) RecordConsumerProgress(ctx context.Context, consumer string, snap
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return err
 	}
-	rollback := func() { _, _ = conn.ExecContext(ctx, "ROLLBACK") }
+	// Uncancellable ROLLBACK: duckdb-go short-circuits ExecContext once ctx is done,
+	// so a ctx-scoped ROLLBACK on a cancelled request would no-op and leave the txn
+	// open on this pooled conn, poisoning its next reuse (mirrors writer.go).
+	rollback := func() { _, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK") }
 	if _, err := conn.ExecContext(ctx,
 		"DELETE FROM meta.din_consumer_progress WHERE consumer = ?", consumer); err != nil {
 		rollback()

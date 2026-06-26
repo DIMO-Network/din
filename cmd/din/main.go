@@ -181,6 +181,8 @@ func lakeConfig(settings config.Settings) lake.Config {
 		S3AccessKeyID:     settings.S3AccessKeyID,
 		S3SecretAccessKey: settings.S3SecretAccessKey,
 		S3Endpoint:        settings.S3Endpoint,
+		S3KMSKeyID:        settings.S3KMSKeyID,
+		Encrypted:         settings.LakeEncryptionEnabled,
 		MemoryLimit:       settings.LakeMemoryLimit,
 		Threads:           settings.LakeThreads,
 		TargetFileSize:    settings.LakeTargetFileSize,
@@ -473,6 +475,7 @@ func newObjectStore(ctx context.Context, settings config.Settings, bucket string
 		AccessKeyID:     settings.S3AccessKeyID,
 		SecretAccessKey: settings.S3SecretAccessKey,
 		Endpoint:        settings.S3Endpoint,
+		KMSKeyID:        settings.S3KMSKeyID,
 	})
 }
 

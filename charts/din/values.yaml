@@ -65,6 +65,18 @@ env:
   # is compatibility-safe. target_file_size is DuckLake's compaction target.
   LAKE_PARQUET_VERSION: '2'
   LAKE_TARGET_FILE_SIZE: 512MB
+  # At-rest encryption. LAKE_ENCRYPTION_ENABLED turns on DuckLake's ENCRYPTED
+  # mode: every Parquet data file is AES-GCM encrypted and its per-file key is
+  # kept in the catalog, so the DATA_PATH bucket is useless ciphertext without
+  # catalog access. The Postgres catalog is the trust root once this is on — its
+  # backup is now data-critical (lose the keys, lose the data). Set before the
+  # first write; treat as fixed for a catalog's lifetime.
+  LAKE_ENCRYPTION_ENABLED: 'true'
+  # S3_KMS_KEY_ID adds SSE-KMS (server-side, AWS-held key, CloudTrail audited) to
+  # both the blob PutObject and DuckLake's Parquet writes, with an S3 Bucket Key
+  # to cut KMS request cost. Empty leaves the bucket default (SSE-S3) in place.
+  # Set to a customer-managed key ARN where KMS is available.
+  S3_KMS_KEY_ID: ''
   # Exactly one maintenance process per catalog: keep this on a single
   # replica (or a dedicated deployment) — never with autoscaling > 1.
   LAKE_MAINTENANCE_ENABLED: 'true'

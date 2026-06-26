@@ -38,6 +38,18 @@ type Config struct {
 	S3AccessKeyID     string
 	S3SecretAccessKey string
 	S3Endpoint        string
+	// S3KMSKeyID, when set, adds KMS_KEY_ID to the DuckDB S3 secret so httpfs
+	// writes Parquet with S3 SSE-KMS (server-side, AWS-held key, CloudTrail
+	// audited). Empty keeps the bucket default (SSE-S3). Independent of
+	// Encrypted, which is client-side Parquet encryption.
+	S3KMSKeyID string
+
+	// Encrypted turns on DuckLake's ENCRYPTED mode on ATTACH: each data file is
+	// written with Parquet AES-GCM encryption and its per-file key is stored in
+	// the catalog, so the DataPath bucket can be untrusted. The catalog becomes
+	// the trust root — losing it loses the keys and therefore the data. Set at
+	// catalog creation; treat as fixed for a given catalog's lifetime.
+	Encrypted bool
 
 	// MemoryLimit caps DuckDB memory (e.g. "1GB"); empty uses the
 	// DuckDB default. Size to the pod limit: inserts buffer + sort.
@@ -174,8 +186,15 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 		setup = append(setup, "INSTALL httpfs", "LOAD httpfs", s3SecretSQL(cfg))
 	}
 	catalogDSN := withCatalogConnectTimeout(cfg.CatalogDSN)
-	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (DATA_PATH %s)",
-		sqlString(catalogURI(catalogDSN)), sqlString(cfg.DataPath)))
+	attachOpts := "DATA_PATH " + sqlString(cfg.DataPath)
+	if cfg.Encrypted {
+		// ENCRYPTED makes DuckLake write every data file with Parquet AES-GCM
+		// encryption and keep its per-file key in the catalog. Pass it on every
+		// attach (not just creation) so the session writes/reads encrypted files.
+		attachOpts += ", ENCRYPTED"
+	}
+	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (%s)",
+		sqlString(catalogURI(catalogDSN)), attachOpts))
 
 	// Consumer progress lives in a plain table in the catalog database —
 	// not a DuckLake table (which would snapshot every cursor update). In
@@ -504,6 +523,12 @@ func s3SecretSQL(cfg Config) string {
 	}
 	if cfg.S3Region != "" {
 		parts = append(parts, "REGION "+sqlString(cfg.S3Region))
+	}
+	if cfg.S3KMSKeyID != "" {
+		// SSE-KMS for httpfs Parquet writes: DuckDB sets the
+		// x-amz-server-side-encryption headers on PutObject. Server-side and
+		// independent of DuckLake's own ENCRYPTED (client-side) layer.
+		parts = append(parts, "KMS_KEY_ID "+sqlString(cfg.S3KMSKeyID))
 	}
 	if cfg.S3Endpoint != "" {
 		host := cfg.S3Endpoint

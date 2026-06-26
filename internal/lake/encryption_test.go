@@ -70,11 +70,22 @@ func TestWriter_Encrypted(t *testing.T) {
 		"SELECT count(*) FROM lake.raw_events").Scan(&n))
 	assert.Equal(t, 3000, n, "encrypted lake must read back through the catalog")
 
-	// At-rest proof: reading the file directly (no catalog, no key) must fail.
+	// The catalog actually persisted a per-file key — guards against a future
+	// DuckLake change making ENCRYPTED a silent no-op while the raw read still
+	// happens to fail for some other reason.
+	var keyed int
+	require.NoError(t, encLake.DB().QueryRowContext(ctx,
+		"SELECT count(*) FROM __ducklake_metadata_lake.ducklake_data_file WHERE encryption_key IS NOT NULL AND encryption_key != ''").Scan(&keyed))
+	assert.Positive(t, keyed, "catalog must store a per-file encryption key")
+
+	// At-rest proof: reading the file directly (no catalog, no key) must fail,
+	// and fail *because it is encrypted*, not for some unrelated reason.
 	var dummy int
 	err := encLake.DB().QueryRowContext(ctx, fmt.Sprintf(
 		"SELECT count(*) FROM read_parquet(%s)", sqlString(encFile))).Scan(&dummy)
 	require.Error(t, err, "an encrypted data file must not be readable as plain parquet")
+	assert.Contains(t, strings.ToLower(err.Error()), "encrypt",
+		"raw read must fail specifically because the file is encrypted")
 
 	// Control: a non-encrypted lake's file IS directly readable, so the error
 	// above is the encryption, not some unrelated read failure.

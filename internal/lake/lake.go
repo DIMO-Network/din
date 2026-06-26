@@ -11,6 +11,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -44,11 +45,10 @@ type Config struct {
 	// Encrypted, which is client-side Parquet encryption.
 	S3KMSKeyID string
 
-	// Encrypted turns on DuckLake's ENCRYPTED mode on ATTACH: each data file is
-	// written with Parquet AES-GCM encryption and its per-file key is stored in
-	// the catalog, so the DataPath bucket can be untrusted. The catalog becomes
-	// the trust root — losing it loses the keys and therefore the data. Set at
-	// catalog creation; treat as fixed for a given catalog's lifetime.
+	// Encrypted adds the ENCRYPTED flag to the DuckLake ATTACH: every data file is
+	// written with Parquet AES-GCM encryption, its per-file key stored in the
+	// catalog. Sticky to the catalog once created — see the operational notes on
+	// config.Settings.LakeEncryptionEnabled.
 	Encrypted bool
 
 	// MemoryLimit caps DuckDB memory (e.g. "1GB"); empty uses the
@@ -186,15 +186,17 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 		setup = append(setup, "INSTALL httpfs", "LOAD httpfs", s3SecretSQL(cfg))
 	}
 	catalogDSN := withCatalogConnectTimeout(cfg.CatalogDSN)
-	attachOpts := "DATA_PATH " + sqlString(cfg.DataPath)
+	// Same parts/Join shape as s3SecretSQL so adding a third ATTACH option later
+	// can't trip on a hand-managed separator.
+	attachParts := []string{"DATA_PATH " + sqlString(cfg.DataPath)}
 	if cfg.Encrypted {
 		// ENCRYPTED makes DuckLake write every data file with Parquet AES-GCM
 		// encryption and keep its per-file key in the catalog. Pass it on every
 		// attach (not just creation) so the session writes/reads encrypted files.
-		attachOpts += ", ENCRYPTED"
+		attachParts = append(attachParts, "ENCRYPTED")
 	}
 	setup = append(setup, fmt.Sprintf("ATTACH IF NOT EXISTS %s AS lake (%s)",
-		sqlString(catalogURI(catalogDSN)), attachOpts))
+		sqlString(catalogURI(catalogDSN)), strings.Join(attachParts, ", ")))
 
 	// Consumer progress lives in a plain table in the catalog database —
 	// not a DuckLake table (which would snapshot every cursor update). In
@@ -206,7 +208,7 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 
 	for _, q := range setup {
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("lake bootstrap %q: %w", redact(q), err)
+			return fmt.Errorf("lake bootstrap %q: %w", redact(q), redactErr(q, err))
 		}
 	}
 	if _, err := l.db.ExecContext(ctx, consumerProgressDDL); err != nil {
@@ -550,17 +552,44 @@ func sqlString(v string) string {
 	return "'" + strings.ReplaceAll(v, "'", "''") + "'"
 }
 
+// credentialBearing reports whether a bootstrap statement carries a secret that
+// must be kept out of logs: the quoted DSN (with its catalog password) in ATTACH,
+// or the key material in CREATE SECRET.
+func credentialBearing(q string) bool {
+	return strings.Contains(q, "SECRET") || strings.Contains(q, "ATTACH")
+}
+
 // redact hides credential-bearing values — the quoted DSN in ATTACH, the secret body
 // in CREATE SECRET — from error messages, while keeping the statement shape (notably
 // the `AS lake` / `AS meta` alias) so a failed bootstrap says WHICH attach failed
 // instead of collapsing both to an identical "ATTACH IF NOT EXISTS (…)".
 func redact(q string) string {
-	if !strings.Contains(q, "SECRET") && !strings.Contains(q, "ATTACH") {
+	if !credentialBearing(q) {
 		return q
 	}
+	return scrubQuotedLiterals(q)
+}
+
+// redactErr scrubs single-quoted literals from a driver error when the failing
+// statement carries credentials. DuckDB often echoes the offending statement —
+// including the secret body or catalog password — back in its error text, which
+// redact(q) on the wrapper alone would not catch. Non-credential statements keep
+// their original wrapped error for debuggability.
+func redactErr(q string, err error) error {
+	if err == nil || !credentialBearing(q) {
+		return err
+	}
+	return errors.New(scrubQuotedLiterals(err.Error()))
+}
+
+// scrubQuotedLiterals replaces the body of every single-quoted SQL string literal
+// with an ellipsis. The SQL escape ” reads as close-then-open, so an escaped quote
+// inside a value leaves the literal body hidden (escapes come in pairs, so quote
+// parity is preserved) — a value like O'Brien can't unmask the rest of the secret.
+func scrubQuotedLiterals(s string) string {
 	var b strings.Builder
 	inQuote := false
-	for _, r := range q {
+	for _, r := range s {
 		switch {
 		case r == '\'' && !inQuote:
 			b.WriteString("'…'") // open quote: emit the redacted placeholder once

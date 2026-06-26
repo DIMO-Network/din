@@ -295,10 +295,23 @@ func Load() (Settings, error) {
 			return s, fmt.Errorf("%s must not be a relative path, got %q", name, v)
 		}
 	}
+	if s.S3KMSKeyID != "" && !isKMSKeyARN(s.S3KMSKeyID) {
+		// DuckLake's S3 secret KMS_KEY_ID wants a full ARN (the stricter of the two
+		// consumers), so require that form. Catches a pasted bare key-id or a typo
+		// here instead of as a runtime PutObject 400 / a CrashLooping write tier.
+		return s, fmt.Errorf("S3_KMS_KEY_ID must be a KMS key ARN (arn:aws:kms:...), got %q", s.S3KMSKeyID)
+	}
 	if err := s.validateMaintenance(); err != nil {
 		return s, err
 	}
 	return s, nil
+}
+
+// isKMSKeyARN reports whether v looks like a KMS key or alias ARN
+// (arn:<partition>:kms:...). Deliberately loose on the tail so key and alias
+// ARNs across aws / aws-us-gov / aws-cn partitions all pass.
+func isKMSKeyARN(v string) bool {
+	return strings.HasPrefix(v, "arn:") && strings.Contains(v, ":kms:")
 }
 
 // validateMaintenance checks maintenance-tuning invariants. ConsumerStaleness

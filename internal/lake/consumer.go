@@ -55,6 +55,10 @@ func (l *Lake) RecordConsumerProgress(ctx context.Context, consumer string, snap
 		return fmt.Errorf("consumer progress insert: %w", err)
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		// A failed COMMIT can leave the txn open; reset it before defer conn.Close
+		// returns the conn to the pool, or its next reuse inherits an open txn
+		// (same hazard writer.go and backfill.go guard).
+		rollback()
 		return fmt.Errorf("consumer progress commit: %w", err)
 	}
 	return nil

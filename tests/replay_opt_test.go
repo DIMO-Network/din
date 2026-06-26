@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/DIMO-Network/cloudevent"
+	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/stretchr/testify/require"
 )
@@ -182,27 +183,15 @@ func TestReplayE2E(t *testing.T) {
 	}
 }
 
-// --- decode micro-opt: ValidIdentifier regex vs hand-rolled ASCII check ---
+// --- decode micro-opt: the old regex baseline vs the production hand-rolled scan ---
 
+// validCharsRE is the regexp ValidIdentifier used before the hand-rolled scan; kept
+// here as the benchmark's "before" baseline (it no longer exists in convert). The
+// "after" side benchmarks the real convert.ValidIdentifier directly — no test copy,
+// so it can't silently drift from production.
 var validCharsRE = regexp.MustCompile(`^[a-zA-Z0-9\-_/,. :]+$`)
 
 func validIdentRE(s string) bool { return validCharsRE.MatchString(s) }
-
-func validIdentFast(s string) bool {
-	if s == "" {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		switch {
-		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9',
-			c == '-', c == '_', c == '/', c == ',', c == '.', c == ' ', c == ':':
-		default:
-			return false
-		}
-	}
-	return true
-}
 
 // identStrings returns the header fields ValidIdentifier actually checks (id,
 // subject, producer, type, specversion, dataversion) from real rows.
@@ -227,10 +216,10 @@ func BenchmarkValidIdentifier(b *testing.B) {
 		}
 		_ = ok
 	})
-	b.Run("handrolled", func(b *testing.B) {
+	b.Run("production", func(b *testing.B) {
 		var ok bool
 		for i := 0; i < b.N; i++ {
-			ok = validIdentFast(strs[i%len(strs)])
+			ok = convert.ValidIdentifier(strs[i%len(strs)])
 		}
 		_ = ok
 	})

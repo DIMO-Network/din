@@ -259,10 +259,14 @@ func parquetVersionLiteral(v string) string {
 // keeps a typo'd LAKE_COMPRESSION from reaching set_option and wedging boot
 // (a deterministic error retryCatalog would otherwise retry then crash on);
 // sqlString already blocks injection, this blocks the unknown-codec footgun.
+// Unlike parquetVersionLiteral (which returns "" so the option is omitted and
+// DuckLake keeps its own default), this always returns a codec: snappy is din's
+// deliberate default and must be pinned even when the operator sets nothing.
 func compressionLiteral(v string) string {
-	switch strings.ToLower(v) {
+	c := strings.ToLower(v)
+	switch c {
 	case "zstd", "lz4", "snappy", "uncompressed":
-		return strings.ToLower(v)
+		return c
 	default:
 		return "snappy"
 	}

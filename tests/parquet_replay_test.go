@@ -597,17 +597,7 @@ func TestReplayLake(t *testing.T) {
 		t.Skip("pass -replay to run the ingestion benchmark")
 	}
 	events := loadEvents(t, *replayN)
-	stored := make([]cloudevent.StoredEvent, len(events))
-	for i, e := range events {
-		stored[i] = cloudevent.StoredEvent{RawEvent: cloudevent.RawEvent{
-			CloudEventHeader: cloudevent.CloudEventHeader{
-				SpecVersion: "1.0", ID: e.id, Source: replaySource,
-				Subject: e.subject, Producer: e.producer, Time: e.t,
-				Type: e.typ, DataContentType: e.dct, DataVersion: e.dver,
-			},
-			Data: e.data,
-		}}
-	}
+	stored := storedFromDump(events)
 
 	const bundleSize = 100_000 // the sink's MaxRowsPerFlush
 	for _, writerConns := range []int{1, 2, 4, 8} {
@@ -621,37 +611,14 @@ func TestReplayLake(t *testing.T) {
 		writer, err := lk.NewWriterN(context.Background(), lake.RawTable, writerConns)
 		require.NoError(t, err)
 
-		// Split into bundles and commit them across writerConns concurrently —
-		// exactly how the per-partition sinks drive the writer.
-		var bundles [][]cloudevent.StoredEvent
-		for i := 0; i < len(stored); i += bundleSize {
-			end := min(i+bundleSize, len(stored))
-			bundles = append(bundles, stored[i:end])
-		}
-		start := time.Now()
-		var wg sync.WaitGroup
-		sem := make(chan struct{}, writerConns)
-		errs := make(chan error, len(bundles))
-		for _, b := range bundles {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(b []cloudevent.StoredEvent) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				// Don't require.* inside the goroutine: a failure calls runtime.Goexit
-				// on this goroutine only, so wg.Wait would hang and the lake/writer
-				// would leak. Report the error and assert on the main goroutine.
-				errs <- writer.WriteBundle(context.Background(), b)
-			}(b)
-		}
-		wg.Wait()
-		close(errs)
-		for err := range errs {
-			require.NoError(t, err)
-		}
-		eps := float64(len(stored)) / time.Since(start).Seconds()
+		// Bundle + commit across writerConns concurrently — exactly how the
+		// per-partition sinks drive the writer. writeBundles (replay_opt_test.go)
+		// is the shared helper used by the codec/bundle sweeps too.
+		dur := writeBundles(t, writer, stored, bundleSize, writerConns)
+		nBundles := (len(stored) + bundleSize - 1) / bundleSize
+		eps := float64(len(stored)) / dur.Seconds()
 		t.Logf("lake write ceiling: %d writer-conns → %.0f events/s (%d events, %d bundles)",
-			writerConns, eps, len(stored), len(bundles))
+			writerConns, eps, len(stored), nBundles)
 		_ = writer.Close()
 		_ = lk.Close()
 	}

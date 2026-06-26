@@ -83,6 +83,26 @@ func TestNewCipher_Validation(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestGoldenVector pins the wire format: this exact (key, sealed, aad,
+// plaintext) tuple is also pinned in dq's blobcrypt_test. If din's format drifts,
+// this Open fails here; if dq's drifts, dq's copy fails — so neither repo can
+// change the format without the other noticing.
+func TestGoldenVector(t *testing.T) {
+	const (
+		keyB64    = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio="
+		sealedB64 = "REJFMfpbx2YHkkRYAdtRPzuxzz7dwfQJNizKGPt2rTfyuQxLDF656mDN5H8zlpCmikO3wJcKpg=="
+		aad       = "cloudevent/blobs/golden"
+		want      = "din<->dq blob format v1"
+	)
+	c, err := NewCipher(keyB64)
+	require.NoError(t, err)
+	sealed, err := base64.StdEncoding.DecodeString(sealedB64)
+	require.NoError(t, err)
+	got, err := c.Open(aad, sealed)
+	require.NoError(t, err)
+	assert.Equal(t, want, string(got))
+}
+
 type fakeStore struct{ body []byte }
 
 func (f *fakeStore) PutObject(_ context.Context, _ string, body []byte) error {

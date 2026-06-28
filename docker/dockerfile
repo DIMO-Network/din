@@ -1,7 +1,7 @@
 # Build context is the din repo itself (cloudevent is a published public module now —
 # no sibling checkout, no replace). Build from the repo root:
 #   docker build -f docker/dockerfile .
-FROM golang:1.26 AS build
+FROM golang:1.26-bookworm AS build
 RUN useradd -u 10001 dimo
 WORKDIR /src
 # Resolve modules first so the dep layer caches across source changes (cloudevent is
@@ -15,10 +15,15 @@ RUN CGO_ENABLED=1 go build -o /din ./cmd/din
 RUN /din install-duckdb-extensions /duckdb-extensions
 
 # distroless/cc (not static): the DuckDB bindings link libstdc++.
-FROM gcr.io/distroless/cc AS final
+FROM gcr.io/distroless/cc-debian12 AS final
 LABEL maintainer="DIMO <hello@dimo.zone>"
 USER nonroot:nonroot
 COPY --from=build --chown=nonroot:nonroot /din /
 COPY --from=build --chown=nonroot:nonroot /duckdb-extensions /duckdb-extensions
 ENV DUCKDB_EXTENSION_DIR=/duckdb-extensions
+# Listening ports (see internal/config/config.go):
+#   9443 — mTLS connection/ingest server (DIS_CONNECTION_ADDRESS)
+#   9442 — attestation server           (DIS_ATTESTATION_ADDRESS)
+#   8080 — ops server: health + metrics (OPS_ADDRESS)
+EXPOSE 9443 9442 8080
 ENTRYPOINT ["/din"]

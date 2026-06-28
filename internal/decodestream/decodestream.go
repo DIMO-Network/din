@@ -73,7 +73,22 @@ type Config struct {
 	// StreamPartitions is the WAL partition count to consume (must match
 	// the publisher's NATS_STREAM_PARTITIONS).
 	StreamPartitions int
+	// SignalsMaxBytes / EventsMaxBytes are the hard on-disk backstops for the
+	// DIMO_SIGNALS / DIMO_EVENTS streams. 0 uses the package defaults, which
+	// stay BYTE-COMPATIBLE with vehicle-triggers-api's provisioning. Lower them
+	// on small/test nodes whose JetStream file store can't fit the prod caps —
+	// a stream's MaxBytes must not exceed the store or creation fails (10047).
+	SignalsMaxBytes int64
+	EventsMaxBytes  int64
 }
+
+// Default on-disk backstops for the decoded streams, matching
+// vehicle-triggers-api's CreateOrUpdateStream values. Used when the
+// corresponding Config field is 0.
+const (
+	defaultSignalsMaxBytes = 100 << 30
+	defaultEventsMaxBytes  = 10 << 30
+)
 
 // Bridge consumes raw status/event messages and republishes decoded
 // signals/events on triggers-compatible subjects.
@@ -87,6 +102,12 @@ type Bridge struct {
 func New(cfg Config, js jetstream.JetStream, log zerolog.Logger) *Bridge {
 	if cfg.Replicas == 0 {
 		cfg.Replicas = 1
+	}
+	if cfg.SignalsMaxBytes == 0 {
+		cfg.SignalsMaxBytes = defaultSignalsMaxBytes
+	}
+	if cfg.EventsMaxBytes == 0 {
+		cfg.EventsMaxBytes = defaultEventsMaxBytes
 	}
 	return &Bridge{cfg: cfg, js: js, log: log.With().Str("component", "decodestream").Logger()}
 }
@@ -104,7 +125,7 @@ func (b *Bridge) EnsureStreams(ctx context.Context) error {
 			Retention:   jetstream.LimitsPolicy,
 			Discard:     jetstream.DiscardOld,
 			MaxAge:      24 * time.Hour,
-			MaxBytes:    100 << 30, // vta SIGNALS_MAX_BYTES default
+			MaxBytes:    b.cfg.SignalsMaxBytes,
 			Replicas:    b.cfg.Replicas,
 			Description: "DIMO vehicle signal telemetry",
 		},
@@ -115,7 +136,7 @@ func (b *Bridge) EnsureStreams(ctx context.Context) error {
 			Retention:   jetstream.LimitsPolicy,
 			Discard:     jetstream.DiscardOld,
 			MaxAge:      24 * time.Hour,
-			MaxBytes:    10 << 30, // vta EVENTS_MAX_BYTES default
+			MaxBytes:    b.cfg.EventsMaxBytes,
 			Replicas:    b.cfg.Replicas,
 			Description: "DIMO vehicle events",
 		},

@@ -435,6 +435,8 @@ func run(log zerolog.Logger) error {
 			VehicleNFTAddress: settings.VehicleNFTAddress,
 			Replicas:          settings.NATSReplicas,
 			StreamPartitions:  settings.NATSStreamPartitions,
+			SignalsMaxBytes:   settings.SignalsMaxBytes,
+			EventsMaxBytes:    settings.EventsMaxBytes,
 		}, bridgeJS, log)
 		if err := bridge.EnsureStreams(ctx); err != nil {
 			return err

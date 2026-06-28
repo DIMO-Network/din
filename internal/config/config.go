@@ -51,6 +51,12 @@ type Settings struct {
 	// hard backstop so a prolonged sink stall can't grow the WAL without bound
 	// before MaxAge (48h) reclaims it. 0 (default) = unlimited.
 	NATSStreamMaxBytes int64
+	// SignalsMaxBytes / EventsMaxBytes are the on-disk backstops for the decoded
+	// DIMO_SIGNALS / DIMO_EVENTS streams. 0 (default) keeps the prod-sized caps
+	// that match vehicle-triggers-api; lower them on small nodes whose JetStream
+	// file store can't fit them (a MaxBytes above the store fails creation 10047).
+	SignalsMaxBytes int64
+	EventsMaxBytes  int64
 
 	// Storage.
 	BlobBucket        string
@@ -199,6 +205,18 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	s.NATSStreamMaxBytes = int64(maxBytes)
+
+	signalsMax, err := envUint("SIGNALS_MAX_BYTES", 0)
+	if err != nil {
+		return s, err
+	}
+	s.SignalsMaxBytes = int64(signalsMax)
+
+	eventsMax, err := envUint("EVENTS_MAX_BYTES", 0)
+	if err != nil {
+		return s, err
+	}
+	s.EventsMaxBytes = int64(eventsMax)
 
 	s.DecodeStreamEnabled = envBool("DECODESTREAM_ENABLED", true)
 	s.LakeMaintenanceEnabled = envBool("LAKE_MAINTENANCE_ENABLED", false)

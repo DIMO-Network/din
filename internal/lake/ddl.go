@@ -25,10 +25,16 @@ const rawEventsCreate = `CREATE TABLE IF NOT EXISTS lake.raw_events (
 		voids_id VARCHAR)`
 
 // rawEventsLayout is the partition + sort layout, kept separate from the CREATE
-// so it can be re-asserted on every boot. Backfill RESETs partitioning for its
-// registration window and restores it in a defer; a SIGKILL skips the defer, so
-// re-asserting at startup is what stops a crash from leaving raw_events
-// permanently unpartitioned (CHD-23). The ALTERs are idempotent.
+// so it can be re-asserted when a crashed backfill left it RESET. Backfill RESETs
+// partitioning for its registration window and restores it in a defer; a SIGKILL
+// skips the defer, so re-asserting is what stops a crash from leaving raw_events
+// permanently unpartitioned (CHD-23).
+//
+// These ALTERs are NOT idempotent: DuckLake bumps schema_version on every SET even
+// when the spec is unchanged, which churns the catalog (and renames inline-data
+// tables — the dq materializer crash). So they must NOT run blindly on every boot:
+// tryEnsureSchema applies them only on first creation, and reassertLayout re-applies
+// them only when isPartitioned reports the layout is currently missing.
 var rawEventsLayout = []string{
 	`ALTER TABLE lake.raw_events SET PARTITIONED BY (type, day("time"))`,
 	`ALTER TABLE lake.raw_events SET SORTED BY (subject, "time")`,

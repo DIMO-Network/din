@@ -58,3 +58,48 @@ func TestHandleCoordinates_PrunesInvalid(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleCoordinates_HDOPOnlyEmitsNoLocation pins D6: an HDOP-only triple
+// (latitude/longitude absent) must NOT emit a currentLocationCoordinates — it
+// previously produced a location at the (0,0) null island.
+func TestHandleCoordinates_HDOPOnlyEmitsNoLocation(t *testing.T) {
+	ts := time.Now().UTC()
+	out, err := handleCoordinates([]vss.Signal{
+		{Data: vss.SignalData{Name: fieldDIMOAftermarketHDOP, Timestamp: ts, ValueNumber: 1.5}},
+	})
+	if err != nil {
+		t.Fatalf("HDOP alone is not an error condition: %v", err)
+	}
+	for _, s := range out {
+		if s.Data.Name == vss.FieldCurrentLocationCoordinates {
+			t.Fatalf("HDOP-only input must not emit a location signal: %+v", s)
+		}
+	}
+}
+
+// TestHandleCoordinates_ValidTripleEmitsLocationWithHDOP guards the merge path:
+// a valid lat+lon pair with HDOP still yields one location carrying all three.
+func TestHandleCoordinates_ValidTripleEmitsLocationWithHDOP(t *testing.T) {
+	ts := time.Now().UTC()
+	out, err := handleCoordinates([]vss.Signal{
+		{Data: vss.SignalData{Name: fieldCurrentLocationLatitude, Timestamp: ts, ValueNumber: 37.7749}},
+		{Data: vss.SignalData{Name: fieldCurrentLocationLongitude, Timestamp: ts, ValueNumber: -122.4194}},
+		{Data: vss.SignalData{Name: fieldDIMOAftermarketHDOP, Timestamp: ts, ValueNumber: 1.5}},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var locs []vss.Signal
+	for _, s := range out {
+		if s.Data.Name == vss.FieldCurrentLocationCoordinates {
+			locs = append(locs, s)
+		}
+	}
+	if len(locs) != 1 {
+		t.Fatalf("expected exactly one location signal, got %d", len(locs))
+	}
+	loc := locs[0].Data.ValueLocation
+	if loc.Latitude != 37.7749 || loc.Longitude != -122.4194 || loc.HDOP != 1.5 {
+		t.Fatalf("location did not carry lat/lon/hdop: %+v", loc)
+	}
+}

@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/rs/zerolog"
 )
 
@@ -88,16 +88,28 @@ const (
 	maintStepTimeout = 30 * time.Minute
 )
 
+// The din_lake_* maintenance metrics below are maintainer-OWNED: only the
+// Maintainer's Cycle/reportConsumerHealth/expireSQL paths ever write them, and
+// only the dedicated maintenance Deployment runs a Maintainer.
+//
+// NOT promauto: package lake is imported by every din binary (ingest sinks,
+// backfill), so promauto's package-init registration would make an ingest pod
+// export din_lake_last_successful_cycle_timestamp_seconds{}=0 etc. That defeats
+// DinMaintenanceDown's absent_over_time (the gauge is never absent while any
+// ingest pod is up) and poisons the max()-fallback alerts with a bogus 0 during
+// a real maintenance outage (C2). Registration happens in
+// registerMaintenanceMetrics, called from NewMaintainer only — mirrors dq's H2
+// materializer-metrics fix.
 var (
-	maintCycles = promauto.NewCounter(prometheus.CounterOpts{
+	maintCycles = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "din_lake_maintenance_cycles_total",
 		Help: "Completed lake maintenance cycles.",
 	})
-	maintErrors = promauto.NewCounterVec(prometheus.CounterOpts{
+	maintErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "din_lake_maintenance_errors_total",
 		Help: "Failed lake maintenance steps.",
 	}, []string{"step"})
-	maintStepSeconds = promauto.NewSummaryVec(prometheus.SummaryOpts{
+	maintStepSeconds = prometheus.NewSummaryVec(prometheus.SummaryOpts{
 		Name: "din_lake_maintenance_step_seconds",
 		Help: "Duration of each lake maintenance step.",
 	}, []string{"step"})
@@ -106,11 +118,11 @@ var (
 	// consumer's lag. A gauge (not a counter) so the alert reads current
 	// state; it needs a long-lived process to be scraped, which is why
 	// maintenance runs as its own Deployment, not a CronJob.
-	maintOldestSnapshotAge = promauto.NewGauge(prometheus.GaugeOpts{
+	maintOldestSnapshotAge = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "din_lake_oldest_unexpired_snapshot_age_seconds",
 		Help: "Age of the oldest retained snapshot; must stay below LAKE_SNAPSHOT_RETENTION.",
 	})
-	maintLastSuccess = promauto.NewGauge(prometheus.GaugeOpts{
+	maintLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "din_lake_last_successful_cycle_timestamp_seconds",
 		Help: "Unix time of the last fully successful maintenance cycle.",
 	})
@@ -118,14 +130,14 @@ var (
 	// expiry cutoff back below the retention horizon — i.e. a consumer has
 	// fallen behind retention and expiry is protecting it. Alert on it:
 	// the lake stops reclaiming space until that consumer catches up.
-	maintFloorBinding = promauto.NewGauge(prometheus.GaugeOpts{
+	maintFloorBinding = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "din_lake_expiry_floor_binding",
 		Help: "1 when a live consumer's progress floor is holding expiry back below retention.",
 	})
 	// staleConsumers is the count of consumers present in the progress table
 	// but past the staleness window — known consumers the floor no longer
 	// protects. Non-zero means a consumer is unprotected (SR review #2, F2).
-	staleConsumers = promauto.NewGauge(prometheus.GaugeOpts{
+	staleConsumers = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "din_lake_stale_consumers",
 		Help: "Consumers with a progress row older than the staleness window (no longer protected by the expiry floor).",
 	})
@@ -133,15 +145,36 @@ var (
 	// (stale) consumer's cursor — the actual data-loss event. The floor-binding
 	// gauge flips 1→0 at this exact moment, so its alert *resolves* and reads as
 	// recovery; this counter makes the loss its own alertable signal (F1).
-	consumerDropped = promauto.NewCounterVec(prometheus.CounterOpts{
+	consumerDropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "din_lake_consumer_dropped_total",
 		Help: "Un-consumed snapshots reclaimed past a dropped stale consumer's cursor (permanent change-feed loss).",
 	}, []string{"consumer"})
 )
 
-// NewMaintainer wires a Maintainer onto an open Lake.
+// registerMaintenanceMetricsOnce guards registerMaintenanceMetrics: NewMaintainer
+// may be called more than once per process (the maintenance service constructs
+// one; tests construct many), and duplicate registration would panic.
+var registerMaintenanceMetricsOnce sync.Once
+
+// registerMaintenanceMetrics exports the maintainer-owned din_lake_* set with the
+// default registry. Called from NewMaintainer only, so a process that never
+// constructs a Maintainer (an ingest pod, backfill) exposes none of these series —
+// see the package var block for why that matters (C2).
+func registerMaintenanceMetrics() {
+	registerMaintenanceMetricsOnce.Do(func() {
+		prometheus.MustRegister(
+			maintCycles, maintErrors, maintStepSeconds, maintOldestSnapshotAge,
+			maintLastSuccess, maintFloorBinding, staleConsumers, consumerDropped,
+		)
+	})
+}
+
+// NewMaintainer wires a Maintainer onto an open Lake. Constructing a Maintainer
+// is what registers the maintainer-owned din_lake_* metrics — see
+// registerMaintenanceMetrics (C2).
 func NewMaintainer(l *Lake, cfg MaintConfig, log zerolog.Logger) *Maintainer {
 	cfg.applyDefaults()
+	registerMaintenanceMetrics()
 	return &Maintainer{lake: l, cfg: cfg, log: log.With().Str("component", "lake-maintainer").Logger()}
 }
 
@@ -242,7 +275,19 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 		}
 		start := time.Now()
 		stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
-		n, err := m.execCount(stepCtx, step.sql)
+		// Retry each CALL through retryCatalog: flush_inlined_data / merge /
+		// expire / cleanup / orphan all commit DuckLake metadata, and losing that
+		// commit race to a concurrent dq write surfaces as a transient
+		// "TransactionContext Error". Without the retry a lost race counts a cycle
+		// failure toward the 4-strike restart backstop, so under sustained dq load
+		// the maintainer restart-loops and expiry/orphan-delete stop running (S5).
+		// The per-step timeout still bounds the whole retry loop (stepCtx).
+		var n int
+		err := retryCatalog(stepCtx, func() error {
+			var e error
+			n, e = m.execCount(stepCtx, step.sql)
+			return e
+		})
 		cancel()
 		maintStepSeconds.WithLabelValues(step.name).Observe(time.Since(start).Seconds())
 		if err != nil {

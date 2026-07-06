@@ -10,17 +10,17 @@ import (
 	"github.com/rs/zerolog"
 )
 
-// backfillBatch bounds files per per-file registration transaction: one
-// snapshot per batch instead of per file keeps a multi-year backfill from
-// minting millions of snapshots. Only the per-file fallback path uses it; the
-// glob fast path commits one snapshot per prefix.
+// backfillBatch bounds files per per-file registration transaction (the
+// partial-prefix fallback): one snapshot per batch instead of per file keeps a
+// multi-year backfill from minting millions of snapshots.
 const backfillBatch = 1000
 
-// maxFilesPerGlob caps how many files a single glob CALL registers. A glob
-// reads every footer it matches before committing, so an unbounded prefix
-// (millions of files) would balloon memory; above the cap we fall back to the
-// per-file batched path, which bounds the working set to backfillBatch.
-const maxFilesPerGlob = 250_000
+// backfillFilesPerSnapshot bounds files per ducklake_add_data_files CALL on the
+// fast (whole-new-prefix) path so a large backfill mints many bounded snapshots
+// instead of one fat snapshot. dq's readDelta materializes a snapshot WHOLE, so a
+// single quarter-million-file snapshot OOM-crash-loops the consumer (S2). A var so
+// a test can lower it to assert multi-snapshot batching cheaply.
+var backfillFilesPerSnapshot = 2000
 
 // BackfillResult reports one Backfill invocation.
 type BackfillResult struct {
@@ -34,24 +34,22 @@ type BackfillResult struct {
 // raw_events schema by construction.
 //
 // Files are grouped by their parent prefix (the S3 "directory" / local dir)
-// and each prefix registers in a single ducklake_add_data_files glob CALL.
-// One glob lets DuckDB list the prefix and read every parquet footer in
-// parallel — over S3, httpfs hides the per-request round-trip latency that
-// makes a serial CALL-per-file pathologically slow (each file is its own
-// HTTP GET). On local NVMe this is ~17x faster than per-file; over S3 the
-// gap is far larger. Because the CALL matches a glob, it registers every
-// .parquet physically under the prefix — for immutable day-partition dumps
-// that is exactly the listed set.
+// and each wholly-new prefix registers via ducklake_add_data_files over an
+// explicit LIST of its paths, batched at backfillFilesPerSnapshot files per
+// CALL/snapshot. One CALL reads its batch's parquet footers in parallel — over
+// S3, httpfs hides the per-request round-trip latency that makes a serial
+// CALL-per-file pathologically slow (each file is its own HTTP GET) — while the
+// per-CALL batch cap keeps any single snapshot small enough that a
+// whole-snapshot consumer (dq's readDelta) can materialize it without OOM (S2).
 //
-// Idempotent: a prefix all of whose files the catalog already tracks is
-// skipped, so reruns resume where a crashed run stopped (the glob CALL +
-// COMMIT is atomic — a prefix is fully registered or not at all). A prefix
-// that is only partially registered (a crash under the old per-file code, or
-// files appended to an already-backfilled day) cannot use the glob — it would
-// double-register the tracked files — so it falls back to per-file
-// registration of just the new files. Registration transfers ownership to
-// DuckLake — later merges may rewrite the data into DATA_PATH and delete the
-// originals.
+// Idempotent: files the catalog already tracks are filtered out, so reruns
+// resume where a crashed run stopped (each batch's CALL + COMMIT is atomic — a
+// batch is fully registered or not at all, and already-registered files are
+// skipped next time). A prefix that is only partially registered (a crash, or
+// files appended to an already-backfilled day) registers just its new files via
+// the per-file batched fallback — the whole-prefix list path would re-register
+// the tracked files. Registration transfers ownership to DuckLake — later merges
+// may rewrite the data into DATA_PATH and delete the originals.
 func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger) (BackfillResult, error) {
 	var res BackfillResult
 	if l.encrypted {
@@ -115,15 +113,16 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 			continue
 		}
 
-		// Glob fast path only when the whole prefix is new and globbable; a
-		// partial prefix would re-register the tracked files, an unsafe prefix
-		// (glob metacharacters in the path) would match the wrong set, and an
-		// oversized prefix would blow memory — all fall back to per-file.
-		if already == 0 && globSafe(prefix) && len(group) <= maxFilesPerGlob {
-			if err := l.registerGlob(ctx, conn, prefix, log); err != nil {
+		// Fast path when the whole prefix is new: register its explicit file list
+		// in bounded snapshot-batches. A partially-registered prefix would
+		// re-register the tracked files this way, so it falls back to per-file
+		// registration of just the new files.
+		if already == 0 {
+			n, err := l.registerListed(ctx, conn, group, log)
+			res.Registered += n
+			if err != nil {
 				return res, err
 			}
-			res.Registered += len(group)
 		} else {
 			n, err := l.registerFiles(ctx, conn, newFiles, log)
 			if err != nil {
@@ -141,43 +140,64 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 	return res, nil
 }
 
-// registerGlob registers every parquet file under prefix in one transaction
-// via a single glob CALL — DuckDB reads the matched footers in parallel.
-func (l *Lake) registerGlob(ctx context.Context, conn *sql.Conn, prefix string, log zerolog.Logger) error {
-	// Keep the maintenance pause fresh per prefix. If the refresh fails the pause
-	// can go stale (>30m), letting the maintainer resume re-asserting partitioning
-	// into this RESET window and abort an in-flight add_data_files (recoverable on
-	// rerun) — so surface a failing heartbeat instead of swallowing it silently.
-	if herr := l.heartbeatBackfillPause(ctx); herr != nil {
-		log.Warn().Err(herr).Msg("backfill pause heartbeat refresh failed; maintainer may resume re-asserting layout")
-	}
-	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
-		return fmt.Errorf("lake backfill begin: %w", err)
-	}
-	// allow_missing tolerates legacy bundles written before a column was added to
-	// raw_events (notably voids_id, the tombstone pointer): the missing column
-	// reads as NULL, exactly "not voided". Without it ducklake_add_data_files
-	// hard-fails on any pre-voids_id file.
-	q := fmt.Sprintf("CALL ducklake_add_data_files('lake', %s, %s, allow_missing => true)",
-		sqlString(RawTable), sqlString(prefix+"*.parquet"))
-	if _, err := conn.ExecContext(ctx, q); err != nil {
-		// ROLLBACK under an uncancellable ctx: duckdb-go short-circuits ExecContext
-		// once ctx is done, so a ctx-scoped ROLLBACK on an interrupted backfill would
-		// no-op and leave the txn open on this conn — wedging the deferred partition
-		// restore (mirrors writer.go's WriteBundle).
-		if _, rbErr := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); rbErr != nil {
-			return fmt.Errorf("registering glob %s: %w (rollback also failed: %w)", prefix, err, rbErr)
+// registerListed registers an explicit file list, batched at
+// backfillFilesPerSnapshot files per ducklake_add_data_files CALL/snapshot.
+// Passing an explicit LIST literal (not a per-prefix glob) keeps DuckDB's
+// parallel-footer-read speed while the batch cap bounds each snapshot so a
+// whole-snapshot consumer (dq's readDelta) can't be handed a multi-GiB snapshot
+// that OOM-crash-loops it (S2). Each batch is its own transaction/snapshot;
+// already-registered files are filtered out by the caller, so a crash mid-list
+// resumes from the first un-committed batch. Returns the count committed so a
+// mid-run failure reports real progress.
+func (l *Lake) registerListed(ctx context.Context, conn *sql.Conn, files []string, log zerolog.Logger) (int, error) {
+	var registered int
+	for i := 0; i < len(files); i += backfillFilesPerSnapshot {
+		end := min(i+backfillFilesPerSnapshot, len(files))
+		batch := files[i:end]
+		// Keep the maintenance pause fresh per batch. If the refresh fails the pause
+		// can go stale (>30m), letting the maintainer resume re-asserting partitioning
+		// into this RESET window and abort an in-flight add_data_files (recoverable on
+		// rerun) — so surface a failing heartbeat instead of swallowing it silently.
+		if herr := l.heartbeatBackfillPause(ctx); herr != nil {
+			log.Warn().Err(herr).Msg("backfill pause heartbeat refresh failed; maintainer may resume re-asserting layout")
 		}
-		return fmt.Errorf("registering glob %s: %w", prefix, err)
+		if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
+			return registered, fmt.Errorf("lake backfill begin: %w", err)
+		}
+		if _, err := conn.ExecContext(ctx, addDataFilesListSQL(batch)); err != nil {
+			// ROLLBACK under an uncancellable ctx: duckdb-go short-circuits ExecContext
+			// once ctx is done, so a ctx-scoped ROLLBACK on an interrupted backfill would
+			// no-op and leave the txn open on this conn — wedging the deferred partition
+			// restore (mirrors writer.go's WriteBundle).
+			if _, rbErr := conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK"); rbErr != nil {
+				return registered, fmt.Errorf("registering batch of %d files: %w (rollback also failed: %w)", len(batch), err, rbErr)
+			}
+			return registered, fmt.Errorf("registering batch of %d files: %w", len(batch), err)
+		}
+		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+			// A failed COMMIT can leave the txn open; reset it (uncancellable) so the
+			// conn — and the deferred SET PARTITIONED BY restore that runs on it — isn't
+			// left wedged. Ignore the rollback error (DuckDB may have auto-aborted).
+			_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
+			return registered, fmt.Errorf("lake backfill commit: %w", err)
+		}
+		registered += len(batch)
 	}
-	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		// A failed COMMIT can leave the txn open; reset it (uncancellable) so the
-		// conn — and the deferred SET PARTITIONED BY restore that runs on it — isn't
-		// left wedged. Ignore the rollback error (DuckDB may have auto-aborted).
-		_, _ = conn.ExecContext(context.WithoutCancel(ctx), "ROLLBACK")
-		return fmt.Errorf("lake backfill commit: %w", err)
+	return registered, nil
+}
+
+// addDataFilesListSQL builds one ducklake_add_data_files CALL over an explicit
+// list of paths. allow_missing tolerates legacy bundles written before a column
+// was added to raw_events (notably voids_id, the tombstone pointer): the missing
+// column reads as NULL, exactly "not voided". Without it ducklake_add_data_files
+// hard-fails on any pre-voids_id file.
+func addDataFilesListSQL(files []string) string {
+	quoted := make([]string, len(files))
+	for i, f := range files {
+		quoted[i] = sqlString(f)
 	}
-	return nil
+	return fmt.Sprintf("CALL ducklake_add_data_files('lake', %s, [%s], allow_missing => true)",
+		sqlString(RawTable), strings.Join(quoted, ", "))
 }
 
 // registerFiles registers an explicit file list one CALL at a time, batched at
@@ -237,13 +257,6 @@ func groupParquetByPrefix(files []string) (map[string][]string, []string) {
 		groups[prefix] = append(groups[prefix], f)
 	}
 	return groups, order
-}
-
-// globSafe reports whether prefix can be safely suffixed with "*.parquet" and
-// passed to a glob CALL — a path already containing glob metacharacters would
-// match an unintended set.
-func globSafe(prefix string) bool {
-	return !strings.ContainsAny(prefix, "*?[")
 }
 
 // registeredFiles returns every data-file path the catalog tracks for

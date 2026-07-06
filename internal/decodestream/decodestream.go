@@ -168,6 +168,10 @@ func (b *Bridge) Run(ctx context.Context) error {
 const (
 	maxDecodeFetchRetries   = 30
 	decodeFetchRetryBackoff = 2 * time.Second
+	// nakRedeliveryDelay spaces out the first redelivery after a publish failure so
+	// a persistent DIMO_SIGNALS/DIMO_EVENTS publish outage doesn't hot-loop; it
+	// matches the consumer's BackOff[0] (D4).
+	nakRedeliveryDelay = 15 * time.Second
 )
 
 func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) error {
@@ -185,6 +189,16 @@ func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) er
 		Durable:   durable,
 		AckPolicy: jetstream.AckExplicitPolicy,
 		AckWait:   time.Minute,
+		// Escalate redelivery and cap total attempts. Without a BackOff a persistent
+		// publish failure to DIMO_SIGNALS/DIMO_EVENTS (or NakWithDelay below) would
+		// redeliver near-immediately at the fixed AckWait cadence forever — a hot
+		// loop that hammers the failing publish and floods the logs (D4). MaxDeliver
+		// eventually sheds a truly-stuck message: acceptable here because this bridge
+		// is a transitional feed for vehicle-triggers, not the durable lake — the raw
+		// bytes are already in raw_events for parse-on-read recovery, so shedding a
+		// decoded republish loses only a trigger notification, not data.
+		MaxDeliver: 100,
+		BackOff:    []time.Duration{15 * time.Second, time.Minute, 5 * time.Minute},
 		FilterSubjects: []string{
 			stream.SubjectFilterForType(cloudevent.TypeStatus),
 			stream.SubjectFilterForType(cloudevent.TypeEvents),
@@ -253,7 +267,10 @@ func (b *Bridge) handle(ctx context.Context, msg jetstream.Msg) {
 
 	if pubErr != nil {
 		b.log.Error().Err(pubErr).Str("subject", msg.Subject()).Msg("publishing decoded message failed; nak for redelivery")
-		if err := msg.Nak(); err != nil {
+		// NakWithDelay, not a bare Nak: a bare Nak redelivers near-immediately, so a
+		// persistent publish failure spins a hot loop. The delay spaces the first
+		// retry out; the consumer's BackOff/MaxDeliver bound the rest (D4).
+		if err := msg.NakWithDelay(nakRedeliveryDelay); err != nil {
 			b.log.Warn().Err(err).Msg("nak failed")
 		}
 		return

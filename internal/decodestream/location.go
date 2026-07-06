@@ -196,9 +196,16 @@ func (c *coordinateStore) tryCreateLocation() {
 	}
 
 	if c.lastHDOP != -1 {
-		loc.HDOP = c.signals[c.lastHDOP].Data.ValueNumber
+		// HDOP enriches a location but never justifies one. Attach it only when a
+		// valid lat+lon pair is already producing a location; an HDOP-only triple
+		// (lat/lon absent) must NOT emit a currentLocationCoordinates — doing so
+		// wrote a location at the (0,0) null island into storage and the DIMO_SIGNALS
+		// trigger stream (D6). Either way the raw HDOP field is consumed: it is an
+		// internal merge input, not an output signal.
+		if create {
+			loc.HDOP = c.signals[c.lastHDOP].Data.ValueNumber
+		}
 		c.signals[c.lastHDOP].Data.Name = pruneSignalName
-		create = true
 	}
 
 	if create {

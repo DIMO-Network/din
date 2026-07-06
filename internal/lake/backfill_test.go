@@ -171,6 +171,50 @@ func TestBackfill_PartialPrefixPerFileFallback(t *testing.T) {
 	assert.Equal(t, 1, dup, "already-registered file must not be re-registered")
 }
 
+// TestBackfill_RegisterListedBatchesSnapshots pins S2: the fast path must
+// register an explicit file list in bounded snapshot-batches, not one fat
+// snapshot. dq's readDelta materializes a snapshot WHOLE, so a single
+// quarter-million-file snapshot OOM-crash-loops it. With the batch cap lowered,
+// a >cap file set mints exactly ceil(files/cap) snapshots.
+func TestBackfill_RegisterListedBatchesSnapshots(t *testing.T) {
+	old := backfillFilesPerSnapshot
+	backfillFilesPerSnapshot = 2 // mutates a package var — not parallel-safe.
+	defer func() { backfillFilesPerSnapshot = old }()
+
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	files := []string{
+		writeBundleAt(t, root, "01", "batch-a.parquet", evts("a1")),
+		writeBundleAt(t, root, "01", "batch-b.parquet", evts("b1")),
+		writeBundleAt(t, root, "01", "batch-c.parquet", evts("c1")),
+		writeBundleAt(t, root, "01", "batch-d.parquet", evts("d1")),
+		writeBundleAt(t, root, "01", "batch-e.parquet", evts("e1")),
+	}
+
+	conn, err := l.db.Conn(ctx)
+	require.NoError(t, err)
+	defer conn.Close() //nolint:errcheck
+	// Legacy bundles span (type, day); registration RESETs partitioning as Backfill does.
+	_, err = conn.ExecContext(ctx, "ALTER TABLE lake.raw_events RESET PARTITIONED BY")
+	require.NoError(t, err)
+
+	var before int
+	require.NoError(t, l.DB().QueryRowContext(ctx, "SELECT count(*) FROM lake.snapshots()").Scan(&before))
+
+	n, err := l.registerListed(ctx, conn, files, zerolog.Nop())
+	require.NoError(t, err)
+	assert.Equal(t, 5, n)
+
+	var after int
+	require.NoError(t, l.DB().QueryRowContext(ctx, "SELECT count(*) FROM lake.snapshots()").Scan(&after))
+	assert.Equal(t, 3, after-before, "5 files at batch cap 2 must mint 3 bounded snapshots (2+2+1), not one fat snapshot")
+
+	var rows int
+	require.NoError(t, l.DB().QueryRowContext(ctx, "SELECT count(*) FROM lake.raw_events").Scan(&rows))
+	assert.Equal(t, 5, rows)
+}
+
 // Backfilled files and native writes coexist: maintenance merges across
 // both without losing rows.
 func TestBackfill_ThenMaintenance(t *testing.T) {

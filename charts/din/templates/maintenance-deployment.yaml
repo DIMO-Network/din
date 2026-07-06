@@ -56,12 +56,19 @@ spec:
               name: {{ include "din.fullname" . }}-config
           - secretRef:
               name: {{ include "din.fullname" . }}-secret
-          {{- if .Values.maintenance.memoryLimit }}
-          # Explicit env overrides the shared configmap's DUCKDB_MEMORY_LIMIT so
-          # the maintainer's DuckDB can use the larger merge budget (CHD-20).
+          {{- if or .Values.maintenance.memoryLimit .Values.maintenance.threads }}
+          # Explicit env overrides the shared configmap's DuckDB sizing so the
+          # maintainer's DuckDB can use the larger merge budget and its own CPU
+          # limit's worth of threads (CHD-20), not the ingest pod's values.
           env:
+            {{- if .Values.maintenance.memoryLimit }}
             - name: DUCKDB_MEMORY_LIMIT
               value: {{ .Values.maintenance.memoryLimit | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.threads }}
+            - name: DUCKDB_THREADS
+              value: {{ .Values.maintenance.threads | quote }}
+            {{- end }}
           {{- end }}
           ports:
             - name: mon-http

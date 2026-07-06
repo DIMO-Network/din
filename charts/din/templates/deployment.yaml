@@ -1,15 +1,31 @@
 {{- /*
-Each ingest replica consumes whole NATS WAL partitions (in.raw.<type>.<did>.pNNN).
-With more replicas than partitions some replicas idle and two can race one
-partition's writes. Refuse to render a fleet whose replica ceiling exceeds
-NATS_STREAM_PARTITIONS (CHD-9); raising partitions is a re-partitioning
-operation — follow the runbook.
+Every ingest replica runs a sink for EVERY NATS WAL partition
+(in.raw.<type>.<did>.pNNN) through a shared per-partition durable — competing
+consumers, NOT partition ownership. Concurrent commits to the same DuckLake
+catalog are safe: a metadata-commit collision is resolved by DuckLake's commit
+retry. So replicas > partitions is actually valid competing-consumer scaling; the
+guard below is a conservative bound on flush parallelism — each extra replica adds
+a full set of per-partition sinks and their buffered-memory ceiling — not a
+correctness requirement. Raising partitions is a re-partitioning operation —
+follow the runbook.
 */ -}}
 {{- $partitions := int (.Values.env.NATS_STREAM_PARTITIONS | default 1) }}
 {{- $replicas := int .Values.replicaCount }}
 {{- if .Values.autoscaling.enabled }}{{ $replicas = int .Values.autoscaling.maxReplicas }}{{ end }}
 {{- if gt $replicas $partitions }}
-{{-   fail (printf "din: replica ceiling (%d) exceeds NATS_STREAM_PARTITIONS (%d). Set NATS_STREAM_PARTITIONS >= replicas (re-partitioning runbook) so each replica owns whole partitions." $replicas $partitions) }}
+{{-   fail (printf "din: replica ceiling (%d) exceeds NATS_STREAM_PARTITIONS (%d). Competing consumers are safe, so this is a conservative bound on flush parallelism, not correctness — each replica adds a full set of per-partition sinks. Raise NATS_STREAM_PARTITIONS to match (re-partitioning runbook)." $replicas $partitions) }}
+{{- end }}
+{{- /*
+In-process maintenance (LAKE_MAINTENANCE_ENABLED) must be a singleton: exactly one
+maintenance loop per catalog. With more than one ingest replica (or autoscaling) it
+would run in every pod, so several maintainers race expiry/merge/orphan-delete. The
+dedicated single-replica maintenance Deployment (maintenance.enabled) is the
+multi-replica path. Mirrors dq's single-writer guard.
+*/ -}}
+{{- if eq (toString (.Values.env.LAKE_MAINTENANCE_ENABLED | default "false")) "true" }}
+{{-   if or (gt (int .Values.replicaCount) 1) .Values.autoscaling.enabled }}
+{{-     fail "din: LAKE_MAINTENANCE_ENABLED=true (in-process maintenance) requires replicaCount=1 and autoscaling.enabled=false — it must be a singleton. For more than one replica, disable it and run the dedicated maintenance Deployment (maintenance.enabled=true) instead." }}
+{{-   end }}
 {{- end }}
 apiVersion: apps/v1
 kind: Deployment

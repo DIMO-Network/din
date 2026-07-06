@@ -136,24 +136,27 @@ spec:
               The sink is repeatedly failing to commit bundles (NATS redelivery),
               an early indicator of catalog Postgres / S3 trouble before the WAL
               backs up. Check the lake writer and catalog connectivity.
-        # The direct write-health signal (H15): commits failing with ZERO
-        # successes means the writer is durably broken (poisoned pinned conn
-        # after a catalog failover, dead S3 path). The in-process backstop
-        # restarts the pod after CommitFailureWindow; this fires if the fleet
-        # keeps cycling through that state. Both sides aggregated + `and on()`
-        # — bare `and` between differently-labeled vectors never matches (H1).
+        # The direct PER-POD write-health signal (H15/C5): a replica committing
+        # NOTHING while its commits keep failing is durably broken (poisoned pinned
+        # conn after a catalog failover, dead S3 path). Per-pod, NOT fleet-wide sums:
+        # one wedged replica must not hide behind a healthy one committing for it.
+        # `A unless B` keeps every pod with a failure rate >0 (A) that has no matching
+        # pod with a commit rate >0 (B) — i.e. failing AND committing nothing. A pod
+        # that has never committed exports no commits series at all, so `unless` still
+        # keeps it: exactly the wedged case. The in-process backstop restarts a pod
+        # after CommitFailureWindow; this fires if a replica keeps cycling through it.
         - alert: DinSinkZeroCommits
-          expr: sum(rate(din_sink_commit_failures_total[15m])) > 0 and on() (sum(rate(din_sink_commits_total[15m])) or vector(0)) == 0
+          expr: sum by (pod) (rate(din_sink_commit_failures_total[15m])) > 0 unless sum by (pod) (rate(din_sink_commits_total[15m])) > 0
           for: 15m
           labels:
             severity: critical
           annotations:
-            summary: sink is committing NOTHING while writes keep failing
+            summary: a sink replica is committing NOTHING while writes keep failing ({{ "{{ $labels.pod }}" }})
             description: >-
-              Every bundle commit is failing fleet-wide and no data is reaching
-              the lake — the WAL is absorbing all ingest (DiscardNew rejects
-              publishes once NATS_STREAM_MAX_BYTES is hit). Check catalog
-              Postgres health/failover state and S3; pods self-restart every
+              Every bundle commit is failing on this pod and no data is reaching
+              the lake from it — the WAL absorbs its ingest (DiscardNew rejects
+              publishes once NATS_STREAM_MAX_BYTES is hit). Check catalog Postgres
+              health/failover state and S3; the pod self-restarts every
               CommitFailureWindow to re-pin connections.
         # WAL backlog (H3): NumPending = events JetStream accepted that the
         # sink has not consumed yet. Sustained growth means ingest outruns the

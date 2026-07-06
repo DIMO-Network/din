@@ -65,6 +65,11 @@ env:
   # to disk instead of the container root fs. Empty = spill to the default (root fs).
   DUCKDB_TEMP_DIRECTORY: /tmp/duckdb
   DUCKDB_MEMORY_LIMIT: 512MB
+  # DuckDB worker threads for the ingest pod. Pin it: unset, DuckDB sizes to the
+  # NODE core count, blind to the container CPU limit — inside a CPU-limited
+  # container that over-subscription causes CFS throttling (long tail latencies,
+  # stalled flushes). Match it to the ingest pod's CPU limit (dev: 1).
+  DUCKDB_THREADS: '1'
   # Parquet write tuning (catalog-global; applies to din's raw_events and dq's
   # decoded tables). v2 delta-packs the sorted (subject,"time") layer for a
   # large size win over v1 on top of zstd — only DuckDB reads the lake, so it
@@ -211,6 +216,10 @@ maintenance:
   # and leaves small files that inflate per-query S3 GET cost (CHD-20, R2-H5).
   # memoryLimit overrides the shared DUCKDB_MEMORY_LIMIT for the maintainer only.
   memoryLimit: 3GB
+  # DUCKDB_THREADS for the maintenance pod, overriding the shared configmap value
+  # (which is sized for an ingest pod). Match the maintenance pod's CPU limit
+  # below (2) so the heavy merge parallelizes without CFS-throttling itself.
+  threads: 2
   resources:
     limits:
       cpu: '2'

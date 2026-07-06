@@ -214,13 +214,58 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 			return fmt.Errorf("lake bootstrap %q: %w", redact(q), redactErr(q, err))
 		}
 	}
-	if _, err := l.db.ExecContext(ctx, consumerProgressDDL); err != nil {
+	// The ATTACH above only *requests* ENCRYPTED; it does not make an existing
+	// plaintext catalog encrypted (nor vice versa). Encryption is a one-way door
+	// fixed at catalog creation, so a config/catalog mismatch must fail fast here
+	// rather than silently writing plaintext into a catalog the operator believes
+	// is encrypted (or attaching an encrypted catalog without the flag). (S9)
+	if err := l.assertEncryptionState(ctx, cfg); err != nil {
+		return err
+	}
+	// CREATE IF NOT EXISTS can still lose a duplicate-key/metadata race when
+	// several replicas boot against a fresh shared catalog at once; retry so a
+	// transient race doesn't CrashLoop the pod (S11).
+	if err := retryCatalog(ctx, func() error {
+		_, e := l.db.ExecContext(ctx, consumerProgressDDL)
+		return e
+	}); err != nil {
 		return fmt.Errorf("lake bootstrap consumer-progress table: %w", err)
 	}
 	if err := l.ensureSchema(ctx); err != nil {
 		return err
 	}
 	return l.assertOptions(ctx, cfg)
+}
+
+// assertEncryptionState fails fast when the attached catalog's actual encryption
+// state disagrees with cfg.Encrypted. DuckLake records the state as the
+// 'encrypted' key ('true'/'false') in its metadata table; cfg.Encrypted only
+// shapes the ATTACH options and does NOT convert an existing catalog. Attaching
+// an encrypted catalog WITHOUT the flag proceeds silently (DuckLake reads the
+// per-file keys from the catalog either way) — so without this probe a dropped
+// LAKE_ENCRYPTION_ENABLED would let a supposedly-encrypted deployment write new
+// data unencrypted. (The opposite, plaintext catalog + ENCRYPTED, DuckLake
+// itself rejects at ATTACH — this covers the silent direction and gives both a
+// clear message.) Encryption is decided at creation and is a one-way door.
+func (l *Lake) assertEncryptionState(ctx context.Context, cfg Config) error {
+	var actual bool
+	err := l.db.QueryRowContext(ctx,
+		"SELECT value = 'true' FROM __ducklake_metadata_lake.ducklake_metadata WHERE key = 'encrypted'").Scan(&actual)
+	if errors.Is(err, sql.ErrNoRows) {
+		// No 'encrypted' key recorded — can't determine state, so don't invent a
+		// failure. Every catalog this code creates records the key (verified
+		// empirically), so this only trips on an unrelated catalog variant.
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lake: reading catalog encryption state: %w", err)
+	}
+	if actual != cfg.Encrypted {
+		return fmt.Errorf("lake: catalog encryption mismatch — catalog is encrypted=%t but LAKE_ENCRYPTION_ENABLED=%t; "+
+			"encryption is fixed at catalog creation and cannot be changed on an existing catalog (create a fresh catalog to change it)",
+			actual, cfg.Encrypted)
+	}
+	return nil
 }
 
 // assertOptions sets the catalog-global write options on every boot, retrying

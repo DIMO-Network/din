@@ -53,6 +53,49 @@ func writeEncBundle(t *testing.T, encrypted bool) (file string, l *Lake) {
 	return file, l
 }
 
+// TestOpen_EncryptionMismatchFailsFast pins S9: encryption is fixed at catalog
+// creation (a one-way door), and cfg.Encrypted only shapes the ATTACH — it does
+// NOT convert an existing catalog. Reopening with the wrong flag must fail fast in
+// BOTH directions rather than silently writing plaintext into a catalog the
+// operator believes is encrypted (or attaching an encrypted catalog without the
+// flag). The dangerous direction — encrypted catalog + Encrypted=false — proceeds
+// silently at ATTACH, so assertEncryptionState is what catches it.
+func TestOpen_EncryptionMismatchFailsFast(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	newCatalog := func(t *testing.T, encrypted bool) Config {
+		t.Helper()
+		dir := t.TempDir()
+		cfg := Config{
+			CatalogDSN: filepath.Join(dir, "meta.ducklake"),
+			DataPath:   filepath.Join(dir, "data"),
+			Encrypted:  encrypted,
+		}
+		l, err := Open(ctx, cfg)
+		require.NoError(t, err)
+		require.NoError(t, l.Close())
+		return cfg
+	}
+
+	t.Run("encrypted catalog reopened plaintext errors", func(t *testing.T) {
+		t.Parallel()
+		cfg := newCatalog(t, true)
+		cfg.Encrypted = false
+		_, err := Open(ctx, cfg)
+		require.Error(t, err, "attaching an encrypted catalog without ENCRYPTED must fail fast")
+		assert.Contains(t, err.Error(), "encryption mismatch")
+	})
+
+	t.Run("plaintext catalog reopened encrypted errors", func(t *testing.T) {
+		t.Parallel()
+		cfg := newCatalog(t, false)
+		cfg.Encrypted = true
+		_, err := Open(ctx, cfg)
+		require.Error(t, err, "attaching a plaintext catalog with ENCRYPTED must fail")
+	})
+}
+
 // TestWriter_Encrypted proves Config.Encrypted reaches DuckLake's ATTACH and
 // gives real at-rest protection: reads through the catalog stay transparent,
 // but the raw data file on disk is unreadable as plain parquet (the per-file

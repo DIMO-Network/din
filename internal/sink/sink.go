@@ -58,6 +58,26 @@ var commitFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Bundle commits that failed (before per-event isolation).",
 })
 
+// Backpressure state + WAL lag gauges (H3). bufferedFootprintGauge/inflight
+// expose how close the sink is to its MaxBufferedBytes ceiling; walPending is
+// the single most important ingest SLI — consumer NumPending is the WAL
+// backlog (events accepted but not yet in the lake), invisible before this:
+// dq's decode lag stays 0 for data that never reached raw_events.
+var (
+	bufferedFootprintGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "din_sink_buffered_footprint_bytes",
+		Help: "Resident bytes held in the sink's accumulation buffer.",
+	}, []string{"sink"})
+	inflightFootprintGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "din_sink_inflight_footprint_bytes",
+		Help: "Resident bytes handed to flush workers but not yet committed+acked.",
+	}, []string{"sink"})
+	walPendingGauge = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "din_wal_pending_messages",
+		Help: "JetStream consumer NumPending: WAL messages not yet delivered to the sink (ingest backlog).",
+	}, []string{"sink"})
+)
+
 // poisonRedeliveryThreshold bounds how many times a message that fails to
 // commit even on its own is redelivered before it is terminated as poison.
 // High enough that a transient writer/catalog outage — each redelivery waits
@@ -130,6 +150,9 @@ type Config struct {
 	// DrainTimeout bounds the shutdown flush. Past it, in-flight commits
 	// are canceled and their messages redeliver (at-least-once holds).
 	DrainTimeout time.Duration
+	// Name labels this sink's metrics (the consumer durable, e.g.
+	// "parquet-sink-p001"); empty = "sink".
+	Name string
 	// FlushTimeout bounds one bundle's commit (WriteBundle + per-event
 	// isolation). Without it, a wedged S3 multipart / catalog commit pins
 	// that writer connection's mutex indefinitely and every bundle round-
@@ -174,6 +197,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.CommitFailureWindow == 0 {
 		c.CommitFailureWindow = 10 * time.Minute
+	}
+	if c.Name == "" {
+		c.Name = "sink"
 	}
 	if c.MaxAgeHard == 0 {
 		c.MaxAgeHard = DefaultMaxAgeHard
@@ -277,6 +303,7 @@ func (s *Sink) Run(ctx context.Context) error {
 	msgs := make(chan jetstream.Msg, s.cfg.FetchBatch)
 	fetchDone := make(chan error, 1)
 	go s.fetchLoop(ctx, msgs, fetchDone)
+	go s.pollWALPending(ctx)
 
 loop:
 	for {
@@ -377,6 +404,31 @@ func (s *Sink) fetchLoop(ctx context.Context, out chan<- jetstream.Msg, done cha
 	}
 }
 
+// walPendingPollInterval paces the NumPending gauge refresh: Consumer.Info is
+// a broker round-trip, so it runs off the hot path at a slow cadence.
+const walPendingPollInterval = 15 * time.Second
+
+// pollWALPending exports the consumer's NumPending — the WAL backlog, the
+// ingest pipeline's most important scale SLI (H3): events JetStream accepted
+// that have not yet been delivered toward the lake. Before this gauge a
+// saturating sink was invisible until redeliveries fired ~an AckWait later.
+func (s *Sink) pollWALPending(ctx context.Context) {
+	t := time.NewTicker(walPendingPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			info, err := s.consumer.Info(ctx)
+			if err != nil {
+				continue // transient broker error; the gauge just goes stale one tick
+			}
+			walPendingGauge.WithLabelValues(s.cfg.Name).Set(float64(info.NumPending))
+		}
+	}
+}
+
 // add decodes one message into the buffer. Undecodable messages are
 // terminated: redelivery cannot fix them and they must not block acks.
 func (s *Sink) add(msg jetstream.Msg) {
@@ -409,6 +461,7 @@ func (s *Sink) add(msg jetstream.Msg) {
 	s.buffer.msgs = append(s.buffer.msgs, msg)
 	s.buffer.bytes += len(msg.Data())
 	s.buffer.footprint += bufferedFootprint(&event, len(msg.Data()))
+	bufferedFootprintGauge.WithLabelValues(s.cfg.Name).Set(float64(s.buffer.footprint))
 }
 
 // bufferedMsgOverhead approximates the fixed per-message resident cost beyond
@@ -474,6 +527,8 @@ func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
 	}
 	s.inflight.Add(int64(job.footprint))
 	s.buffer = nil
+	bufferedFootprintGauge.WithLabelValues(s.cfg.Name).Set(0)
+	inflightFootprintGauge.WithLabelValues(s.cfg.Name).Set(float64(s.inflight.Load()))
 	return true
 }
 
@@ -570,7 +625,7 @@ func (s *Sink) recordCommitFailure() {
 // on the next completion, and there is always a pending completion while
 // inflight is over the ceiling).
 func (s *Sink) flushDone(footprint int) {
-	s.inflight.Add(-int64(footprint))
+	inflightFootprintGauge.WithLabelValues(s.cfg.Name).Set(float64(s.inflight.Add(-int64(footprint))))
 	select {
 	case s.flushed <- struct{}{}:
 	default:

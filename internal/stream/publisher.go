@@ -4,11 +4,42 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/DIMO-Network/cloudevent"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
+
+// Publish outcome/latency metrics (H3): before these, a stalling or rejecting
+// WAL was invisible until sink redeliveries fired minutes later. The duration
+// histogram is the ingest-side ack-latency SLI; the outcome counter separates
+// acks from transient failures (503 to devices) and payload rejections (413).
+var (
+	publishSeconds = promauto.NewHistogram(prometheus.HistogramOpts{
+		Name:    "din_publish_ack_seconds",
+		Help:    "JetStream publish-to-ack latency.",
+		Buckets: []float64{.001, .005, .01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10},
+	})
+	publishOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "din_publish_total",
+		Help: "JetStream publishes by outcome: ok, unavailable (503), too_large (413).",
+	}, []string{"outcome"})
+)
+
+func observePublish(start time.Time, err error) {
+	publishSeconds.Observe(time.Since(start).Seconds())
+	switch {
+	case err == nil:
+		publishOutcomes.WithLabelValues("ok").Inc()
+	case errors.Is(err, ErrPayloadTooLarge):
+		publishOutcomes.WithLabelValues("too_large").Inc()
+	default:
+		publishOutcomes.WithLabelValues("unavailable").Inc()
+	}
+}
 
 // Header names carried on every published message. ce-* duplicate body
 // fields so header-only consumers can route without unmarshaling; the
@@ -53,7 +84,9 @@ func NewPublisher(js jetstream.JetStream, partitions int) *Publisher {
 // Publish sends one validated event and blocks until JetStream acks it or
 // ctx expires. DataIndexKey and VoidsID travel as headers; the body is the
 // RawEvent wire format.
-func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) error {
+func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) (err error) {
+	start := time.Now()
+	defer func() { observePublish(start, err) }()
 	body, err := event.MarshalJSON()
 	if err != nil {
 		return fmt.Errorf("marshaling event %s: %w", event.ID, err)

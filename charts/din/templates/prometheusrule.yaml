@@ -155,6 +155,22 @@ spec:
               publishes once NATS_STREAM_MAX_BYTES is hit). Check catalog
               Postgres health/failover state and S3; pods self-restart every
               CommitFailureWindow to re-pin connections.
+        # WAL backlog (H3): NumPending = events JetStream accepted that the
+        # sink has not consumed yet. Sustained growth means ingest outruns the
+        # lake writer; the DiscardNew MaxBytes backstop eventually turns this
+        # into publish rejections (503s to devices).
+        - alert: DinWALBacklogHigh
+          expr: max by (sink) (din_wal_pending_messages) > 100000
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: WAL backlog over 100k messages ({{ "{{ $labels.sink }}" }})
+            description: >-
+              The sink is not keeping up with ingest; buffered events are
+              accumulating in the NATS WAL. Check din_sink_commit latency /
+              failures and lake writer throughput before the stream MaxBytes
+              backstop starts rejecting publishes.
         # The decodestream bridge retries transient NATS fetch errors with backoff; a
         # sustained rate means it is flapping (and silently restarts every ~60s when the
         # backstop trips), stalling vehicle-triggers downstream.

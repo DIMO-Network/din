@@ -419,7 +419,9 @@ func run(log zerolog.Logger) error {
 		}
 		defer writer.Close() //nolint:errcheck
 		group.Go(func() error {
-			return sink.New(sinkConfig(settings, len(rawStreams)), sinkConsumer, writer, log).Run(gctx)
+			cfg := sinkConfig(settings, len(rawStreams))
+			cfg.Name = durable // labels the sink's buffer/WAL-lag metrics (H3)
+			return sink.New(cfg, sinkConsumer, writer, log).Run(gctx)
 		})
 	}
 

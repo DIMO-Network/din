@@ -42,6 +42,17 @@ type MaintConfig struct {
 	// floor. Must exceed a healthy consumer's reporting gap and stay well
 	// below SnapshotKeep. Zero disables the floor (pure time-based).
 	ConsumerStaleness time.Duration
+	// OrphanRetention is the ducklake_delete_orphaned_files older_than
+	// window. This is the DISASTER-RECOVERY window (B6): after a Postgres
+	// PITR restore to T-Δ, every data file written after T-Δ is an orphan
+	// whose per-file encryption key was in the lost catalog delta — and the
+	// orphan sweep permanently deletes those bytes. The window must exceed
+	// worst-case restore-DETECTION time, not just crash-leftover age; the
+	// only cost of a generous window is transient orphan disk. Negative
+	// disables the step entirely (the post-restore guard: set
+	// LAKE_ORPHAN_RETENTION=-1s while re-registering restored-era files).
+	// See docs/catalog-backup-restore.md.
+	OrphanRetention time.Duration
 }
 
 func (c *MaintConfig) applyDefaults() {
@@ -53,6 +64,9 @@ func (c *MaintConfig) applyDefaults() {
 	}
 	if c.ConsumerStaleness == 0 {
 		c.ConsumerStaleness = time.Hour
+	}
+	if c.OrphanRetention == 0 {
+		c.OrphanRetention = 7 * 24 * time.Hour
 	}
 }
 
@@ -207,11 +221,20 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	} else {
 		steps = append(steps, maintStep{"expire_snapshots", expireSQL})
 	}
+	// Files released by expired snapshots, then crash leftovers.
 	steps = append(steps,
-		// Files released by expired snapshots, then crash leftovers.
-		maintStep{"cleanup_old_files", "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"},
-		maintStep{"delete_orphaned_files", "CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL '1 day')"},
-	)
+		maintStep{"cleanup_old_files", "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"})
+	// Orphan deletion is IRREVERSIBLE byte destruction and, with the catalog
+	// holding the per-file encryption keys, the step that turns a catalog
+	// restore into permanent data loss (B6) — see MaintConfig.OrphanRetention
+	// and docs/catalog-backup-restore.md. Skippable for post-restore recovery.
+	if m.cfg.OrphanRetention >= 0 {
+		steps = append(steps, maintStep{"delete_orphaned_files",
+			fmt.Sprintf("CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL '%d seconds')",
+				int64(m.cfg.OrphanRetention.Seconds()))})
+	} else {
+		m.log.Warn().Msg("orphan-file deletion DISABLED (LAKE_ORPHAN_RETENTION < 0) — re-enable after post-restore recovery completes")
+	}
 
 	for _, step := range steps {
 		if ctx.Err() != nil {

@@ -109,6 +109,11 @@ type Settings struct {
 	// cursor. Must exceed a healthy consumer's reporting gap, stay well
 	// below LakeSnapshotKeep.
 	LakeConsumerStaleness time.Duration // LAKE_CONSUMER_STALENESS
+	// LakeOrphanRetention is the orphan-file deletion window — the
+	// disaster-recovery budget after a catalog restore (B6): orphans younger
+	// than this survive the sweep. Negative disables the sweep (post-restore
+	// guard). Default 7 days (lake.MaintConfig).
+	LakeOrphanRetention time.Duration // LAKE_ORPHAN_RETENTION
 	// LakeWriterConnections is how many pinned DuckDB connections each sink's
 	// writer round-robins bundles across, so several bundles' S3 uploads overlap.
 	// >1 raises per-partition write throughput; the DuckDB pool is sized for it.
@@ -254,6 +259,9 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	if s.LakeConsumerStaleness, err = envDuration("LAKE_CONSUMER_STALENESS", time.Hour); err != nil {
+		return s, err
+	}
+	if s.LakeOrphanRetention, err = envDuration("LAKE_ORPHAN_RETENTION", 7*24*time.Hour); err != nil {
 		return s, err
 	}
 	writerConns, err := envUint("LAKE_WRITER_CONNECTIONS", 2)

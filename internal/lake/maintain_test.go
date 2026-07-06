@@ -126,3 +126,46 @@ func TestMaintainer_RetentionReleasesFiles(t *testing.T) {
 		"SELECT count(*) FROM lake.raw_events").Scan(&n))
 	assert.Equal(t, total, n, "current snapshot survives expiry")
 }
+
+// TestMaintainer_OrphanSweepWindowAndDisable pins the B6 disaster-recovery
+// guard: the orphan sweep must honor LAKE_ORPHAN_RETENTION — a young orphan
+// (inside the window) survives, a negative window disables the sweep entirely
+// (the post-restore freeze), and only an aged-out orphan is destroyed. After a
+// catalog PITR restore, files written past the restore point are exactly such
+// orphans — and with encryption on, deleting them is unrecoverable.
+func TestMaintainer_OrphanSweepWindowAndDisable(t *testing.T) {
+	t.Parallel()
+	l, dataPath := openTestLake(t)
+	ctx := context.Background()
+
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
+	require.NoError(t, w.WriteBundle(ctx, []cloudevent.StoredEvent{testEvent("o-1", "dimo.status", "did:1", ts)}))
+
+	// An unreferenced file in the data path = an orphan, as a post-restore
+	// world would have it.
+	orphan := filepath.Join(dataPath, "orphan-restore-era.parquet")
+	require.NoError(t, os.WriteFile(orphan, []byte("not-in-catalog"), 0o644))
+
+	exists := func() bool {
+		_, err := os.Stat(orphan)
+		return err == nil
+	}
+
+	// Default-shaped window (7d): the young orphan is inside it and survives.
+	m := NewMaintainer(l, MaintConfig{}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+	assert.True(t, exists(), "orphan inside the retention window must survive the sweep")
+
+	// Disabled sweep (post-restore freeze): survives even though it would age out.
+	m = NewMaintainer(l, MaintConfig{OrphanRetention: -time.Second}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+	assert.True(t, exists(), "negative window must skip the sweep entirely")
+
+	// Aged out (tiny window): now — and only now — it is destroyed.
+	m = NewMaintainer(l, MaintConfig{OrphanRetention: time.Nanosecond}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+	assert.False(t, exists(), "orphan past the window is deleted")
+}

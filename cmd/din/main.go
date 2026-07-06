@@ -204,6 +204,7 @@ func maintConfig(settings config.Settings) lake.MaintConfig {
 		Interval:          settings.LakeMaintInterval,
 		SnapshotKeep:      settings.LakeSnapshotKeep,
 		ConsumerStaleness: settings.LakeConsumerStaleness,
+		OrphanRetention:   settings.LakeOrphanRetention,
 	}
 }
 

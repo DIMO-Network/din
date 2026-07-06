@@ -45,6 +45,19 @@ var poisonRows = promauto.NewCounter(prometheus.CounterOpts{
 	Help: "Raw events terminated because the writer could not persist them.",
 })
 
+// commitsTotal / commitFailuresTotal make the sink's write health directly
+// observable (H15/H3): before them the only signal of a dead writer was
+// redeliveries, ~an AckWait late and warning-severity.
+var commitsTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "din_sink_commits_total",
+	Help: "Bundles committed to the lake.",
+})
+
+var commitFailuresTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "din_sink_commit_failures_total",
+	Help: "Bundle commits that failed (before per-event isolation).",
+})
+
 // poisonRedeliveryThreshold bounds how many times a message that fails to
 // commit even on its own is redelivered before it is terminated as poison.
 // High enough that a transient writer/catalog outage — each redelivery waits
@@ -117,6 +130,19 @@ type Config struct {
 	// DrainTimeout bounds the shutdown flush. Past it, in-flight commits
 	// are canceled and their messages redeliver (at-least-once holds).
 	DrainTimeout time.Duration
+	// FlushTimeout bounds one bundle's commit (WriteBundle + per-event
+	// isolation). Without it, a wedged S3 multipart / catalog commit pins
+	// that writer connection's mutex indefinitely and every bundle round-
+	// robined onto it queues behind the wedge (H15). Keep it under the
+	// consumer AckWait so a timed-out bundle redelivers cleanly.
+	FlushTimeout time.Duration
+	// CommitFailureWindow bounds how long EVERY commit may keep failing
+	// before Run returns an error so the pod restarts and re-pins its
+	// writer connections. A catalog failover can poison the pinned conns
+	// permanently (SetConnMaxLifetime cannot recycle a checked-out conn) —
+	// without this backstop the sink grinds redeliveries forever while the
+	// pod sits Ready (H15). Partial isolate commits count as progress.
+	CommitFailureWindow time.Duration
 }
 
 func (c *Config) applyDefaults() {
@@ -142,6 +168,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MinFlushBytes == 0 {
 		c.MinFlushBytes = 16 << 20 // 16 MiB — well above "tiny", well below the 128 MiB target
+	}
+	if c.FlushTimeout == 0 {
+		c.FlushTimeout = 5 * time.Minute // < AckWait (MaxAgeHard+3m), so timeouts redeliver cleanly
+	}
+	if c.CommitFailureWindow == 0 {
+		c.CommitFailureWindow = 10 * time.Minute
 	}
 	if c.MaxAgeHard == 0 {
 		c.MaxAgeHard = DefaultMaxAgeHard
@@ -180,6 +212,15 @@ type Sink struct {
 	// dropped). Buffered to Workers so a worker never blocks signaling.
 	flushed chan struct{}
 
+	// commitFailFirst is the UnixNano of the first commit failure of the
+	// current zero-progress streak (0 = healthy). When the streak spans
+	// CommitFailureWindow, a worker posts to fatal and Run exits so the pod
+	// restarts and re-pins its writer connections (H15).
+	commitFailFirst atomic.Int64
+	// fatal carries the writer-durably-broken error to Run. Buffered so a
+	// worker never blocks reporting it.
+	fatal chan error
+
 	// drainDeadline bounds the whole shutdown flush; set once by Run.
 	drainDeadline time.Time
 }
@@ -213,6 +254,7 @@ func New(cfg Config, consumer jetstream.Consumer, writer BundleWriter, log zerol
 		log:      log.With().Str("component", "sink").Logger(),
 		jobs:     make(chan flushJob, cfg.Workers*8),
 		flushed:  make(chan struct{}, cfg.Workers),
+		fatal:    make(chan error, 1),
 	}
 }
 
@@ -248,6 +290,15 @@ loop:
 			s.applyBackpressure(ctx)
 		case <-ticker.C:
 			s.flushReady(false)
+		case err := <-s.fatal:
+			// The writer has committed NOTHING for CommitFailureWindow —
+			// a failover-poisoned pinned connection never heals in-process
+			// (H15). Stop the workers, return the error so the pod restarts
+			// and re-pins; unacked messages redeliver (at-least-once holds).
+			cancelWorkers()
+			close(s.jobs)
+			s.wg.Wait()
+			return err
 		}
 	}
 	fetchErr := <-fetchDone
@@ -475,14 +526,43 @@ func (s *Sink) worker(ctx context.Context) {
 // re-formed the same failing bundle on every redelivery (SR review #1).
 func (s *Sink) flush(ctx context.Context, job flushJob) {
 	defer s.flushDone(job.footprint)
-	if err := s.writer.WriteBundle(ctx, job.events); err != nil {
+	// Bound the whole commit + isolation: a wedged S3 multipart / catalog
+	// commit otherwise pins this writer connection's mutex indefinitely and
+	// every bundle round-robined onto it queues behind the wedge (H15). A
+	// timed-out bundle's messages stay un-acked and redeliver after AckWait.
+	fctx, cancel := context.WithTimeout(ctx, s.cfg.FlushTimeout)
+	defer cancel()
+	if err := s.writer.WriteBundle(fctx, job.events); err != nil {
+		commitFailuresTotal.Inc()
+		s.recordCommitFailure()
 		s.log.Warn().Err(err).Int("events", len(job.events)).
 			Msg("bundle commit failed; isolating per-event")
-		s.isolate(ctx, job)
+		s.isolate(fctx, job)
 		return
 	}
+	commitsTotal.Inc()
+	s.commitFailFirst.Store(0)
 	s.ackAll(job.msgs)
 	s.log.Info().Int("events", len(job.events)).Msg("bundle committed")
+}
+
+// recordCommitFailure tracks the zero-progress failure streak; when it spans
+// CommitFailureWindow, the sink reports itself durably broken (see Run). Any
+// commit — whole-bundle or an isolate range — clears the streak: a poison-
+// heavy but healthy period must never trip a restart (H15).
+func (s *Sink) recordCommitFailure() {
+	now := time.Now().UnixNano()
+	first := s.commitFailFirst.Load()
+	if first == 0 {
+		s.commitFailFirst.CompareAndSwap(0, now)
+		return
+	}
+	if time.Duration(now-first) >= s.cfg.CommitFailureWindow {
+		select {
+		case s.fatal <- fmt.Errorf("sink committed nothing for %s: writer/catalog durably broken (restart re-pins connections)", s.cfg.CommitFailureWindow):
+		default:
+		}
+	}
 }
 
 // flushDone releases a finished bundle's resident footprint from the inflight
@@ -555,6 +635,7 @@ func (s *Sink) isolateRange(ctx context.Context, job flushJob, lo, hi int, st *i
 	err := s.writer.WriteBundle(ctx, job.events[lo:hi])
 	if err == nil {
 		st.committed += hi - lo
+		s.commitFailFirst.Store(0) // partial progress: the writer is alive (H15)
 		for i := lo; i < hi; i++ {
 			if ackErr := job.msgs[i].Ack(); ackErr != nil {
 				s.log.Warn().Err(ackErr).Msg("ack failed after isolated commit; duplicate rows possible")

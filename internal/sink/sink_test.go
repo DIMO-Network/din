@@ -319,3 +319,47 @@ func TestSink_TransientRowAmongCommittedNotDropped(t *testing.T) {
 	assert.Equal(t, map[string]bool{"good1": true, "good2": true}, ids,
 		"good rows commit; the transient row is neither committed nor dropped")
 }
+
+// TestSink_DurablyBrokenWriterRestartsPod pins the H15 backstop: when EVERY
+// commit fails for CommitFailureWindow (a failover-poisoned pinned catalog
+// connection never heals in-process), Run must return an error so the pod
+// restarts and re-pins its writer connections — instead of grinding
+// redeliveries forever while Ready.
+func TestSink_DurablyBrokenWriterRestartsPod(t *testing.T) {
+	t.Parallel()
+	js, cons := setup(t)
+	writer := &memWriter{}
+	writer.setFail(errors.New("catalog failover: connection poisoned"))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := sink.New(sink.Config{
+		MaxAge:              50 * time.Millisecond,
+		MaxAgeHard:          100 * time.Millisecond,
+		MinFlushBytes:       1,
+		CommitFailureWindow: 300 * time.Millisecond,
+	}, cons, writer, zerolog.Nop())
+
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	// A failed bundle waits for JetStream redelivery (AckWait), so the streak
+	// builds from NEW traffic: keep publishing so fresh bundles keep failing
+	// past the window — exactly the steady-state shape of a poisoned conn.
+	pub := stream.NewPublisher(js, 1)
+	ts := time.Date(2026, 6, 9, 10, 0, 0, 0, time.UTC)
+	go func() {
+		for i := 0; ctx.Err() == nil && i < 200; i++ {
+			_ = pub.Publish(ctx, event(fmt.Sprintf("e-wedge-%d", i), "dimo.status", "did:erc721:137:0xA:1", ts))
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
+
+	select {
+	case err := <-done:
+		require.Error(t, err, "Run must surface the durably-broken writer")
+		assert.Contains(t, err.Error(), "committed nothing")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Run did not trip the commit-failure backstop")
+	}
+}

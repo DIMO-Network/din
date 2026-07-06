@@ -208,8 +208,11 @@ func maintConfig(settings config.Settings) lake.MaintConfig {
 }
 
 // sinkConfig maps the env-tuned sink settings onto sink.Config. Zero values pass
-// through to the sink package's own defaults.
-func sinkConfig(settings config.Settings) sink.Config {
+// through to the sink package's own defaults. podSinks is the number of sinks
+// this process runs (one per WAL partition): the default buffered-memory
+// ceiling is a pod budget divided across them, so raising the partition count
+// cannot multiply pod memory past the container limit (B4).
+func sinkConfig(settings config.Settings, podSinks int) sink.Config {
 	return sink.Config{
 		MaxRowsPerFlush:  int(settings.SinkMaxRowsPerFlush),
 		MaxBytesPerFlush: int(settings.SinkMaxBytesPerFlush),
@@ -218,6 +221,7 @@ func sinkConfig(settings config.Settings) sink.Config {
 		MaxAgeHard:       settings.SinkMaxAgeHard,
 		Workers:          int(settings.SinkWorkers),
 		DrainTimeout:     settings.SinkDrainTimeout,
+		PodSinks:         podSinks,
 	}
 }
 
@@ -413,7 +417,9 @@ func run(log zerolog.Logger) error {
 			return err
 		}
 		defer writer.Close() //nolint:errcheck
-		group.Go(func() error { return sink.New(sinkConfig(settings), sinkConsumer, writer, log).Run(gctx) })
+		group.Go(func() error {
+			return sink.New(sinkConfig(settings, len(rawStreams)), sinkConsumer, writer, log).Run(gctx)
+		})
 	}
 
 	if settings.LakeMaintenanceEnabled {

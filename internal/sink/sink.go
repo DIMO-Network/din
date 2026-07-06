@@ -84,11 +84,20 @@ type Config struct {
 	// size. DuckLake splits each bundle across partitions itself, so a
 	// single buffer needs no per-partition cap.
 	MaxBytesPerFlush int
-	// MaxBufferedBytes is the hard ceiling on un-flushed buffered payload.
-	// When the writer stalls and flush slots fill, the Run loop blocks on
-	// this ceiling so JetStream backpressure propagates instead of the
-	// buffer growing until OOM (SR-8). Defaults to 4x MaxBytesPerFlush.
+	// MaxBufferedBytes is the hard ceiling on RESIDENT buffered memory (not just
+	// payload): a buffered message retains both the raw jetstream.Msg and the
+	// parsed StoredEvent, so it is charged bufferedFootprint bytes, ~2x its
+	// payload. When the writer stalls and flush slots fill, the Run loop blocks on
+	// this ceiling so JetStream backpressure propagates instead of the buffer
+	// growing until OOM (SR-8, B4). Per-SINK: when unset, the 4x MaxBytesPerFlush
+	// default is treated as the POD budget and divided by PodSinks, so the pod
+	// total stays bounded regardless of partition count. An explicit value is
+	// used as-is per sink — size it yourself.
 	MaxBufferedBytes int
+	// PodSinks is how many sibling sinks this process runs (one per WAL
+	// partition). Only used to divide the default MaxBufferedBytes pod budget;
+	// zero means 1.
+	PodSinks int
 	// MaxAge is the soft age trigger: flush a buffer this old only once it has
 	// accumulated at least MinFlushBytes, so a low-traffic partition doesn't emit
 	// a tiny Parquet file every MaxAge. MaxAgeHard is the hard cap.
@@ -119,8 +128,14 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxBufferedBytes == 0 {
 		// Headroom for normal bursts above the flush size, but a firm cap so
-		// a stalled writer can't grow the buffer without bound.
+		// a stalled writer can't grow the buffer without bound. The default is
+		// a POD budget: a process running one sink per WAL partition divides
+		// it across PodSinks siblings so pod-total resident buffer memory
+		// stays 4x MaxBytesPerFlush regardless of partition count (B4).
 		c.MaxBufferedBytes = 4 * c.MaxBytesPerFlush
+		if c.PodSinks > 1 {
+			c.MaxBufferedBytes /= c.PodSinks
+		}
 	}
 	if c.MaxAge == 0 {
 		c.MaxAge = time.Minute
@@ -170,16 +185,22 @@ type Sink struct {
 }
 
 type eventBuffer struct {
-	events  []cloudevent.StoredEvent
-	msgs    []jetstream.Msg
-	bytes   int
-	firstAt time.Time
+	events []cloudevent.StoredEvent
+	msgs   []jetstream.Msg
+	// bytes is payload (wire) bytes — it drives the flush-size triggers,
+	// which target parquet output size. footprint is estimated RESIDENT
+	// bytes (raw msg + parsed copy + overhead) — it drives the
+	// MaxBufferedBytes backpressure ceiling, which bounds pod memory (B4).
+	bytes     int
+	footprint int
+	firstAt   time.Time
 }
 
 type flushJob struct {
-	events []cloudevent.StoredEvent
-	msgs   []jetstream.Msg
-	bytes  int
+	events    []cloudevent.StoredEvent
+	msgs      []jetstream.Msg
+	bytes     int
+	footprint int
 }
 
 // New constructs a Sink reading from consumer and committing via writer.
@@ -336,6 +357,24 @@ func (s *Sink) add(msg jetstream.Msg) {
 	s.buffer.events = append(s.buffer.events, event)
 	s.buffer.msgs = append(s.buffer.msgs, msg)
 	s.buffer.bytes += len(msg.Data())
+	s.buffer.footprint += bufferedFootprint(&event, len(msg.Data()))
+}
+
+// bufferedMsgOverhead approximates the fixed per-message resident cost beyond
+// the payload copies: jetstream.Msg internals (subject/reply strings, header
+// map, metadata) plus the StoredEvent struct and its decoded header-string
+// copies.
+const bufferedMsgOverhead = 512
+
+// bufferedFootprint estimates the resident memory one buffered message pins.
+// The buffer retains BOTH the raw jetstream.Msg (its Data slice) AND the
+// parsed StoredEvent, whose Data json.RawMessage is a second copy of the
+// payload — so a buffered message costs ~2x its wire size, not 1x. The
+// MaxBufferedBytes ceiling gates on this, not on payload bytes: counting only
+// len(msg.Data()) let a writer stall hold ~2.5x the configured ceiling and
+// OOMKill the pod in exactly the scenario backpressure exists for (B4).
+func bufferedFootprint(ev *cloudevent.StoredEvent, msgLen int) int {
+	return msgLen + len(ev.Data) + bufferedMsgOverhead
 }
 
 // flushReady enqueues the buffer once it hits a trigger (or always when
@@ -362,7 +401,7 @@ func (s *Sink) flushReady(force bool) {
 // the shutdown drain (block=true) waits up to the drain deadline so a
 // wedged writer can't hang exit — whatever doesn't flush redelivers.
 func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
-	job := flushJob{events: buf.events, msgs: buf.msgs, bytes: buf.bytes}
+	job := flushJob{events: buf.events, msgs: buf.msgs, bytes: buf.bytes, footprint: buf.footprint}
 	if block {
 		wait := time.Until(s.drainDeadline)
 		if wait <= 0 {
@@ -382,7 +421,7 @@ func (s *Sink) enqueue(buf *eventBuffer, block bool) bool {
 			return false
 		}
 	}
-	s.inflight.Add(int64(job.bytes))
+	s.inflight.Add(int64(job.footprint))
 	s.buffer = nil
 	return true
 }
@@ -400,7 +439,7 @@ func (s *Sink) applyBackpressure(ctx context.Context) {
 	for {
 		bufBytes := 0
 		if s.buffer != nil {
-			bufBytes = s.buffer.bytes
+			bufBytes = s.buffer.footprint
 		}
 		if bufBytes+int(s.inflight.Load()) < s.cfg.MaxBufferedBytes {
 			return
@@ -435,7 +474,7 @@ func (s *Sink) worker(ctx context.Context) {
 // unpersistable (no MaxDeliver, no Term on this path), since the bad row
 // re-formed the same failing bundle on every redelivery (SR review #1).
 func (s *Sink) flush(ctx context.Context, job flushJob) {
-	defer s.flushDone(job.bytes)
+	defer s.flushDone(job.footprint)
 	if err := s.writer.WriteBundle(ctx, job.events); err != nil {
 		s.log.Warn().Err(err).Int("events", len(job.events)).
 			Msg("bundle commit failed; isolating per-event")
@@ -446,12 +485,12 @@ func (s *Sink) flush(ctx context.Context, job flushJob) {
 	s.log.Info().Int("events", len(job.events)).Msg("bundle committed")
 }
 
-// flushDone releases a finished bundle's bytes from the inflight tally and wakes
-// applyBackpressure (non-blocking — a missed wake is re-checked on the next
-// completion, and there is always a pending completion while inflight is over
-// the ceiling).
-func (s *Sink) flushDone(bytes int) {
-	s.inflight.Add(-int64(bytes))
+// flushDone releases a finished bundle's resident footprint from the inflight
+// tally and wakes applyBackpressure (non-blocking — a missed wake is re-checked
+// on the next completion, and there is always a pending completion while
+// inflight is over the ceiling).
+func (s *Sink) flushDone(footprint int) {
+	s.inflight.Add(-int64(footprint))
 	select {
 	case s.flushed <- struct{}{}:
 	default:

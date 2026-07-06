@@ -176,7 +176,7 @@ func TestApplyBackpressure_BlocksOverCeilingUntilCtxDone(t *testing.T) {
 		jobs:    make(chan flushJob), // unbuffered, no worker draining → no free slot
 		flushed: make(chan struct{}, 1),
 	}
-	s.buffer = &eventBuffer{events: []cloudevent.StoredEvent{{}}, bytes: 200} // over ceiling
+	s.buffer = &eventBuffer{events: []cloudevent.StoredEvent{{}}, footprint: 200} // over ceiling (ceiling gates on resident footprint, B4)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -202,7 +202,7 @@ func TestApplyBackpressure_BlocksOverCeilingUntilCtxDone(t *testing.T) {
 // Under the ceiling it is a no-op even with no free flush slot.
 func TestApplyBackpressure_NoopUnderCeiling(t *testing.T) {
 	s := &Sink{cfg: Config{MaxBufferedBytes: 1000}, jobs: make(chan flushJob), flushed: make(chan struct{}, 1)}
-	s.buffer = &eventBuffer{bytes: 10}
+	s.buffer = &eventBuffer{footprint: 10}
 
 	done := make(chan struct{})
 	go func() { s.applyBackpressure(context.Background()); close(done) }()
@@ -222,13 +222,13 @@ func TestApplyBackpressure_HandsOffThenReturnsOnDrain(t *testing.T) {
 		jobs:    make(chan flushJob, 1), // one free slot
 		flushed: make(chan struct{}, 1),
 	}
-	s.buffer = &eventBuffer{events: []cloudevent.StoredEvent{{}}, bytes: 200}
+	s.buffer = &eventBuffer{events: []cloudevent.StoredEvent{{}}, footprint: 200}
 
 	// A worker drains the handed-off bundle and reports completion (inflight drops
 	// back under the ceiling), letting applyBackpressure return.
 	go func() {
 		job := <-s.jobs
-		s.flushDone(job.bytes)
+		s.flushDone(job.footprint)
 	}()
 
 	s.applyBackpressure(context.Background()) // owns s.buffer; the worker only touches jobs/inflight/flushed
@@ -266,5 +266,94 @@ func TestApplyBackpressure_GatesOnQueueNotJustBuffer(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("did not return after the queue drained under the ceiling")
+	}
+}
+
+// The MaxBufferedBytes ceiling gates on RESIDENT memory, not payload bytes: a
+// buffered message pins both the raw jetstream.Msg and the parsed StoredEvent
+// (a second copy of the payload), so charging only len(msg.Data()) let a
+// writer stall hold ~2.5x the ceiling and OOMKill the pod instead of
+// backpressuring (B4).
+func TestBufferedFootprint_ChargesBothCopiesPlusOverhead(t *testing.T) {
+	payload := make([]byte, 1000)
+	ev := cloudevent.StoredEvent{}
+	ev.Data = payload
+
+	got := bufferedFootprint(&ev, 1200) // wire msg is payload + envelope
+	want := 1200 + 1000 + bufferedMsgOverhead
+	if got != want {
+		t.Fatalf("bufferedFootprint = %d, want %d (msg copy + parsed Data copy + overhead)", got, want)
+	}
+	if got <= 1200 {
+		t.Fatal("footprint must exceed payload bytes — the B4 undercount")
+	}
+}
+
+// enqueue charges the job's footprint to inflight and flushDone releases the
+// same amount — asymmetric accounting here drifts the gauge and either wedges
+// backpressure permanently or disables it.
+func TestEnqueueFlushDone_FootprintSymmetric(t *testing.T) {
+	s := &Sink{
+		cfg:     Config{MaxBufferedBytes: 1 << 20},
+		jobs:    make(chan flushJob, 1),
+		flushed: make(chan struct{}, 1),
+	}
+	s.buffer = &eventBuffer{events: []cloudevent.StoredEvent{{}}, bytes: 100, footprint: 750}
+
+	if !s.enqueue(s.buffer, false) {
+		t.Fatal("enqueue failed with a free slot")
+	}
+	if got := s.inflight.Load(); got != 750 {
+		t.Fatalf("inflight charged %d, want the job footprint 750", got)
+	}
+	job := <-s.jobs
+	s.flushDone(job.footprint)
+	if got := s.inflight.Load(); got != 0 {
+		t.Fatalf("inflight = %d after release, want 0 (no drift)", got)
+	}
+}
+
+// Flush-size triggers stay PAYLOAD-driven (they size the parquet output);
+// only the backpressure ceiling uses resident footprint. A buffer whose
+// footprint exceeds MaxBytesPerFlush but whose payload does not must keep
+// accumulating.
+func TestFlushReady_TriggersOnPayloadNotFootprint(t *testing.T) {
+	s := &Sink{
+		cfg:     Config{MaxRowsPerFlush: 1000, MaxBytesPerFlush: 1000, MaxAge: time.Hour, MaxAgeHard: time.Hour, MinFlushBytes: 1},
+		jobs:    make(chan flushJob, 1),
+		flushed: make(chan struct{}, 1),
+	}
+	s.buffer = &eventBuffer{
+		events:    []cloudevent.StoredEvent{{}},
+		bytes:     500,  // under the flush threshold
+		footprint: 1500, // resident is over it — must NOT trigger a flush
+		firstAt:   time.Now(),
+	}
+	s.flushReady(false)
+	if s.buffer == nil {
+		t.Fatal("flushed on footprint; flush sizing must follow payload bytes")
+	}
+
+	s.buffer.bytes = 1000 // payload reaches the threshold
+	s.flushReady(false)
+	if s.buffer != nil {
+		t.Fatal("did not flush once payload hit MaxBytesPerFlush")
+	}
+}
+
+// The default MaxBufferedBytes is a POD budget: a process running one sink per
+// WAL partition divides it across PodSinks so raising the partition count
+// cannot multiply pod memory (B4). An explicit ceiling is used as-is.
+func TestApplyDefaults_DividesPodBudgetAcrossSinks(t *testing.T) {
+	c := Config{PodSinks: 4}
+	c.applyDefaults()
+	if want := 4 * c.MaxBytesPerFlush / 4; c.MaxBufferedBytes != want {
+		t.Fatalf("MaxBufferedBytes = %d, want pod budget divided by PodSinks = %d", c.MaxBufferedBytes, want)
+	}
+
+	explicit := Config{PodSinks: 4, MaxBufferedBytes: 999}
+	explicit.applyDefaults()
+	if explicit.MaxBufferedBytes != 999 {
+		t.Fatalf("explicit MaxBufferedBytes overridden: %d", explicit.MaxBufferedBytes)
 	}
 }

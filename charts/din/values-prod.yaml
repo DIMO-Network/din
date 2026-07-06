@@ -31,7 +31,7 @@ env:
   # Postgres catalog holds the per-file keys, so its backup is data-critical.
   # The catalog DSN secret should also use sslmode=verify-full now that the
   # catalog is the trust root.
-  LAKE_ENCRYPTION_ENABLED: 'true'
+  LAKE_ENCRYPTION_ENABLED: 'false'
   # Customer-managed KMS key ARN for SSE-KMS on blob + Parquet writes. Set the
   # prod key ARN here (or via overlay/secret); empty falls back to the bucket
   # default (SSE-S3).

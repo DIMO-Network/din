@@ -77,7 +77,10 @@ env:
   # catalog access. The Postgres catalog is the trust root once this is on — its
   # backup is now data-critical (lose the keys, lose the data). Set before the
   # first write; treat as fixed for a catalog's lifetime.
-  LAKE_ENCRYPTION_ENABLED: 'true'
+  # DISABLED BY DEFAULT: enabling is an explicit opt-in, gated on verified
+  # Postgres catalog PITR backups (catalog loss = lake loss once on) and the
+  # blob key secret existing in secretsmanager. Flip here + in dq together.
+  LAKE_ENCRYPTION_ENABLED: 'false'
   # S3_KMS_KEY_ID adds SSE-KMS (server-side, AWS-held key, CloudTrail audited) to
   # both the blob PutObject and DuckLake's Parquet writes, with an S3 Bucket Key
   # to cut KMS request cost. Empty leaves the bucket default (SSE-S3) in place.

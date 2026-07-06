@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"fmt"
 	"github.com/DIMO-Network/cloudevent"
+	"github.com/DIMO-Network/din/internal/lake"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/rs/zerolog"
 )
@@ -380,4 +382,72 @@ func TestApplyDefaults_DividesPodBudgetAcrossSinks(t *testing.T) {
 	if explicit.MaxBufferedBytes != 999 {
 		t.Fatalf("explicit MaxBufferedBytes overridden: %d", explicit.MaxBufferedBytes)
 	}
+}
+
+// termMsg records Term/Ack so tests can assert the isolate leaf's decision.
+type termMsg struct {
+	jetstream.Msg
+	delivered uint64
+	termed    bool
+	acked     bool
+}
+
+func (m *termMsg) Metadata() (*jetstream.MsgMetadata, error) {
+	return &jetstream.MsgMetadata{NumDelivered: m.delivered}, nil
+}
+func (m *termMsg) Term() error { m.termed = true; return nil }
+func (m *termMsg) Ack() error  { m.acked = true; return nil }
+
+// TestIsolate_OutageNeverTermsHealthyRows pins the round-2 CRITICAL: during a
+// global writer/catalog outage, redelivery count alone must NEVER Term
+// (permanently destroy) a single-row leaf — NumDelivered keeps rising on
+// healthy, already-HTTP-200-acknowledged events for the whole outage and
+// survives pod restarts. Terming on count requires EVIDENCE the writer is
+// alive: a sibling range committed in the same pass (st.committed > 0), or
+// the writer deterministically tagged the row (ErrPoisonRow).
+func TestIsolate_OutageNeverTermsHealthyRows(t *testing.T) {
+	ctx := context.Background()
+
+	newJob := func(delivered uint64) (flushJob, *termMsg) {
+		msg := &termMsg{delivered: delivered}
+		return flushJob{
+			events: []cloudevent.StoredEvent{{}},
+			msgs:   []jetstream.Msg{msg},
+		}, msg
+	}
+
+	// Global outage: every write fails transiently, nothing has committed.
+	// Even at 10x the poison threshold, the row must survive for redelivery.
+	s := &Sink{cfg: Config{}, writer: &countingFailWriter{}, log: zerolog.Nop()}
+	job, msg := newJob(poisonRedeliveryThreshold * 10)
+	s.isolateRange(ctx, job, 0, 1, &isolateState{})
+	if msg.termed {
+		t.Fatal("outage + high redelivery count Term'd a healthy row — permanent data loss regression")
+	}
+	if msg.acked {
+		t.Fatal("failed row must stay un-acked for redelivery")
+	}
+
+	// Writer provably alive (a sibling committed this pass): the same row
+	// failing alone past the threshold IS evidence it can't be persisted.
+	job, msg = newJob(poisonRedeliveryThreshold)
+	s.isolateRange(ctx, job, 0, 1, &isolateState{committed: 1})
+	if !msg.termed {
+		t.Fatal("threshold-exceeded row with a live writer must be quarantined")
+	}
+
+	// Deterministic tag Terms regardless of outage state.
+	job, msg = newJob(1)
+	poison := &Sink{cfg: Config{}, writer: poisonWriter{}, log: zerolog.Nop()}
+	poison.isolateRange(ctx, job, 0, 1, &isolateState{})
+	if !msg.termed {
+		t.Fatal("ErrPoisonRow-tagged row must be quarantined even with committed == 0")
+	}
+}
+
+// poisonWriter always rejects with the deterministic poison tag.
+type poisonWriter struct{}
+
+func (poisonWriter) WriteBundle(context.Context, []cloudevent.StoredEvent) error {
+	return fmt.Errorf("bad row: %w", lake.ErrPoisonRow)
 }

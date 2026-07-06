@@ -12,6 +12,12 @@ env:
   # autoscaling.maxReplicas — the deployment guard enforces it. Changing this
   # re-partitions the stream: follow the runbook.
   NATS_STREAM_PARTITIONS: '2'
+  # Per-partition WAL backstop (H12). The stream is DiscardNew: at this bound
+  # publishes are REJECTED (devices get 503 + Retry-After and retry) instead of
+  # NATS silently dropping the oldest un-persisted events. Size: broker volume
+  # / partitions with headroom; 100GiB/partition ≈ 2+ hours of full-firehose
+  # sink outage at 10x today's traffic before ingest pushes back.
+  NATS_STREAM_MAX_BYTES: '107374182400'
   DIMO_REGISTRY_CHAIN_ID: 137
   VEHICLE_NFT_ADDRESS: '0xbA5738a18d83D41847dfFbDC6101d37C69c9B0cF'
   AFTERMARKET_NFT_ADDRESS: '0x9c94C395cBcBDe662235E0A9d3bB87Ad708561BA'

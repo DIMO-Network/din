@@ -192,3 +192,68 @@ func TestPartitionedStreams_RouteBySubjectHash(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, msg.Ack())
 }
+
+// TestEnsureStreams_WALRejectsNewWhenFull pins the H12 discard policy: the WAL
+// must REJECT publishes at the MaxBytes backstop (devices retry on 503), never
+// silently drop the oldest un-persisted events (the JetStream DiscardOld
+// default — data loss disguised as healthy publishing).
+func TestEnsureStreams_WALRejectsNewWhenFull(t *testing.T) {
+	t.Parallel()
+	js := newJetStream(t)
+	ctx := context.Background()
+
+	cfg := stream.DefaultConfig()
+	cfg.MaxBytes = 1024 // tiny backstop
+	streams, err := stream.EnsureStreams(ctx, js, cfg)
+	require.NoError(t, err)
+	info, err := streams[0].Info(ctx)
+	require.NoError(t, err)
+	require.Equal(t, jetstream.DiscardNew, info.Config.Discard, "WAL must be DiscardNew")
+
+	// Fill past the backstop: early publishes land, then publishes FAIL —
+	// and the earliest message is still there (nothing silently dropped).
+	var rejected bool
+	for i := range 100 {
+		_, err := js.Publish(ctx, "in.raw.dimo.status.did1", []byte(fmt.Sprintf("payload-%03d-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", i)))
+		if err != nil {
+			rejected = true
+			break
+		}
+	}
+	require.True(t, rejected, "publishes past MaxBytes must be rejected, not absorbed by discarding old data")
+
+	info, err = streams[0].Info(ctx)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, info.State.FirstSeq, "oldest WAL message survives — DiscardOld would have dropped it")
+}
+
+// TestEnsureStreams_RefusesStaleLayout pins the rescale guard: leftover
+// streams from a different NATS_STREAM_PARTITIONS layout must fail boot with
+// an actionable error (drain + delete per docs/wal-partition-rescale.md), not
+// CrashLoop on subject overlap (grow) or silently strand a backlog (shrink).
+func TestEnsureStreams_RefusesStaleLayout(t *testing.T) {
+	t.Parallel()
+	js := newJetStream(t)
+	ctx := context.Background()
+
+	// Old single-stream layout exists (broad subject)…
+	_, err := stream.EnsureStreams(ctx, js, stream.DefaultConfig())
+	require.NoError(t, err)
+
+	// …growing to 2 partitions must refuse, naming the stale stream.
+	grown := stream.DefaultConfig()
+	grown.Partitions = 2
+	_, err = stream.EnsureStreams(ctx, js, grown)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "INGEST_RAW", "error names the stale stream")
+	require.Contains(t, err.Error(), "wal-partition-rescale", "error points at the runbook")
+
+	// Fresh server: 2-partition layout, then shrinking to 1 must refuse too
+	// (INGEST_RAW_P001's backlog would be stranded).
+	js2 := newJetStream(t)
+	_, err = stream.EnsureStreams(ctx, js2, grown)
+	require.NoError(t, err)
+	_, err = stream.EnsureStreams(ctx, js2, stream.DefaultConfig())
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "INGEST_RAW_P00", "error names the stranded partition stream")
+}

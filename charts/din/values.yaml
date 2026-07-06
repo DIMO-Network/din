@@ -167,6 +167,14 @@ certificate:
 # Size of the emptyDir backing DUCKDB_TEMP_DIRECTORY (DuckDB spill). Only mounted
 # when env.DUCKDB_TEMP_DIRECTORY is set. Raise for deep-history maintenance merges.
 duckdbTempSizeLimit: 5Gi
+# Optional ExternalSecret entries. A remoteRef whose secretsmanager key does
+# not exist fails the WHOLE secret sync and blocks pod start, so optional keys
+# are flag-gated instead of requiring placeholder values. Flip
+# blobEncryptionKey to true (together with dq's) once the real key exists at
+# <namespace>/din/blob_encryption_key — part of the encryption enablement
+# checklist alongside LAKE_ENCRYPTION_ENABLED.
+secrets:
+  blobEncryptionKey: false
 resources:
   limits:
     cpu: '1'

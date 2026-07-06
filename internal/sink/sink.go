@@ -180,10 +180,22 @@ func (c *Config) applyDefaults() {
 		// a stalled writer can't grow the buffer without bound. The default is
 		// a POD budget: a process running one sink per WAL partition divides
 		// it across PodSinks siblings so pod-total resident buffer memory
-		// stays 4x MaxBytesPerFlush regardless of partition count (B4).
+		// stays bounded as the partition count grows (B4).
 		c.MaxBufferedBytes = 4 * c.MaxBytesPerFlush
 		if c.PodSinks > 1 {
 			c.MaxBufferedBytes /= c.PodSinks
+		}
+		// Pipelining floor: the ceiling is RESIDENT footprint (~2x payload),
+		// so one full flush bundle costs ~2x MaxBytesPerFlush against it. If
+		// the divided budget drops below one in-flight bundle plus an
+		// accumulating half, applyBackpressure force-enqueues partial buffers
+		// long before the flush trigger — commits serialize behind a single
+		// in-flight bundle and every parquet file shrinks, so scaling
+		// partitions UP would scale per-sink throughput DOWN. Never divide
+		// below 3x MaxBytesPerFlush; past ~2 sinks the pod's memory limit must
+		// grow with the partition count instead (see values-prod arithmetic).
+		if floor := 3 * c.MaxBytesPerFlush; c.MaxBufferedBytes < floor {
+			c.MaxBufferedBytes = floor
 		}
 	}
 	if c.MaxAge == 0 {
@@ -478,7 +490,10 @@ const bufferedMsgOverhead = 512
 // len(msg.Data()) let a writer stall hold ~2.5x the configured ceiling and
 // OOMKill the pod in exactly the scenario backpressure exists for (B4).
 func bufferedFootprint(ev *cloudevent.StoredEvent, msgLen int) int {
-	return msgLen + len(ev.Data) + bufferedMsgOverhead
+	// A binary wire payload parses into DataBase64 (Data stays empty) — count
+	// whichever copy the StoredEvent actually retains, or the ceiling
+	// undercounts binary-heavy traffic back toward the pre-B4 hole.
+	return msgLen + len(ev.Data) + len(ev.DataBase64) + bufferedMsgOverhead
 }
 
 // flushReady enqueues the buffer once it hits a trigger (or always when

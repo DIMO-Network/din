@@ -287,6 +287,14 @@ func TestBufferedFootprint_ChargesBothCopiesPlusOverhead(t *testing.T) {
 	if got <= 1200 {
 		t.Fatal("footprint must exceed payload bytes — the B4 undercount")
 	}
+
+	// Binary wire payloads parse into DataBase64 with Data empty — the second
+	// copy must still be charged.
+	bin := cloudevent.StoredEvent{}
+	bin.DataBase64 = string(make([]byte, 1400))
+	if got := bufferedFootprint(&bin, 1500); got != 1500+1400+bufferedMsgOverhead {
+		t.Fatalf("bufferedFootprint(base64) = %d, must charge the DataBase64 copy", got)
+	}
 }
 
 // enqueue charges the job's footprint to inflight and flushDone releases the
@@ -345,10 +353,26 @@ func TestFlushReady_TriggersOnPayloadNotFootprint(t *testing.T) {
 // WAL partition divides it across PodSinks so raising the partition count
 // cannot multiply pod memory (B4). An explicit ceiling is used as-is.
 func TestApplyDefaults_DividesPodBudgetAcrossSinks(t *testing.T) {
-	c := Config{PodSinks: 4}
+	c := Config{PodSinks: 2}
 	c.applyDefaults()
-	if want := 4 * c.MaxBytesPerFlush / 4; c.MaxBufferedBytes != want {
-		t.Fatalf("MaxBufferedBytes = %d, want pod budget divided by PodSinks = %d", c.MaxBufferedBytes, want)
+	// P=2 divides cleanly: 4x/2 = 2x... but the pipelining floor (3x) wins —
+	// the footprint-denominated ceiling must fit one in-flight bundle (~2x
+	// payload) plus an accumulating half, or partial buffers force-flush and
+	// commits serialize behind a single bundle (adversarial review #1).
+	if want := 3 * c.MaxBytesPerFlush; c.MaxBufferedBytes != want {
+		t.Fatalf("MaxBufferedBytes = %d, want the 3x pipelining floor = %d", c.MaxBufferedBytes, want)
+	}
+
+	one := Config{PodSinks: 1}
+	one.applyDefaults()
+	if want := 4 * one.MaxBytesPerFlush; one.MaxBufferedBytes != want {
+		t.Fatalf("single sink keeps the full pod budget, got %d want %d", one.MaxBufferedBytes, want)
+	}
+
+	many := Config{PodSinks: 8}
+	many.applyDefaults()
+	if want := 3 * many.MaxBytesPerFlush; many.MaxBufferedBytes != want {
+		t.Fatalf("deep division must clamp at the pipelining floor, got %d want %d", many.MaxBufferedBytes, want)
 	}
 
 	explicit := Config{PodSinks: 4, MaxBufferedBytes: 999}

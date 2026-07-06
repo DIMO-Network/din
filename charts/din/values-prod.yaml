@@ -66,12 +66,15 @@ certificate:
   commonName: din.dimo.zone
   issuer: cas-prod-dimo-ca-issuer
   caConfigMap: cae-prod-dimo-ca-certs
-# Pod memory arithmetic (B4): sink buffered ceiling is a POD budget of
-# 4 x SINK_MAX_BYTES_PER_FLUSH (default 4 x 128MiB = 512MiB RESIDENT bytes —
-# the accounting charges both the raw msg and the parsed copy, ~2x payload),
-# divided across the NATS_STREAM_PARTITIONS sinks this pod runs. Total:
-# 512MiB buffers + 1GB DUCKDB_MEMORY_LIMIT + Go runtime/headroom ~400MiB
-# < 2Gi limit. Raising partitions does NOT raise this — the budget divides.
+# Pod memory arithmetic (B4): the sink buffered ceiling bounds RESIDENT bytes
+# (the accounting charges both the raw msg and the parsed copy, ~2x payload).
+# Default per sink = max(4 x SINK_MAX_BYTES_PER_FLUSH / partitions,
+# 3 x SINK_MAX_BYTES_PER_FLUSH) — the 3x floor keeps one full bundle in
+# flight plus an accumulating half, or commits serialize and files shrink.
+# At partitions=2: 2 sinks x 384MiB = 768MiB ceiling + 1GB
+# DUCKDB_MEMORY_LIMIT + runtime — the ceiling only fills during a writer
+# STALL (steady state flushes far below it), so 2Gi holds; raising
+# partitions past 2 must raise this limit with them (~+384MiB per sink).
 resources:
   limits:
     cpu: '2'

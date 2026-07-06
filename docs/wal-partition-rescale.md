@@ -40,3 +40,15 @@ cheap.
   the read-path dedup collapses them.
 - `NATS_STREAM_MAX_BYTES` is per partition — re-derive it when N changes
   (broker volume / N, with headroom).
+
+## Grow without drain (N→2N with all old streams surviving)
+
+Growing the count such that every OLD stream name survives (e.g. 2→4) passes
+the boot guard by design: partition FILTERS are count-independent
+(`in.raw.*.*.p00i` — the token is baked at publish time), so survivors are
+byte-identical and nothing is rewritten or stranded. Messages published under
+the old layout drain from their original streams; the only effect is a brief
+cross-partition ordering skew for vehicles whose hash moved, lasting until the
+old-token backlog drains (seconds at normal lag). The full drain procedure
+above is still the clean path; skipping it on a pure grow is safe for data,
+not for strict per-vehicle ordering during the transition.

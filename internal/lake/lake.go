@@ -388,18 +388,32 @@ func (l *Lake) reassertLayout(ctx context.Context) error {
 	if paused, err := l.backfillPauseActive(ctx); err == nil && paused {
 		return nil
 	}
+	// Check the two layout specs INDEPENDENTLY: the layout is applied as two
+	// separate auto-committed ALTERs, so a transient failure between them
+	// (cross-pod catalog race) can leave PARTITIONED applied but SORTED not.
+	// A partition-only check would then return early forever and the sort
+	// spec would never be re-asserted — every later Parquet file written
+	// unsorted, silently defeating the (subject,"time") layout. Re-assert
+	// exactly the missing piece (re-ALTERing an active spec is the
+	// schema-version-churn hazard the layout gating exists to avoid).
 	partitioned, err := l.isPartitioned(ctx)
 	if err != nil {
-		// Can't tell — re-assert defensively (idempotent) rather than risk
-		// leaving a reset unfixed.
+		// Can't tell — re-assert defensively rather than risk leaving a
+		// reset unfixed.
 		partitioned = false
 	}
-	if partitioned {
-		return nil
+	sorted, err := l.isSorted(ctx)
+	if err != nil {
+		sorted = false
 	}
-	for _, q := range rawEventsLayout {
-		if _, err := l.db.ExecContext(ctx, q); err != nil {
-			return fmt.Errorf("lake re-assert layout %q: %w", q, err)
+	if !partitioned {
+		if _, err := l.db.ExecContext(ctx, rawEventsLayout[0]); err != nil {
+			return fmt.Errorf("lake re-assert layout %q: %w", rawEventsLayout[0], err)
+		}
+	}
+	if !sorted {
+		if _, err := l.db.ExecContext(ctx, rawEventsLayout[1]); err != nil {
+			return fmt.Errorf("lake re-assert layout %q: %w", rawEventsLayout[1], err)
 		}
 	}
 	return nil
@@ -475,6 +489,21 @@ func (l *Lake) isPartitioned(ctx context.Context) (bool, error) {
 		JOIN __ducklake_metadata_lake.ducklake_partition_info pi ON pc.partition_id = pi.partition_id
 		WHERE pi.end_snapshot IS NULL
 		  AND pi.table_id = (SELECT table_id FROM ducklake_table_info('lake') WHERE table_name = ?)`,
+		RawTable).Scan(&ok)
+	return ok, err
+}
+
+// isSorted reports whether raw_events currently has an active SORTED BY spec
+// (ducklake_sort_info row with end_snapshot IS NULL). Checked separately from
+// the partition spec because the two ALTERs commit independently — see
+// reassertLayout.
+func (l *Lake) isSorted(ctx context.Context) (bool, error) {
+	var ok bool
+	err := l.db.QueryRowContext(ctx, `
+		SELECT count(*) > 0
+		FROM __ducklake_metadata_lake.ducklake_sort_info
+		WHERE end_snapshot IS NULL
+		  AND table_id = (SELECT table_id FROM ducklake_table_info('lake') WHERE table_name = ?)`,
 		RawTable).Scan(&ok)
 	return ok, err
 }

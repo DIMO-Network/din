@@ -337,3 +337,41 @@ func TestWriter_ConcurrentBundles(t *testing.T) {
 		"SELECT count(*) FROM lake.raw_events").Scan(&n))
 	assert.Equal(t, 10, n)
 }
+
+// TestReassertLayout_RestoresSortIndependently pins the partial-apply hole:
+// the two layout ALTERs commit independently, so PARTITIONED can be active
+// while SORTED was lost (transient failure between them, or a reset). A
+// partition-only check would return early forever; reassertLayout must detect
+// and restore the missing sort spec on its own.
+func TestReassertLayout_RestoresSortIndependently(t *testing.T) {
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+
+	// Drop ONLY the sort spec, keeping the partition spec active.
+	_, err := l.DB().ExecContext(ctx, `ALTER TABLE lake.raw_events RESET SORTED BY`)
+	if err != nil {
+		t.Skipf("RESET SORTED BY unsupported by this ducklake build: %v", err)
+	}
+	sorted, err := l.isSorted(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sorted {
+		t.Fatal("precondition: sort spec still active after RESET")
+	}
+	part, err := l.isPartitioned(ctx)
+	if err != nil || !part {
+		t.Fatalf("precondition: partition spec must remain active (err=%v)", err)
+	}
+
+	if err := l.reassertLayout(ctx); err != nil {
+		t.Fatal(err)
+	}
+	sorted, err = l.isSorted(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sorted {
+		t.Fatal("reassertLayout did not restore the lost sort spec")
+	}
+}

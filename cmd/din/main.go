@@ -421,6 +421,16 @@ func run(log zerolog.Logger) error {
 		group.Go(func() error {
 			cfg := sinkConfig(settings, len(rawStreams))
 			cfg.Name = durable // labels the sink's buffer/WAL-lag metrics (H3)
+			// FlushTimeout must stay under AckWait (both derived here, not in
+			// the sink package): a flush still legitimately committing past
+			// AckWait has its messages redelivered while the original also
+			// commits — guaranteed duplicate rows + false redelivery alerts.
+			// AckWait tracks SINK_MAX_AGE_HARD, so a small operator-set hard
+			// cap would silently invert the invariant with the sink's fixed
+			// 5m default.
+			if ft := ackWait - time.Minute; ft < 5*time.Minute {
+				cfg.FlushTimeout = ft
+			}
 			return sink.New(cfg, sinkConsumer, writer, log).Run(gctx)
 		})
 	}

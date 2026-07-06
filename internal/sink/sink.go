@@ -714,7 +714,21 @@ func (s *Sink) isolateRange(ctx context.Context, job flushJob, lo, hi int, st *i
 		return
 	}
 	if hi-lo == 1 {
-		if errors.Is(err, lake.ErrPoisonRow) || redeliveryCount(job.msgs[lo]) >= poisonRedeliveryThreshold {
+		// Term (permanently drop) only with EVIDENCE the row itself is the
+		// problem: either the writer tagged it deterministic (ErrPoisonRow),
+		// or it has failed alone across many redeliveries WHILE the writer
+		// was provably alive (a sibling range committed this pass). The
+		// redelivery count alone is NOT evidence — during a multi-hour
+		// catalog/S3 outage NumDelivered keeps rising on healthy, already
+		// HTTP-200-acknowledged events (it survives pod restarts), and small
+		// bundles reach this leaf before the global-fault short-circuit:
+		// Terming on count alone silently destroyed real data ~4h into an
+		// outage. Residual trade: an UNTAGGED-deterministic row at the
+		// leftmost position sees committed==0 (left-first descent) and is
+		// never Term'd — it redelivers until the WAL's MaxAge instead, which
+		// is visible (redeliveries metric) rather than silent loss.
+		if errors.Is(err, lake.ErrPoisonRow) ||
+			(st.committed > 0 && redeliveryCount(job.msgs[lo]) >= poisonRedeliveryThreshold) {
 			s.terminatePoison(job.events[lo], job.msgs[lo])
 		}
 		// else: transient single-row failure → not acked, not terminated →

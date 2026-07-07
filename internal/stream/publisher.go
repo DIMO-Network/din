@@ -87,9 +87,70 @@ func NewPublisher(js jetstream.JetStream, partitions int) *Publisher {
 func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) (err error) {
 	start := time.Now()
 	defer func() { observePublish(start, err) }()
+	future, err := p.submitAsync(event)
+	if err != nil {
+		return err
+	}
+	return awaitAck(ctx, future)
+}
+
+// PublishBatch pipelines a request's events: it issues every PublishMsgAsync
+// first, then awaits all their acks together, so a status POST that fans out to
+// N CloudEvents costs one round-trip window instead of N serial ack-RTTs (load
+// review #2). PublishMsgAsync itself blocks once the JetStream client's async
+// pending window is full, so submitting the whole batch up front still respects
+// that limit. Error semantics match Publish exactly (per-event outcomes are
+// observed individually and joined): a lost/failed ack is ErrUnavailable (→503),
+// a max-payload rejection is ErrPayloadTooLarge (→413), a marshal fault is a
+// plain error (→500). The joined error preserves the handler's writeError
+// precedence (ErrPayloadTooLarge before ErrUnavailable).
+func (p *Publisher) PublishBatch(ctx context.Context, events []*cloudevent.StoredEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	if len(events) == 1 {
+		// Single event: identical to Publish — no batching to gain.
+		return p.Publish(ctx, events[0])
+	}
+
+	// pending pairs each in-flight future with its submit time so per-event
+	// ack latency is still measured from ITS submit, not the batch's.
+	type pending struct {
+		start  time.Time
+		future jetstream.PubAckFuture
+	}
+	var errs error
+	inflight := make([]pending, 0, len(events))
+	for _, event := range events {
+		start := time.Now()
+		future, err := p.submitAsync(event)
+		if err != nil {
+			// A synchronous reject (marshal fault or PublishMsgAsync error) never
+			// produced a future — record its outcome now and keep going so a later
+			// event's ack still resolves.
+			observePublish(start, err)
+			errs = errors.Join(errs, err)
+			continue
+		}
+		inflight = append(inflight, pending{start: start, future: future})
+	}
+	for _, pr := range inflight {
+		err := awaitAck(ctx, pr.future)
+		observePublish(pr.start, err)
+		if err != nil {
+			errs = errors.Join(errs, err)
+		}
+	}
+	return errs
+}
+
+// submitAsync marshals event, builds its message, and issues PublishMsgAsync
+// without waiting for the ack. It returns a classified error on a synchronous
+// reject (ErrPayloadTooLarge / ErrUnavailable) or a plain marshal error.
+func (p *Publisher) submitAsync(event *cloudevent.StoredEvent) (jetstream.PubAckFuture, error) {
 	body, err := event.MarshalJSON()
 	if err != nil {
-		return fmt.Errorf("marshaling event %s: %w", event.ID, err)
+		return nil, fmt.Errorf("marshaling event %s: %w", event.ID, err)
 	}
 
 	msg := &nats.Msg{
@@ -112,9 +173,14 @@ func (p *Publisher) Publish(ctx context.Context, event *cloudevent.StoredEvent) 
 
 	future, err := p.js.PublishMsgAsync(msg)
 	if err != nil {
-		return classifyPublishErr(err)
+		return nil, classifyPublishErr(err)
 	}
+	return future, nil
+}
 
+// awaitAck blocks until the future resolves or ctx expires, mapping the outcome
+// to the same retry semantics as a synchronous publish.
+func awaitAck(ctx context.Context, future jetstream.PubAckFuture) error {
 	select {
 	case <-future.Ok():
 		return nil

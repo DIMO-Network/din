@@ -21,8 +21,12 @@ import (
 )
 
 // Publisher is the durability point; implemented by stream.Publisher.
+// PublishBatch pipelines a request's events (one async round-trip window for
+// all of them) while preserving Publish's per-event error semantics (load
+// review #2).
 type Publisher interface {
 	Publish(ctx context.Context, event *cloudevent.StoredEvent) error
+	PublishBatch(ctx context.Context, events []*cloudevent.StoredEvent) error
 }
 
 // Converter turns raw connection payloads into validated events.
@@ -73,8 +77,11 @@ func (h *Handlers) Connection() http.Handler {
 
 		// dis semantics: a fingerprint that fails validation is dropped (bad
 		// VIN) or 400s the request (conversion failure), but valid sibling
-		// events from the same payload are still persisted first.
+		// events from the same payload are still persisted first. Split every
+		// surviving event up front, then PublishBatch pipelines all their acks
+		// in one round-trip window instead of blocking per event (load review #2).
 		var validationErr error
+		toPublish := make([]*cloudevent.StoredEvent, 0, len(events))
 		for i := range events {
 			if h.ValidateFingerprint {
 				if err := fpvalidate.Validate(r.Context(), events[i]); err != nil {
@@ -86,10 +93,19 @@ func (h *Handlers) Connection() http.Handler {
 					continue
 				}
 			}
-			if err := h.publishOne(r.Context(), events[i], ""); err != nil {
+			stored, err := h.split(r.Context(), events[i], "")
+			if err != nil {
 				h.writeError(w, err)
 				return
 			}
+			toPublish = append(toPublish, &stored)
+		}
+		// Publish errors take precedence over validation faults, matching the
+		// old serial loop (which returned a publish error before ever checking
+		// validationErr).
+		if err := h.Publisher.PublishBatch(r.Context(), toPublish); err != nil {
+			h.writeError(w, err)
+			return
 		}
 		if validationErr != nil {
 			h.writeError(w, validationErr)
@@ -128,12 +144,24 @@ func (h *Handlers) Attestation() http.Handler {
 	})
 }
 
-func (h *Handlers) publishOne(ctx context.Context, event cloudevent.RawEvent, voidsID string) error {
+// split externalizes an oversized payload and stamps the VoidsID, producing the
+// StoredEvent that will be published.
+func (h *Handlers) split(ctx context.Context, event cloudevent.RawEvent, voidsID string) (cloudevent.StoredEvent, error) {
 	stored, err := h.Splitter.MaybeSplit(ctx, event)
 	if err != nil {
-		return fmt.Errorf("splitting event %s: %w", event.ID, err)
+		return cloudevent.StoredEvent{}, fmt.Errorf("splitting event %s: %w", event.ID, err)
 	}
 	stored.VoidsID = voidsID
+	return stored, nil
+}
+
+// publishOne splits and durably publishes a single event — the attestation path,
+// which never fans out.
+func (h *Handlers) publishOne(ctx context.Context, event cloudevent.RawEvent, voidsID string) error {
+	stored, err := h.split(ctx, event, voidsID)
+	if err != nil {
+		return err
+	}
 	return h.Publisher.Publish(ctx, &stored)
 }
 

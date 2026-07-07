@@ -236,46 +236,80 @@ func (b *Bridge) runPartition(ctx context.Context, partition, partitions int) er
 			continue
 		}
 		consecutiveErrs = 0
-		for msg := range batch.Messages() {
-			b.handle(ctx, msg)
-		}
+		b.handleBatch(ctx, batch)
 	}
 }
 
-// handle decodes one raw message and publishes its signals/events.
-// Conversion failures are terminal for the payload (raw bytes remain in
-// parquet for parse-on-read recovery) and ack. Publish failures are
-// transient — the message is Nak'd so JetStream redelivers instead of
-// silently dropping decoded signals on the floor.
-func (b *Bridge) handle(ctx context.Context, msg jetstream.Msg) {
+// handleBatch decodes every message in a fetched batch and submits all of their
+// decoded publishes async BEFORE awaiting any ack, so CPU decode and network ack
+// pipeline instead of alternating idle — serial per-message awaiting made
+// per-name JetStream round-trips the bridge's throughput ceiling and, at
+// Fetch(500)/AckWait=1min, could approach AckWait and trigger mid-batch
+// redelivery (load review #2). Per-message ack/nak semantics are unchanged: an
+// undecodable, non-vehicle, or empty message acks; a message whose publishes
+// fail naks for redelivery. Messages are decoded and finished in fetch order, so
+// per-subject publish ordering is preserved (submits go out in the same order).
+func (b *Bridge) handleBatch(ctx context.Context, batch jetstream.MessageBatch) {
+	var outcomes []msgOutcome
+	for msg := range batch.Messages() {
+		outcomes = append(outcomes, b.decodeAndSubmit(ctx, msg))
+	}
+	for _, o := range outcomes {
+		b.finish(ctx, o)
+	}
+}
+
+// msgOutcome carries one message from the decode/submit pass to the await/ack
+// pass of handleBatch. futures holds its pending async publishes; submitErr
+// holds any decode-time submit failure (marshal / PublishMsgAsync). An
+// undecodable, non-vehicle, or empty message has neither and is simply acked.
+type msgOutcome struct {
+	msg       jetstream.Msg
+	futures   []jetstream.PubAckFuture
+	submitErr error
+}
+
+// decodeAndSubmit decodes one raw message and issues its signal/event publishes
+// async WITHOUT awaiting the acks. Conversion failures are terminal for the
+// payload (raw bytes remain in parquet for parse-on-read recovery) and the
+// message will ack in finish. The returned outcome carries the pending futures
+// so handleBatch can await the whole batch together.
+func (b *Bridge) decodeAndSubmit(ctx context.Context, msg jetstream.Msg) msgOutcome {
 	event, err := stream.ParseMsg(msg.Headers(), msg.Data())
 	if err != nil {
 		b.log.Error().Err(err).Str("subject", msg.Subject()).Msg("undecodable raw message")
-		b.ack(msg)
-		return
+		return msgOutcome{msg: msg} // ack: redelivery cannot fix an undecodable payload
 	}
 
-	var pubErr error
 	switch event.Type {
 	case cloudevent.TypeStatus:
 		if b.isVehicleSignalMessage(&event.RawEvent) {
-			pubErr = b.publishSignals(ctx, &event.RawEvent)
+			futures, submitErr := b.submitSignals(ctx, &event.RawEvent)
+			return msgOutcome{msg: msg, futures: futures, submitErr: submitErr}
 		}
 	case cloudevent.TypeEvents:
-		pubErr = b.publishEvents(ctx, &event.RawEvent)
+		futures, submitErr := b.submitEvents(ctx, &event.RawEvent)
+		return msgOutcome{msg: msg, futures: futures, submitErr: submitErr}
 	}
+	return msgOutcome{msg: msg} // ack: nothing to decode for this type/subject
+}
 
+// finish awaits a message's pending publishes and acks or naks it. Publish
+// failures are transient — the message is Nak'd so JetStream redelivers instead
+// of silently dropping decoded signals on the floor.
+func (b *Bridge) finish(ctx context.Context, o msgOutcome) {
+	pubErr := errors.Join(o.submitErr, b.awaitFutures(ctx, o.futures))
 	if pubErr != nil {
-		b.log.Error().Err(pubErr).Str("subject", msg.Subject()).Msg("publishing decoded message failed; nak for redelivery")
+		b.log.Error().Err(pubErr).Str("subject", o.msg.Subject()).Msg("publishing decoded message failed; nak for redelivery")
 		// NakWithDelay, not a bare Nak: a bare Nak redelivers near-immediately, so a
 		// persistent publish failure spins a hot loop. The delay spaces the first
 		// retry out; the consumer's BackOff/MaxDeliver bound the rest (D4).
-		if err := msg.NakWithDelay(nakRedeliveryDelay); err != nil {
+		if err := o.msg.NakWithDelay(nakRedeliveryDelay); err != nil {
 			b.log.Warn().Err(err).Msg("nak failed")
 		}
 		return
 	}
-	b.ack(msg)
+	b.ack(o.msg)
 }
 
 func (b *Bridge) ack(msg jetstream.Msg) {
@@ -292,12 +326,13 @@ func (b *Bridge) isVehicleSignalMessage(rawEvent *cloudevent.RawEvent) bool {
 	return did.ChainID == b.cfg.ChainID && did.ContractAddress.Cmp(b.cfg.VehicleNFTAddress) == 0
 }
 
-// publishSignals mirrors dis signalconvert: convert, salvage partial
-// decodes, prune future/duplicate signals, merge coordinate pairs into
-// location signals, then publish one packed SignalCloudEvent per signal
-// name so per-name subject filters stay exact. The returned error covers
-// only publish failures — conversion problems are logged and final.
-func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEvent) error {
+// submitSignals mirrors dis signalconvert: convert, salvage partial decodes,
+// prune future/duplicate signals, merge coordinate pairs into location signals,
+// then submit one packed SignalCloudEvent per signal name (async, no await) so
+// per-name subject filters stay exact. It returns the pending futures plus any
+// submit-side error — conversion problems are logged and final; the acks are
+// awaited later, batched across the whole fetch (load review #2).
+func (b *Bridge) submitSignals(ctx context.Context, rawEvent *cloudevent.RawEvent) ([]jetstream.PubAckFuture, error) {
 	signals, err := modules.ConvertToSignals(ctx, rawEvent.Source, *rawEvent)
 	if err != nil {
 		var convertErr *mgconvert.ConversionError
@@ -307,7 +342,7 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("signal conversion errors")
 	}
 	if len(signals) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	signals, pruneErr := pruneFutureAndDuplicateSignals(signals)
@@ -316,7 +351,7 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("signal pruning errors")
 	}
 	if len(signals) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeSignals)
@@ -333,10 +368,10 @@ func (b *Bridge) publishSignals(ctx context.Context, rawEvent *cloudevent.RawEve
 		}
 		futures = append(futures, fut)
 	}
-	return errors.Join(pubErrs, b.awaitFutures(ctx, futures))
+	return futures, pubErrs
 }
 
-func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEvent) error {
+func (b *Bridge) submitEvents(ctx context.Context, rawEvent *cloudevent.RawEvent) ([]jetstream.PubAckFuture, error) {
 	events, err := modules.ConvertToEvents(ctx, rawEvent.Source, *rawEvent)
 	if err != nil {
 		// Salvage partial decodes exactly like dis eventconvert did.
@@ -347,7 +382,7 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 		b.log.Warn().Err(err).Str("source", rawEvent.Source).Msg("event conversion errors")
 	}
 	if len(events) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	header := decodedHeader(rawEvent, cloudevent.TypeEvents)
@@ -368,7 +403,7 @@ func (b *Bridge) publishEvents(ctx context.Context, rawEvent *cloudevent.RawEven
 		}
 		futures = append(futures, fut)
 	}
-	return errors.Join(pubErrs, b.awaitFutures(ctx, futures))
+	return futures, pubErrs
 }
 
 // publishJSONAsync submits one publish without waiting for the ack; a raw

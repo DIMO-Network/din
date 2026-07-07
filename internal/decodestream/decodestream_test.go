@@ -108,6 +108,54 @@ func TestBridge_StatusToPerNameSignalSubjects(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+// A single fetched batch carrying many raw events must decode every one of
+// them. The batch is now decoded + submitted async up front and its acks
+// awaited together (load review #2); this pins that no message is dropped or
+// skipped by the pipelined path.
+func TestBridge_BatchOfManyStatusEvents(t *testing.T) {
+	t.Parallel()
+	js := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const vehicles = 25
+	ts := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	pub := stream.NewPublisher(js, 1)
+	// Publish the whole set BEFORE the bridge starts so they land in one fetch.
+	for v := range vehicles {
+		require.NoError(t, pub.Publish(ctx, rawStatus(fmt.Sprintf("evt-%d", v), vehicleDID(1000+v), ts,
+			map[string]any{"name": "speed", "timestamp": ts.Format(time.RFC3339Nano), "value": float64(v)},
+		)))
+	}
+
+	bridge := decodestream.New(decodestream.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}, js, zerolog.Nop())
+	require.NoError(t, bridge.EnsureStreams(ctx))
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx) }()
+
+	sigStream, err := js.Stream(ctx, decodestream.SignalsStreamName)
+	require.NoError(t, err)
+	cons, err := sigStream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: "dimo.signals.speed",
+	})
+	require.NoError(t, err)
+
+	seen := map[string]bool{}
+	for len(seen) < vehicles {
+		msg, err := cons.Next(jetstream.FetchMaxWait(10 * time.Second))
+		require.NoError(t, err, "only decoded %d/%d before timeout", len(seen), vehicles)
+		var ce vss.SignalCloudEvent
+		require.NoError(t, json.Unmarshal(msg.Data(), &ce))
+		seen[ce.Subject] = true
+		require.NoError(t, msg.Ack())
+	}
+	assert.Len(t, seen, vehicles, "every raw event in the batch decoded to a signal")
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
 func TestBridge_IgnoresNonVehicleSubjects(t *testing.T) {
 	t.Parallel()
 	js := setup(t)

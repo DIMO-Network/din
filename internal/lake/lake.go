@@ -358,17 +358,29 @@ func metaAttachOpts(catalogDSN string) string {
 	return ""
 }
 
-// retryCatalog runs a catalog bootstrap step up to 3 times, backing off between
-// attempts, to absorb metadata-commit conflicts when several replicas open the
-// same catalog concurrently (fresh-catalog DDL or a set_option write racing a
-// peer). Shared by ensureSchema and assertOptions so neither is fatal on a
-// cluster-wide cold start.
+// retryCatalog runs a catalog bootstrap/maintenance step up to 3 times, backing
+// off between attempts, to absorb metadata-commit conflicts when several
+// replicas open the same catalog concurrently (fresh-catalog DDL or a set_option
+// write racing a peer). Shared by ensureSchema, assertOptions, and maintenance
+// so none is fatal on a cluster-wide cold start; it retries EVERY error because
+// those paths are idempotent and their only expected failures are transient.
 func retryCatalog(ctx context.Context, fn func() error) error {
+	return retryCatalogIf(ctx, fn, func(error) bool { return true })
+}
+
+// retryCatalogIf is retryCatalog with a predicate: it retries only while
+// shouldRetry(err) is true, so a caller that runs non-idempotent work (the write
+// path) can retry the transient DuckLake commit-conflict class while failing
+// fast on a deterministic error — retrying an unpersistable row would only spin.
+func retryCatalogIf(ctx context.Context, fn func() error, shouldRetry func(error) bool) error {
 	var attempt int
 	for {
 		err := fn()
 		if err == nil {
 			return nil
+		}
+		if !shouldRetry(err) {
+			return err
 		}
 		attempt++
 		if attempt >= 3 {

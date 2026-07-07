@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -77,6 +78,15 @@ func (l *Lake) NewWriterN(ctx context.Context, table string, n int) (*Writer, er
 
 // WriteBundle durably persists events; on return, acking is safe. On
 // error nothing is committed and the caller's messages redeliver.
+//
+// The BEGIN/append/COMMIT is wrapped in a commit-conflict retry (load review
+// #6): under DuckLake optimistic concurrency a lost commit race surfaces as a
+// transient "TransactionContext Error", and without a cheap retry here that
+// bubbles up to the sink's per-event isolate() bisection (up to ~8 extra commit
+// attempts under the writer mutex) and, if it persists, multi-minute AckWait
+// redelivery. Only the transient conflict class retries — a deterministic
+// ErrPoisonRow (unpersistable row) or any other error fails fast to the sink,
+// which handles it (isolate/terminate) exactly as before.
 func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEvent) error {
 	if len(events) == 0 {
 		return nil
@@ -90,12 +100,21 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 	defer wc.mu.Unlock()
 	conn := wc.conn
 
+	return retryCatalogIf(ctx, func() error {
+		return writeBundleOnce(ctx, conn, w.table, events)
+	}, isCommitConflict)
+}
+
+// writeBundleOnce runs one BEGIN/append/COMMIT attempt. Each attempt leaves the
+// pinned connection with no open transaction (it ROLLBACKs on any failure), so a
+// commit-conflict retry can start a fresh BEGIN cleanly.
+func writeBundleOnce(ctx context.Context, conn *sql.Conn, table string, events []cloudevent.StoredEvent) error {
 	// Explicit BEGIN/COMMIT rather than database/sql Tx: the appender
 	// needs the raw driver connection, which sql.Tx keeps to itself.
 	if _, err := conn.ExecContext(ctx, "BEGIN"); err != nil {
 		return fmt.Errorf("lake write begin: %w", err)
 	}
-	if err := appendAll(ctx, conn, w.table, events); err != nil {
+	if err := appendAll(ctx, conn, table, events); err != nil {
 		// Roll back with an uncancellable ctx: duckdb-go short-circuits ExecContext
 		// when ctx is already done, so a ctx-scoped ROLLBACK on a cancelled request
 		// would no-op and leave the transaction open on this pinned, reused
@@ -114,6 +133,21 @@ func (w *Writer) WriteBundle(ctx context.Context, events []cloudevent.StoredEven
 		return fmt.Errorf("lake write commit: %w", err)
 	}
 	return nil
+}
+
+// isCommitConflict reports whether err is the transient DuckLake optimistic-
+// concurrency commit-conflict class — a lost metadata-commit race that a retry
+// clears. It is deliberately narrow: a deterministic ErrPoisonRow (or any other
+// error) must NOT retry, so the sink's isolate/terminate path still sees it.
+// DuckDB surfaces the conflict as a "TransactionContext Error" (the phrasing the
+// maintenance retry already keys on); "conflict" is matched too as a defensive
+// widening for wording drift across DuckLake versions.
+func isCommitConflict(err error) bool {
+	if err == nil || errors.Is(err, ErrPoisonRow) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "transactioncontext error") || strings.Contains(msg, "conflict")
 }
 
 func appendAll(ctx context.Context, conn *sql.Conn, table string, events []cloudevent.StoredEvent) error {

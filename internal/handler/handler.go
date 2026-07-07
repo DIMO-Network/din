@@ -80,7 +80,7 @@ func (h *Handlers) Connection() http.Handler {
 		// events from the same payload are still persisted first. Split every
 		// surviving event up front, then PublishBatch pipelines all their acks
 		// in one round-trip window instead of blocking per event (load review #2).
-		var validationErr error
+		var validationErr, splitErr error
 		toPublish := make([]*cloudevent.StoredEvent, 0, len(events))
 		for i := range events {
 			if h.ValidateFingerprint {
@@ -95,16 +95,24 @@ func (h *Handlers) Connection() http.Handler {
 			}
 			stored, err := h.split(r.Context(), events[i], "")
 			if err != nil {
-				h.writeError(w, err)
-				return
+				// Don't abort the whole request on one event's split failure — the old
+				// serial loop published every sibling BEFORE the failing one, so aborting
+				// here would silently drop those already-good events. Record the fault and
+				// keep collecting; the siblings that split are published below, then the
+				// split error is surfaced.
+				splitErr = errors.Join(splitErr, err)
+				continue
 			}
 			toPublish = append(toPublish, &stored)
 		}
-		// Publish errors take precedence over validation faults, matching the
-		// old serial loop (which returned a publish error before ever checking
-		// validationErr).
+		// Publish errors take precedence over split/validation faults, matching the old
+		// serial loop (which returned a publish error before checking anything else).
 		if err := h.Publisher.PublishBatch(r.Context(), toPublish); err != nil {
 			h.writeError(w, err)
+			return
+		}
+		if splitErr != nil {
+			h.writeError(w, splitErr)
 			return
 		}
 		if validationErr != nil {

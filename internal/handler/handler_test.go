@@ -53,8 +53,40 @@ func (passSplitter) MaybeSplit(_ context.Context, e cloudevent.RawEvent) (cloude
 	return cloudevent.StoredEvent{RawEvent: e}, nil
 }
 
+// failOnSplitter fails MaybeSplit for one event ID and passes the rest — used to prove a
+// single event's split failure doesn't drop the siblings that split cleanly.
+type failOnSplitter struct{ failID string }
+
+func (s failOnSplitter) MaybeSplit(_ context.Context, e cloudevent.RawEvent) (cloudevent.StoredEvent, error) {
+	if e.ID == s.failID {
+		return cloudevent.StoredEvent{}, errors.New("split failed for " + e.ID)
+	}
+	return cloudevent.StoredEvent{RawEvent: e}, nil
+}
+
 func statusEvent(id string) cloudevent.RawEvent {
 	return cloudevent.RawEvent{CloudEventHeader: cloudevent.CloudEventHeader{ID: id, Type: cloudevent.TypeStatus}}
+}
+
+// A split failure on ONE event of a multi-event payload must NOT drop the siblings that
+// split cleanly — the old serial loop published every event before the failing one, so
+// aborting the whole request here would silently lose already-good events (load review R3).
+func TestConnection_SplitFailurePublishesGoodSiblings(t *testing.T) {
+	pub := &fakePublisher{}
+	h := &Handlers{
+		Converter: &fakeConverter{events: []cloudevent.RawEvent{statusEvent("a"), statusEvent("b"), statusEvent("c")}},
+		Splitter:  failOnSplitter{failID: "b"}, // the middle event fails to split
+		Publisher: pub,
+		Log:       zerolog.Nop(),
+	}
+	rec := doConnection(t, h)
+
+	if len(pub.lastBatch) != 2 {
+		t.Fatalf("good siblings still published: want 2 (a, c), got %d", len(pub.lastBatch))
+	}
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a split failure must still surface an error, not 200")
+	}
 }
 
 func doConnection(t *testing.T, h *Handlers) *httptest.ResponseRecorder {

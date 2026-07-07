@@ -197,6 +197,31 @@ func TestPublishBatch_PreservesErrorSemantics(t *testing.T) {
 			t.Fatalf("want nil, got %v", err)
 		}
 	})
+
+	// A batch that mixes a transient failure and an oversized one must map to the FIRST
+	// failing event's class (positional), NOT let 413 win over 503 — otherwise a device
+	// treating 413 as permanent drops the retryable sibling.
+	t.Run("mixed batch transient-first returns 503 not 413", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{
+			errFut(errors.New("no responders")),                  // event 0: transient
+			errFut(fmt.Errorf("publish: %w", nats.ErrMaxPayload)), // event 1: oversized
+		}}
+		err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(2))
+		if !errors.Is(err, stream.ErrUnavailable) {
+			t.Fatalf("mixed [transient, oversized]: want ErrUnavailable (positional), got %v", err)
+		}
+	})
+
+	t.Run("mixed batch oversized-first returns 413", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{
+			errFut(fmt.Errorf("publish: %w", nats.ErrMaxPayload)), // event 0: oversized
+			errFut(errors.New("no responders")),                   // event 1: transient
+		}}
+		err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(2))
+		if !errors.Is(err, stream.ErrPayloadTooLarge) {
+			t.Fatalf("mixed [oversized, transient]: want ErrPayloadTooLarge (positional), got %v", err)
+		}
+	})
 }
 
 // A max-payload rejection is deterministic — the identical event always fails —

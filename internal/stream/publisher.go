@@ -113,15 +113,18 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []*cloudevent.Store
 		return p.Publish(ctx, events[0])
 	}
 
-	// pending pairs each in-flight future with its submit time so per-event
-	// ack latency is still measured from ITS submit, not the batch's.
+	// pending pairs each in-flight future with its event index + submit time so
+	// per-event ack latency is measured from ITS submit and its outcome is recorded
+	// against ITS position.
 	type pending struct {
+		index  int
 		start  time.Time
 		future jetstream.PubAckFuture
 	}
-	var errs error
+	// errByIndex records each event's outcome; a nil entry means it published.
+	errByIndex := make([]error, len(events))
 	inflight := make([]pending, 0, len(events))
-	for _, event := range events {
+	for i, event := range events {
 		start := time.Now()
 		future, err := p.submitAsync(event)
 		if err != nil {
@@ -129,19 +132,30 @@ func (p *Publisher) PublishBatch(ctx context.Context, events []*cloudevent.Store
 			// produced a future — record its outcome now and keep going so a later
 			// event's ack still resolves.
 			observePublish(start, err)
-			errs = errors.Join(errs, err)
+			errByIndex[i] = err
 			continue
 		}
-		inflight = append(inflight, pending{start: start, future: future})
+		inflight = append(inflight, pending{index: i, start: start, future: future})
 	}
 	for _, pr := range inflight {
 		err := awaitAck(ctx, pr.future)
 		observePublish(pr.start, err)
 		if err != nil {
-			errs = errors.Join(errs, err)
+			errByIndex[pr.index] = err
 		}
 	}
-	return errs
+	// Return the FIRST failing event's error (lowest index), matching the old serial
+	// loop that returned on the first failure. Joining the errors instead would let
+	// writeError's class precedence (ErrPayloadTooLarge before ErrUnavailable) turn a
+	// mixed batch — a transient/503 sibling AND an oversized/413 sibling — into a 413,
+	// which a device treating 413 as permanent would drop the retryable sibling on.
+	// Positional selection keeps the observable status identical to the per-event loop.
+	for _, e := range errByIndex {
+		if e != nil {
+			return e
+		}
+	}
+	return nil
 }
 
 // submitAsync marshals event, builds its message, and issues PublishMsgAsync

@@ -111,6 +111,27 @@ spec:
               loss for that consumer (e.g. dq). Backfill the skipped snapshot
               range, then restore the consumer and raise retention or decode
               throughput.
+        # Small-file backlog (load review #10): din_lake_data_files is the
+        # DuckLake data-file count per table. A sustained rise means compaction
+        # (merge_adjacent_files) is falling behind ingest — small files inflate
+        # the per-query S3 GET cost and, if the merge step keeps timing out or
+        # spending its whole per-cycle budget, never recover. Fire only when the
+        # count is both HIGH (above a floor, so a tiny lake or a brief
+        # post-ingest spike doesn't page) and NET-GROWING over the window.
+        - alert: DinLakeSmallFileBacklogGrowing
+          expr: max by (table) (din_lake_data_files) > {{ .Values.prometheusRule.dataFilesBacklogThreshold }} and max by (table) (delta(din_lake_data_files[2h])) > 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: lake small-file backlog is growing ({{ "{{ $labels.table }}" }})
+            description: >-
+              DuckLake data files for this table are above the backlog floor and
+              still growing — compaction is not keeping up with ingest. Small
+              files inflate per-query S3 GET cost. Check the merge step in
+              din_lake_maintenance_step_seconds and din_lake_maintenance_errors_total,
+              whether the merge budget is spent every cycle, and the maintenance
+              pod's CPU/memory sizing.
     - name: din-ingest
       rules:
         - alert: DinSinkPoisonRows

@@ -239,3 +239,7 @@ prometheusRule:
   enabled: true
   maintenanceStalledSeconds: 2700 # 45m = 3x the 15m default interval
   snapshotAgeAlertSeconds: 233280 # 64.8h = 90% of the 72h default retention
+  # Small-file-backlog floor for DinLakeSmallFileBacklogGrowing (load review #10):
+  # a well-compacted table stays far below this; the alert only fires above the
+  # floor AND while still net-growing. Tune with LAKE_TARGET_FILE_SIZE / ingest rate.
+  dataFilesBacklogThreshold: 20000

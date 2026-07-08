@@ -86,7 +86,21 @@ const (
 	// on a hung S3 multipart or catalog lock, which the between-steps ctx check
 	// cannot preempt.
 	maintStepTimeout = 30 * time.Minute
+	// mergeCycleBudget caps total merge wall-clock per maintenance cycle. Each
+	// bounded sub-call commits independently, so spending the budget just defers
+	// the remaining files to the next cycle instead of discarding this cycle's
+	// merges — the all-or-nothing failure mode of the old single CALL.
+	mergeCycleBudget = maintStepTimeout
 )
+
+// mergeMaxFilesPerCall bounds how many files one merge CALL rewrites, passed as
+// ducklake_merge_adjacent_files' max_compacted_files. Without it, one CALL
+// rewrites every mergeable file in a single transaction; a lake too large to
+// merge inside maintStepTimeout then times out and rolls back ALL of it, so
+// compaction can never converge (load review #10). Bounding the work per CALL
+// makes each CALL its own committed, durable unit of progress. A var, not a
+// const, only so tests can lower it to force multiple sub-calls.
+var mergeMaxFilesPerCall = 1000
 
 // The din_lake_* maintenance metrics below are maintainer-OWNED: only the
 // Maintainer's Cycle/reportConsumerHealth/expireSQL paths ever write them, and
@@ -149,6 +163,20 @@ var (
 		Name: "din_lake_consumer_dropped_total",
 		Help: "Un-consumed snapshots reclaimed past a dropped stale consumer's cursor (permanent change-feed loss).",
 	}, []string{"consumer"})
+	// maintDataFiles is the small-file-backlog SLI (load review #10): the DuckLake
+	// data-file count per lake table. Sustained growth means compaction isn't
+	// keeping up (merge timing out, or falling behind ingest), which inflates the
+	// per-query S3 GET cost — invisible before this gauge. maintAvgDataFileBytes
+	// pairs with it: a falling average alongside a rising count confirms
+	// fragmentation rather than genuine data growth.
+	maintDataFiles = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "din_lake_data_files",
+		Help: "DuckLake data file count per table; sustained growth signals a small-file backlog compaction isn't clearing.",
+	}, []string{"table"})
+	maintAvgDataFileBytes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "din_lake_avg_data_file_bytes",
+		Help: "Average DuckLake data file size per table; falling alongside rising din_lake_data_files confirms small-file fragmentation.",
+	}, []string{"table"})
 )
 
 // registerMaintenanceMetricsOnce guards registerMaintenanceMetrics: NewMaintainer
@@ -165,6 +193,7 @@ func registerMaintenanceMetrics() {
 		prometheus.MustRegister(
 			maintCycles, maintErrors, maintStepSeconds, maintOldestSnapshotAge,
 			maintLastSuccess, maintFloorBinding, staleConsumers, consumerDropped,
+			maintDataFiles, maintAvgDataFileBytes,
 		)
 	})
 }
@@ -212,6 +241,11 @@ func (m *Maintainer) Run(ctx context.Context) error {
 // Cycle runs one full maintenance pass.
 func (m *Maintainer) Cycle(ctx context.Context) error {
 	var firstErr error
+	recordErr := func(name string, err error) {
+		if err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("%s: %w", name, err)
+		}
+	}
 
 	// Re-assert the partition layout first. A crashed backfill can leave
 	// raw_events RESET, and unlike a fresh Open the long-lived maintainer never
@@ -226,8 +260,7 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	if err := retryCatalog(ctx, func() error { return m.lake.reassertLayout(ctx) }); err != nil {
 		maintErrors.WithLabelValues("reassert_layout").Inc()
 		m.log.Error().Err(err).Str("step", "reassert_layout").Msg("maintenance step failed")
-		// First step in the cycle, so firstErr is still nil — assign directly.
-		firstErr = fmt.Errorf("reassert_layout: %w", err)
+		recordErr("reassert_layout", err)
 	}
 	maintStepSeconds.WithLabelValues("reassert_layout").Observe(time.Since(start).Seconds())
 
@@ -235,80 +268,180 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	// they are about to lose still exist to be counted (SR review #2).
 	m.reportConsumerHealth(ctx)
 
-	steps := []maintStep{
-		// Inlined rows first so the merge pass sees their files.
-		{"flush_inlined_data", "CALL ducklake_flush_inlined_data('lake')"},
-		{"merge_adjacent_files", "CALL ducklake_merge_adjacent_files('lake')"},
-	}
-	// A transient catalog blip while building the expire cutoff must not skip the
-	// independent merge/cleanup/orphan steps for the whole interval. Count it like
-	// a failed step and run the rest; expiry retries next cycle. Insert it between
-	// merge and cleanup — cleanup releases the files the expired snapshots pinned.
-	expireSQL, err := m.expireSQL(ctx)
-	if err != nil {
+	// Freeze the expire cutoff BEFORE the (possibly long) merge runs — see
+	// expireSQL: re-evaluating now() after merge could drift minutes past the
+	// frozen decision cutoff and expire a snapshot floor+1 a reader parked at the
+	// retention edge still needs. A transient catalog blip building the cutoff
+	// must not skip the independent merge/cleanup/orphan work for the whole
+	// interval, so it is counted like a failed step and expiry retries next cycle.
+	expireStep, expireErr := m.expireSQL(ctx)
+	if expireErr != nil {
 		maintErrors.WithLabelValues("expire_snapshots").Inc()
-		m.log.Error().Err(err).Str("step", "expire_snapshots").Msg("maintenance step failed")
-		if firstErr == nil {
-			firstErr = fmt.Errorf("expire_snapshots: %w", err)
-		}
-	} else {
-		steps = append(steps, maintStep{"expire_snapshots", expireSQL})
+		m.log.Error().Err(expireErr).Str("step", "expire_snapshots").Msg("maintenance step failed")
+		recordErr("expire_snapshots", expireErr)
 	}
-	// Files released by expired snapshots, then crash leftovers.
-	steps = append(steps,
+
+	// Inlined rows first so the merge pass sees their files.
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	_, err := m.runStep(ctx, maintStep{"flush_inlined_data", "CALL ducklake_flush_inlined_data('lake')"})
+	recordErr("flush_inlined_data", err)
+
+	// Bounded, independently-committed merge (load review #10): each sub-call
+	// commits its own snapshot, so hitting a timeout or the per-cycle budget
+	// leaves earlier merges durable instead of rolling back the whole compaction.
+	if ctx.Err() == nil {
+		mergeStart := time.Now()
+		if _, mergeErr := m.runBoundedMerge(ctx); mergeErr != nil {
+			maintErrors.WithLabelValues("merge_adjacent_files").Inc()
+			m.log.Error().Err(mergeErr).Str("step", "merge_adjacent_files").Msg("maintenance step failed")
+			recordErr("merge_adjacent_files", mergeErr)
+		}
+		maintStepSeconds.WithLabelValues("merge_adjacent_files").Observe(time.Since(mergeStart).Seconds())
+	}
+
+	// Expire (using the frozen cutoff), then cleanup releases the files those
+	// snapshots pinned, then the orphan sweep clears crash leftovers.
+	var postSteps []maintStep
+	if expireErr == nil {
+		postSteps = append(postSteps, maintStep{"expire_snapshots", expireStep})
+	}
+	postSteps = append(postSteps,
 		maintStep{"cleanup_old_files", "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"})
 	// Orphan deletion is IRREVERSIBLE byte destruction and, with the catalog
 	// holding the per-file encryption keys, the step that turns a catalog
 	// restore into permanent data loss (B6) — see MaintConfig.OrphanRetention
 	// and docs/catalog-backup-restore.md. Skippable for post-restore recovery.
 	if m.cfg.OrphanRetention >= 0 {
-		steps = append(steps, maintStep{"delete_orphaned_files",
+		postSteps = append(postSteps, maintStep{"delete_orphaned_files",
 			fmt.Sprintf("CALL ducklake_delete_orphaned_files('lake', older_than => now() - INTERVAL '%d seconds')",
 				int64(m.cfg.OrphanRetention.Seconds()))})
 	} else {
 		m.log.Warn().Msg("orphan-file deletion DISABLED (LAKE_ORPHAN_RETENTION < 0) — re-enable after post-restore recovery completes")
 	}
 
-	for _, step := range steps {
+	for _, step := range postSteps {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		start := time.Now()
-		stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
-		// Retry each CALL through retryCatalog: flush_inlined_data / merge /
-		// expire / cleanup / orphan all commit DuckLake metadata, and losing that
-		// commit race to a concurrent dq write surfaces as a transient
-		// "TransactionContext Error". Without the retry a lost race counts a cycle
-		// failure toward the 4-strike restart backstop, so under sustained dq load
-		// the maintainer restart-loops and expiry/orphan-delete stop running (S5).
-		// The per-step timeout still bounds the whole retry loop (stepCtx).
-		var n int
-		err := retryCatalog(stepCtx, func() error {
-			var e error
-			n, e = m.execCount(stepCtx, step.sql)
-			return e
-		})
-		cancel()
-		maintStepSeconds.WithLabelValues(step.name).Observe(time.Since(start).Seconds())
-		if err != nil {
-			maintErrors.WithLabelValues(step.name).Inc()
-			m.log.Error().Err(err).Str("step", step.name).Msg("maintenance step failed")
-			if firstErr == nil {
-				firstErr = fmt.Errorf("%s: %w", step.name, err)
-			}
-			continue
-		}
-		m.log.Debug().Str("step", step.name).Int("rows", n).
-			Dur("took", time.Since(start)).Msg("maintenance step done")
+		_, err := m.runStep(ctx, step)
+		recordErr(step.name, err)
 	}
 	if firstErr == nil {
 		maintCycles.Inc()
 		maintLastSuccess.Set(float64(time.Now().Unix()))
 	}
-	// Refresh the health gauge every cycle, even on partial failure — a
-	// stalled expire step is exactly when oldest-snapshot age matters.
+	// Refresh the health gauges every cycle, even on partial failure — a stalled
+	// expire step is exactly when oldest-snapshot age matters, and a stalled merge
+	// is exactly when the data-file backlog matters (load review #10).
 	m.recordOldestSnapshotAge(ctx)
+	m.recordDataFileCounts(ctx)
 	return firstErr
+}
+
+// runStep runs one maintenance CALL under its own timeout + catalog-conflict
+// retry, records its duration/error metrics, and returns the row count and
+// error. Retry each CALL through retryCatalog: flush / merge / expire / cleanup
+// / orphan all commit DuckLake metadata, and losing that commit race to a
+// concurrent dq write surfaces as a transient "TransactionContext Error";
+// without the retry a lost race counts a cycle failure toward the 4-strike
+// restart backstop, so under sustained dq load the maintainer restart-loops and
+// expiry/orphan-delete stop running (S5). The per-step timeout bounds the whole
+// retry loop.
+func (m *Maintainer) runStep(ctx context.Context, step maintStep) (int, error) {
+	start := time.Now()
+	stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
+	defer cancel()
+	var n int
+	err := retryCatalog(stepCtx, func() error {
+		var e error
+		n, e = m.execCount(stepCtx, step.sql)
+		return e
+	})
+	maintStepSeconds.WithLabelValues(step.name).Observe(time.Since(start).Seconds())
+	if err != nil {
+		maintErrors.WithLabelValues(step.name).Inc()
+		m.log.Error().Err(err).Str("step", step.name).Msg("maintenance step failed")
+		return n, err
+	}
+	m.log.Debug().Str("step", step.name).Int("rows", n).
+		Dur("took", time.Since(start)).Msg("maintenance step done")
+	return n, nil
+}
+
+// runBoundedMerge compacts small files in bounded, independently-committed
+// sub-calls until nothing is left to merge, the per-cycle wall-clock budget is
+// spent, or ctx is canceled. Each CALL passes max_compacted_files so it rewrites
+// a bounded set of files in its OWN DuckLake transaction (its own snapshot) —
+// so a later sub-call timing out never discards the merges an earlier sub-call
+// already committed, the all-or-nothing failure mode of the old single
+// unbounded CALL under a 30-min timeout (load review #10). Returns the number of
+// sub-calls that merged work and the first error.
+func (m *Maintainer) runBoundedMerge(ctx context.Context) (int, error) {
+	deadline := time.Now().Add(mergeCycleBudget)
+	query := fmt.Sprintf(
+		"CALL ducklake_merge_adjacent_files('lake', max_compacted_files => %d)", mergeMaxFilesPerCall)
+	subCalls := 0
+	for {
+		if ctx.Err() != nil {
+			return subCalls, ctx.Err()
+		}
+		if !time.Now().Before(deadline) {
+			m.log.Info().Int("sub_calls", subCalls).
+				Msg("merge budget for this cycle spent; remaining small files merge next cycle")
+			return subCalls, nil
+		}
+		// Each sub-call is its own committed transaction, bounded by its own
+		// timeout; a wedged sub-call rolls back only its chunk, leaving the earlier
+		// committed sub-calls intact.
+		stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
+		var n int
+		err := retryCatalog(stepCtx, func() error {
+			var e error
+			n, e = m.execCount(stepCtx, query)
+			return e
+		})
+		cancel()
+		if err != nil {
+			return subCalls, err
+		}
+		if n == 0 {
+			// No (schema, table) rows returned ⇒ nothing left to merge this cycle.
+			return subCalls, nil
+		}
+		subCalls++
+	}
+}
+
+// recordDataFileCounts refreshes the small-file-backlog gauges from the catalog:
+// the DuckLake data-file count and average file size per table. Best-effort — a
+// failed read logs and leaves the last values (load review #10).
+func (m *Maintainer) recordDataFileCounts(ctx context.Context) {
+	rows, err := m.lake.db.QueryContext(ctx,
+		"SELECT table_name, file_count, file_size_bytes FROM ducklake_table_info('lake')")
+	if err != nil {
+		m.log.Warn().Err(err).Msg("recording data-file counts failed")
+		return
+	}
+	defer rows.Close() //nolint:errcheck
+	for rows.Next() {
+		var table string
+		var fileCount, fileBytes int64
+		if err := rows.Scan(&table, &fileCount, &fileBytes); err != nil {
+			m.log.Warn().Err(err).Msg("scanning data-file counts failed")
+			return
+		}
+		maintDataFiles.WithLabelValues(table).Set(float64(fileCount))
+		avg := 0.0
+		if fileCount > 0 {
+			avg = float64(fileBytes) / float64(fileCount)
+		}
+		maintAvgDataFileBytes.WithLabelValues(table).Set(avg)
+	}
+	if err := rows.Err(); err != nil {
+		m.log.Warn().Err(err).Msg("iterating data-file counts failed")
+	}
 }
 
 // reportConsumerHealth surfaces consumers that have gone stale (present but

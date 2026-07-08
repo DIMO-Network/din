@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -97,6 +98,130 @@ func TestPublish_AsyncErrorIsUnavailable(t *testing.T) {
 	if !errors.Is(err, stream.ErrUnavailable) {
 		t.Fatalf("async-error publish: want ErrUnavailable, got %v", err)
 	}
+}
+
+// barrierJS releases every future's Ok() only once want async submits have
+// landed. It proves PublishBatch pipelines: a serial submit→await→submit loop
+// would block on the first await (its future never fires until all N are
+// submitted, but only one has been) and deadlock; a pipelined batch submits all
+// N, the barrier fires them, and every await resolves.
+type barrierJS struct {
+	jetstream.JetStream
+	mu      sync.Mutex
+	want    int
+	futures []*fakeFuture
+}
+
+func (b *barrierJS) PublishMsgAsync(*nats.Msg, ...jetstream.PublishOpt) (jetstream.PubAckFuture, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	f := newFuture()
+	b.futures = append(b.futures, f)
+	if len(b.futures) == b.want {
+		for _, ff := range b.futures {
+			ff.ok <- &jetstream.PubAck{} // buffered: never blocks
+		}
+	}
+	return f, nil
+}
+
+// seqJS hands out pre-seeded futures in call order, so a test can dictate each
+// event's outcome.
+type seqJS struct {
+	jetstream.JetStream
+	futures []jetstream.PubAckFuture
+	i       int
+}
+
+func (s *seqJS) PublishMsgAsync(*nats.Msg, ...jetstream.PublishOpt) (jetstream.PubAckFuture, error) {
+	f := s.futures[s.i]
+	s.i++
+	return f, nil
+}
+
+func batchEvents(n int) []*cloudevent.StoredEvent {
+	events := make([]*cloudevent.StoredEvent, n)
+	for i := range events {
+		e := testStoredEvent()
+		e.ID = fmt.Sprintf("id-%d", i)
+		events[i] = e
+	}
+	return events
+}
+
+// PublishBatch must issue every PublishMsgAsync BEFORE awaiting any ack — the
+// whole point of load review #2. barrierJS only completes the futures once all
+// N are in flight, so a still-serial implementation would deadlock here.
+func TestPublishBatch_SubmitsAllBeforeAwaiting(t *testing.T) {
+	const n = 4
+	p := stream.NewPublisher(&barrierJS{want: n}, 1)
+	done := make(chan error, 1)
+	go func() { done <- p.PublishBatch(context.Background(), batchEvents(n)) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("pipelined batch: want nil, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PublishBatch deadlocked — it awaited an ack before submitting all events (serial, not pipelined)")
+	}
+}
+
+// A failed ack anywhere in the batch surfaces as ErrUnavailable so the handler
+// returns 503; a max-payload rejection surfaces as ErrPayloadTooLarge (413) and
+// must NOT read as the retryable ErrUnavailable. writeError checks
+// ErrPayloadTooLarge first, so a mixed batch maps to 413.
+func TestPublishBatch_PreservesErrorSemantics(t *testing.T) {
+	okFut := func() *fakeFuture { f := newFuture(); f.ok <- &jetstream.PubAck{}; return f }
+	errFut := func(e error) *fakeFuture { f := newFuture(); f.err <- e; return f }
+
+	t.Run("failed ack is unavailable", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{okFut(), errFut(errors.New("no responders"))}}
+		err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(2))
+		if !errors.Is(err, stream.ErrUnavailable) {
+			t.Fatalf("want ErrUnavailable, got %v", err)
+		}
+	})
+
+	t.Run("max-payload is too-large, not unavailable", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{okFut(), errFut(fmt.Errorf("publish: %w", nats.ErrMaxPayload))}}
+		err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(2))
+		if !errors.Is(err, stream.ErrPayloadTooLarge) {
+			t.Fatalf("want ErrPayloadTooLarge, got %v", err)
+		}
+	})
+
+	t.Run("all acked is nil", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{okFut(), okFut(), okFut()}}
+		if err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(3)); err != nil {
+			t.Fatalf("want nil, got %v", err)
+		}
+	})
+
+	// A batch that mixes a transient failure and an oversized one must map to the FIRST
+	// failing event's class (positional), NOT let 413 win over 503 — otherwise a device
+	// treating 413 as permanent drops the retryable sibling.
+	t.Run("mixed batch transient-first returns 503 not 413", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{
+			errFut(errors.New("no responders")),                  // event 0: transient
+			errFut(fmt.Errorf("publish: %w", nats.ErrMaxPayload)), // event 1: oversized
+		}}
+		err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(2))
+		if !errors.Is(err, stream.ErrUnavailable) {
+			t.Fatalf("mixed [transient, oversized]: want ErrUnavailable (positional), got %v", err)
+		}
+	})
+
+	t.Run("mixed batch oversized-first returns 413", func(t *testing.T) {
+		js := &seqJS{futures: []jetstream.PubAckFuture{
+			errFut(fmt.Errorf("publish: %w", nats.ErrMaxPayload)), // event 0: oversized
+			errFut(errors.New("no responders")),                   // event 1: transient
+		}}
+		err := stream.NewPublisher(js, 1).PublishBatch(context.Background(), batchEvents(2))
+		if !errors.Is(err, stream.ErrPayloadTooLarge) {
+			t.Fatalf("mixed [oversized, transient]: want ErrPayloadTooLarge (positional), got %v", err)
+		}
+	})
 }
 
 // A max-payload rejection is deterministic — the identical event always fails —

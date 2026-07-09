@@ -31,9 +31,53 @@ const rawEventColumnCount = 13
 // backfilled bundle must carry an identical value or reader dedup — keyed on
 // (subject, "time", ...) — would treat them as distinct and fail to collapse
 // the native/backfill overlap (SR review #6).
-func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
+const (
+	// defaultMaxPastWindow / defaultMaxFutureWindow bound how far from now() the STORED
+	// raw_events "time" (the day("time") partition source) may be before it is treated as a
+	// broken-clock artifact and clamped to now. They are DELIBERATELY WIDE so legit timings
+	// are never touched: offline-buffered readings are commonly days-to-weeks old (past window
+	// = 365d, ~the decoded-retention horizon), and normal skew / dis-parity near-future is
+	// minutes-to-hours (future window = 24h). Only clearly-garbage clocks (unset RTC → 1970,
+	// GPS-week rollover → 1980/2019, factory default → 2000, runaway → 2099) fall outside.
+	//
+	// Crucially this clamp is applied ONLY to the value WRITTEN to raw_events (the partition
+	// key), NOT to the CloudEvent header time. The header time still drives the NATS MsgID and
+	// the decodestream dedup id, so retry dedup and the vehicle-triggers de-dup are unchanged —
+	// clamping the stored time can't make a retry's MsgID drift or collapse distinct siblings.
+	defaultMaxPastWindow   = 365 * 24 * time.Hour
+	defaultMaxFutureWindow = 24 * time.Hour
+)
+
+var (
+	maxPastWindow   = defaultMaxPastWindow
+	maxFutureWindow = defaultMaxFutureWindow
+)
+
+// SetPartitionSafeTimeWindows overrides the broken-clock clamp bounds from validated config.
+// Non-positive values keep the default. Call once at boot before ingest starts.
+func SetPartitionSafeTimeWindows(maxPast, maxFuture time.Duration) {
+	if maxPast > 0 {
+		maxPastWindow = maxPast
+	}
+	if maxFuture > 0 {
+		maxFutureWindow = maxFuture
+	}
+}
+
+// partitionSafeTime returns t if it is within [now-maxPastWindow, now+maxFutureWindow], else
+// now — so a broken device clock can't mint a permanent singleton day-partition in
+// raw_events (PARTITIONED BY day("time")) that maintenance can never merge. Deterministic
+// per (t, now); only the STORED partition value is affected (see the const doc).
+func partitionSafeTime(t, now time.Time) time.Time {
+	if t.Before(now.Add(-maxPastWindow)) || t.After(now.Add(maxFutureWindow)) {
+		return now
+	}
+	return t
+}
+
+func rowArgs(event *cloudevent.StoredEvent, now time.Time) ([]driver.Value, error) {
 	args := make([]driver.Value, rawEventColumnCount)
-	if err := fillRowArgs(args, event); err != nil {
+	if err := fillRowArgs(args, event, now); err != nil {
 		return nil, err
 	}
 	return args, nil
@@ -45,7 +89,7 @@ func rowArgs(event *cloudevent.StoredEvent) ([]driver.Value, error) {
 // columns (data, extras) are passed as []byte to skip a string copy of the
 // largest column — DuckDB's appender validates the UTF-8 VARCHAR contract on the
 // C side whether given a string or []byte, so poison-row detection is unchanged.
-func fillRowArgs(dst []driver.Value, event *cloudevent.StoredEvent) error {
+func fillRowArgs(dst []driver.Value, event *cloudevent.StoredEvent, now time.Time) error {
 	var extrasJSON driver.Value = emptyExtrasJSON
 	if extras := cloudevent.AddNonColumnFieldsToExtras(&event.CloudEventHeader); extras != nil {
 		b, err := json.Marshal(extras)
@@ -71,7 +115,9 @@ func fillRowArgs(dst []driver.Value, event *cloudevent.StoredEvent) error {
 	}
 
 	dst[0] = event.Subject
-	dst[1] = event.Time.UTC().Truncate(time.Millisecond)
+	// Clamp only the STORED (partition-key) time — never the header time, which already drove
+	// the MsgID/dedup upstream (see partitionSafeTime's doc).
+	dst[1] = partitionSafeTime(event.Time, now).UTC().Truncate(time.Millisecond)
 	dst[2] = event.Type
 	dst[3] = event.ID
 	dst[4] = event.Source

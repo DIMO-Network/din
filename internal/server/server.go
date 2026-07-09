@@ -18,7 +18,14 @@ const (
 	DefaultAttestationAddr = ":9442"
 	DefaultOpsAddr         = ":8080"
 	DefaultTimeout         = 5 * time.Second
-	DefaultMaxBodyBytes    = 32 << 20 // 32 MiB
+	// DefaultWriteTimeout bounds writing the response. It is DELIBERATELY larger than the
+	// read/handler-in budget: an ingest handler may block up to the JetStream publish-ack
+	// budget (cmd/din publishAckTimeout, 10s) before mapping a lost ack to 503+Retry-After,
+	// so the socket write deadline must exceed that or the orderly backpressure response is
+	// killed mid-write and the device sees a raw connection reset → retry storm (scale
+	// review #5). Set > publishAckTimeout with margin.
+	DefaultWriteTimeout = 15 * time.Second
+	DefaultMaxBodyBytes = 32 << 20 // 32 MiB
 	// DefaultIdleTimeout bounds how long a keep-alive connection may sit idle
 	// between requests; without it an idle (or slow-trickle) connection is held
 	// open indefinitely, tying up a goroutine/fd (slowloris-style exhaustion).
@@ -39,8 +46,11 @@ type ConnectionConfig struct {
 	// ClientCAFiles are PEM files holding the root CAs that client
 	// certificates must chain to (mutual TLS is required).
 	ClientCAFiles []string
-	// Timeout bounds request read/write; defaults to 5s.
+	// Timeout bounds request READ (header+body); defaults to 5s.
 	Timeout time.Duration
+	// WriteTimeout bounds writing the response; defaults to DefaultWriteTimeout. It must
+	// exceed the publish-ack budget so a slow-publish 503+Retry-After is writable (#5).
+	WriteTimeout time.Duration
 	// MaxBodyBytes caps request body size; defaults to 32 MiB.
 	MaxBodyBytes int64
 	// RateLimitRPS is the per-remote sustained request rate; <= 0 disables
@@ -61,8 +71,11 @@ type AttestationConfig struct {
 	// TokenExchangeKeySetURL provides the public keys for JWT signature
 	// validation (JWKS).
 	TokenExchangeKeySetURL string
-	// Timeout bounds request read/write; defaults to 5s.
+	// Timeout bounds request READ (header+body); defaults to 5s.
 	Timeout time.Duration
+	// WriteTimeout bounds writing the response; defaults to DefaultWriteTimeout. It must
+	// exceed the publish-ack budget so a slow-publish 503+Retry-After is writable (#5).
+	WriteTimeout time.Duration
 	// MaxBodyBytes caps request body size; defaults to 32 MiB.
 	MaxBodyBytes int64
 	// RateLimitRPS is the per-remote sustained request rate; <= 0 disables
@@ -98,6 +111,9 @@ func NewConnectionServer(cfg ConnectionConfig, handler http.Handler) (*http.Serv
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultTimeout
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = DefaultWriteTimeout
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = DefaultMaxBodyBytes
@@ -138,7 +154,7 @@ func NewConnectionServer(cfg ConnectionConfig, handler http.Handler) (*http.Serv
 		},
 		ReadTimeout:       cfg.Timeout,
 		ReadHeaderTimeout: cfg.Timeout,
-		WriteTimeout:      cfg.Timeout,
+		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       DefaultIdleTimeout,
 		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 	}, nil
@@ -156,6 +172,9 @@ func NewAttestationServer(cfg AttestationConfig, handler http.Handler) (*http.Se
 	}
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = DefaultTimeout
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = DefaultWriteTimeout
 	}
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = DefaultMaxBodyBytes
@@ -186,7 +205,7 @@ func NewAttestationServer(cfg AttestationConfig, handler http.Handler) (*http.Se
 		Handler:           h,
 		ReadTimeout:       cfg.Timeout,
 		ReadHeaderTimeout: cfg.Timeout,
-		WriteTimeout:      cfg.Timeout,
+		WriteTimeout:      cfg.WriteTimeout,
 		IdleTimeout:       DefaultIdleTimeout,
 		MaxHeaderBytes:    DefaultMaxHeaderBytes,
 	}, nil

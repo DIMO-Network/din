@@ -17,7 +17,7 @@ import (
 func TestRowArgs_TruncatesTimeToMillis(t *testing.T) {
 	t.Parallel()
 	ev := testEvent("e1", "dimo.status", "did:1", time.Date(2026, 6, 8, 10, 0, 0, 123456789, time.UTC))
-	args, err := rowArgs(&ev)
+	args, err := rowArgs(&ev, time.Now().UTC())
 	require.NoError(t, err)
 	got, ok := args[1].(time.Time) // column order: subject, "time", ...
 	require.True(t, ok, "second column must be the timestamp")

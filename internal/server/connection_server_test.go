@@ -300,3 +300,23 @@ func TestRateLimitMiddleware_Disabled(t *testing.T) {
 		require.Equal(t, http.StatusOK, rec.Code, fmt.Sprintf("request %d must pass with limiting disabled", i))
 	}
 }
+
+// publishAckBudgetForTest mirrors cmd/din's publishAckTimeout (10s) — the max a handler
+// can block on a JetStream ack before writing its 503. Kept here so the server package can
+// assert its write budget exceeds it without importing the cmd package.
+const publishAckBudgetForTest = 10 * time.Second
+
+// TestServers_WriteTimeoutExceedsAckBudget pins the fix for the WriteTimeout(5s) <
+// publishAckTimeout(10s) mismatch: the ingest handler can block up to the publish-ack
+// budget before writing a 503+Retry-After, so the socket WriteTimeout must exceed that
+// (and the read budget) or the orderly backpressure response is never writable — the
+// device sees a raw connection reset and retry-storms (scale review #5).
+func TestServers_WriteTimeoutExceedsAckBudget(t *testing.T) {
+	t.Parallel()
+	_, cfg := connectionTestSetup(t)
+	srv, err := NewConnectionServer(cfg, http.NotFoundHandler())
+	require.NoError(t, err)
+	assert.Equal(t, DefaultWriteTimeout, srv.WriteTimeout)
+	assert.Greater(t, srv.WriteTimeout, srv.ReadTimeout, "write budget must exceed the read budget so a slow-publish 503 is writable")
+	assert.Greater(t, srv.WriteTimeout, publishAckBudgetForTest, "write budget must exceed the publish-ack budget")
+}

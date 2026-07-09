@@ -42,6 +42,18 @@ import (
 // publishAckTimeout bounds the wait for each JetStream publish ack (see jetstream.New).
 const publishAckTimeout = 10 * time.Second
 
+// writeTimeoutMargin is the headroom added to publishAckTimeout for the ingest servers'
+// response WriteTimeout, so a handler that waited the full ack budget still has time to
+// write its 503+Retry-After before the socket deadline fires (scale review #5).
+const writeTimeoutMargin = 5 * time.Second
+
+// attestationPrePublishBudget covers the work the attestation handler does BEFORE the
+// publish ack — an on-chain ERC-1271 signature verify (erc1271CallTimeout, 5s) plus an
+// optional blob PUT — so the attestation WriteTimeout must budget it ON TOP of
+// publishAckTimeout, or a compound-slow attestation has its 503+Retry-After cut off mid-
+// write exactly like the mismatch #5 fixes for the connection path.
+const attestationPrePublishBudget = 15 * time.Second
+
 func main() {
 	log := zerolog.New(os.Stdout).With().Timestamp().Str("app", "din").Logger()
 	// Stamp the build commit on every log line so a running pod reports its version
@@ -345,7 +357,11 @@ func run(log zerolog.Logger) error {
 		MaxBodyBytes:   settings.MaxBodyBytes,
 		RateLimitRPS:   settings.RateLimitRPS,
 		RateLimitBurst: settings.RateLimitBurst,
-		Logger:         log,
+		// Write budget must exceed the publish-ack budget: the handler blocks up to
+		// publishAckTimeout awaiting the JetStream ack before writing a 503+Retry-After,
+		// which the socket WriteTimeout must not cut short (scale review #5).
+		WriteTimeout: publishAckTimeout + writeTimeoutMargin,
+		Logger:       log,
 	}, postOnly(handlers.Connection()))
 	if err != nil {
 		return err
@@ -357,7 +373,9 @@ func run(log zerolog.Logger) error {
 		MaxBodyBytes:           settings.MaxBodyBytes,
 		RateLimitRPS:           settings.RateLimitRPS,
 		RateLimitBurst:         settings.RateLimitBurst,
-		Logger:                 log,
+		// Budget the pre-publish ERC-1271 verify + blob PUT on top of the ack budget (#5).
+		WriteTimeout: publishAckTimeout + attestationPrePublishBudget + writeTimeoutMargin,
+		Logger:       log,
 	}, postOnly(handlers.Attestation()))
 	if err != nil {
 		return err

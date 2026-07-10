@@ -10,7 +10,7 @@ import (
 // TestLake_EveryConnPinnedUTC pins the NewConnector init-hook fix: TimeZone is
 // session-local in DuckDB, so it must be set on EVERY pool/writer connection, not
 // just the bootstrap one. Otherwise a fresh or pinned writer conn inherits the host
-// tz and day("time") partitioning mis-buckets rows that straddle a UTC day boundary.
+// tz and year/month/day("time") partitioning mis-buckets rows that straddle a UTC day boundary.
 // A non-UTC TZ is forced so this catches the bug even on a UTC CI runner.
 func TestLake_EveryConnPinnedUTC(t *testing.T) {
 	t.Setenv("TZ", "America/New_York")

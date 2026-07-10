@@ -90,9 +90,8 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 		return res, fmt.Errorf("lake backfill: dropping partitioning: %w", err)
 	}
 	defer func() {
-		if _, err := conn.ExecContext(context.WithoutCancel(ctx),
-			`ALTER TABLE lake.raw_events SET PARTITIONED BY (type, day("time"))`); err != nil {
-			log.Error().Err(err).Msg("restoring partitioning failed — rerun: ALTER TABLE raw_events SET PARTITIONED BY (type, day(time))")
+		if _, err := conn.ExecContext(context.WithoutCancel(ctx), rawEventsLayout[0]); err != nil {
+			log.Error().Err(err).Msgf("restoring partitioning failed — rerun: %s", rawEventsLayout[0])
 		}
 	}()
 

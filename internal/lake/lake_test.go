@@ -19,9 +19,9 @@ import (
 
 // TestConnInit_AllPooledConnsAreUTC proves the connector's per-connection init
 // runs on every pooled connection, not just the one bootstrap() used. The
-// raw_events partition key is day("time") over a TIMESTAMP WITH TIME ZONE
-// column, so a writer/recycled conn left at the process TimeZone would file
-// near-midnight-UTC events under the wrong (type, day) partition. Hold several
+// raw_events partition key is year/month/day("time") over a TIMESTAMP WITH TIME
+// ZONE column, so a writer/recycled conn left at the process TimeZone would file
+// near-midnight-UTC events under the wrong (type, date) partition. Hold several
 // conns open at once to force distinct physical connections and assert each is
 // pinned to UTC.
 func TestConnInit_AllPooledConnsAreUTC(t *testing.T) {

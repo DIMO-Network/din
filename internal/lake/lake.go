@@ -116,8 +116,8 @@ func Open(ctx context.Context, cfg Config) (*Lake, error) {
 	// TimeZone is SESSION-local in DuckDB and does NOT persist across pool/writer conns
 	// the way the global pragmas (memory_limit, threads) and instance-global ATTACH/LOAD
 	// do. Set it on EVERY connection via this init hook: without it a fresh or pinned
-	// writer conn inherits the host tz, so day("time") partitioning is evaluated in that
-	// tz and mis-partitions rows straddling a UTC day boundary — correct in prod only
+	// writer conn inherits the host tz, so year/month/day("time") partitioning is evaluated in
+	// that tz and mis-partitions rows straddling a UTC day boundary — correct in prod only
 	// because distroless defaults to UTC, but wrong on any non-UTC host (incl. local dev).
 	// Mirrors dq's connInitFn (duck.go).
 	connector, err := duckdb.NewConnector("", func(execer driver.ExecerContext) error {
@@ -174,7 +174,7 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	}
 	// TimeZone (UTC) is set per-connection in the NewConnector init hook above — it is
 	// session-local, so it must apply to every writer/pool conn, not just this bootstrap
-	// one. day("time") then partitions on the UTC date regardless of host tz.
+	// one. year/month/day("time") then partition on the UTC date regardless of host tz.
 	// preserve_insertion_order=false lets DuckDB reorder rows for lower memory and
 	// better parallelism on large appends/exports (DuckDB OOM guidance). Safe here:
 	// raw_events is SORTED BY (subject,"time") so DuckLake orders rows on write, and

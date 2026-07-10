@@ -21,7 +21,7 @@ Raw events live in a DuckLake: parquet files under `DUCKLAKE_DATA_PATH`, tracked
 | | `/data/lake/meta.ducklake` | single-node/dev: local file catalog |
 | `DUCKLAKE_DATA_PATH` | `s3://bucket/lake/` or `/data/lake/data` | where parquet lands; **immutable once the catalog exists** |
 
-The table is partitioned by `(type, day(time))` and sorted by `(subject, time)`. Bundles smaller than DuckLake's inlining threshold are stored as catalog rows and materialized to parquet by maintenance.
+The table is partitioned by `(type, year(time), month(time), day(time))` and sorted by `(subject, time)`. The year/month/day triple is required for a date partition — DuckLake's `day(x)` alone extracts day-of-month (1–31), not a date. Bundles smaller than DuckLake's inlining threshold are stored as catalog rows and materialized to parquet by maintenance.
 
 Blobs (>1MB payloads) keep their own bucket: `BLOB_BUCKET` is an S3 bucket name or absolute local path (filesystem writes are crash-safe: temp file + fsync + atomic rename).
 

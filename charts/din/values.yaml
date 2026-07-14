@@ -220,6 +220,14 @@ maintenance:
   # (which is sized for an ingest pod). Match the maintenance pod's CPU limit
   # below (2) so the heavy merge parallelizes without CFS-throttling itself.
   threads: 2
+  # mergeMaxFilesPerCall pins LAKE_MERGE_MAX_FILES_PER_CALL — the ceiling on how
+  # many files one compaction sub-call rewrites, DuckLake's memory-batching lever.
+  # Leave empty (the default): the maintainer derives a memory-safe ceiling from
+  # memoryLimit above and the observed average file size, and ramps up to it from a
+  # small first sub-call, so a cold/backlogged lake never attempts a merge too big
+  # for the pod and OOMKills before committing (issue #11). Set a positive integer
+  # only to override that derivation by hand.
+  mergeMaxFilesPerCall: ''
   resources:
     limits:
       cpu: '2'

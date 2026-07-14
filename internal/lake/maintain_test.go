@@ -2,6 +2,7 @@ package lake
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,11 +98,7 @@ func TestMaintainer_MergePreservesChangeFeed(t *testing.T) {
 // whole compaction. This pins that each sub-call commits its own snapshot, the
 // backlog shrinks, the change feed is preserved, and the loop converges.
 func TestMaintainer_BoundedMergeCommitsPerSubCall(t *testing.T) {
-	// Not Parallel: it overrides the package-level mergeMaxFilesPerCall.
-	prev := mergeMaxFilesPerCall
-	mergeMaxFilesPerCall = 2 // force several sub-calls over a handful of files
-	defer func() { mergeMaxFilesPerCall = prev }()
-
+	t.Parallel()
 	l, _ := openTestLake(t)
 	ctx := context.Background()
 	w, err := l.NewWriter(ctx, RawTable)
@@ -145,7 +142,9 @@ func TestMaintainer_BoundedMergeCommitsPerSubCall(t *testing.T) {
 	}
 	snapsBefore := snap()
 
-	m := NewMaintainer(l, MaintConfig{SnapshotKeep: 72 * time.Hour}, zerolog.Nop())
+	// MergeMaxFilesPerCall pins the ceiling to 2, forcing several sub-calls over the
+	// 24-file backlog (the ramp is clamped to this explicit cap, so it never grows).
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: 72 * time.Hour, MergeMaxFilesPerCall: 2}, zerolog.Nop())
 	subCalls, err := m.runBoundedMerge(ctx)
 	require.NoError(t, err)
 	require.Greater(t, subCalls, 1, "a bounded merge over 24 files with a 2-file cap must take several sub-calls")
@@ -178,6 +177,170 @@ func TestMaintainer_BoundedMergeCommitsPerSubCall(t *testing.T) {
 	again, err := m.runBoundedMerge(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, again, "bounded merge must converge — no work left on the second pass")
+}
+
+// parseByteSize is the input to the derived merge ceiling: a wrong parse would size
+// the whole memory guard wrong. Pin the suffix handling and the "give up → 0"
+// contract that routes callers to the fallback ceiling (issue #11).
+func TestParseByteSize(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		in   string
+		want int64
+	}{
+		{"", 0},
+		{"1073741824", 1 << 30},
+		{"512MB", 512 << 20},
+		{"512mb", 512 << 20},
+		{" 1GB ", 1 << 30},
+		{"2GiB", 2 << 30},
+		{"4KB", 4 << 10},
+		{"1TB", 1 << 40},
+		{"1.5GB", 3 << 29}, // 1.5 * 2^30
+		{"80%", 0},         // percentage form is unresolvable without total RAM
+		{"garbage", 0},
+		{"-5MB", 0},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, parseByteSize(c.in), "parseByteSize(%q)", c.in)
+	}
+}
+
+// isOutOfMemory decides whether a merge error is a graceful DuckDB OOM (back off the
+// ramp, don't fail the cycle) or a real failure (surface it). Pin both classes so a
+// wording change on either side is caught (issue #11).
+func TestIsOutOfMemory(t *testing.T) {
+	t.Parallel()
+	assert.False(t, isOutOfMemory(nil))
+	assert.False(t, isOutOfMemory(errors.New("TransactionContext Error: conflict")))
+	assert.False(t, isOutOfMemory(errors.New("connection refused")))
+	assert.True(t, isOutOfMemory(errors.New("Out of Memory Error: could not allocate block of size 76.5 MiB (2.7 GiB/2.7 GiB used)")))
+	assert.True(t, isOutOfMemory(errors.New("could not allocate 512MB")))
+}
+
+// The graceful-OOM contract: when a merge sub-call hits the DuckDB memory limit,
+// the maintainer must NOT fail the cycle (which would march it toward the 4-strike
+// restart backstop while it is in fact making progress). It halves the per-call cap,
+// counts the backoff, and returns cleanly so the remaining files merge next cycle —
+// and a real (non-OOM) error must still surface. Uses the fault seam because real
+// memory pressure can't be reproduced deterministically here (issue #11).
+func TestMaintainer_MergeOOMBacksOffWithoutFailingCycle(t *testing.T) {
+	// Not Parallel: mutates the package-level fault hook and reads a shared counter.
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: 72 * time.Hour}, zerolog.Nop())
+	startRamp := m.mergeRamp
+	require.Equal(t, mergeRampStartFiles, startRamp)
+
+	backoffs := func() float64 {
+		var mtr dto.Metric
+		require.NoError(t, mergeOOMBackoffs.Write(&mtr))
+		return mtr.GetCounter().GetValue()
+	}
+	before := backoffs()
+
+	// First sub-call reports a graceful DuckDB OOM.
+	mergeExecFaultHook = func(subCall int) (int, error) {
+		return 0, errors.New("Out of Memory Error: could not allocate block of size 76.5 MiB (2.7 GiB/2.7 GiB used)")
+	}
+	defer func() { mergeExecFaultHook = nil }()
+
+	subCalls, err := m.runBoundedMerge(ctx)
+	require.NoError(t, err, "a graceful OOM must not fail the cycle")
+	assert.Zero(t, subCalls, "the OOM sub-call committed nothing")
+	assert.Equal(t, startRamp/2, m.mergeRamp, "the per-call cap must halve on OOM")
+	assert.Equal(t, before+1, backoffs(), "the OOM backoff must be counted")
+
+	// A non-OOM error, by contrast, must surface as a real failure and leave the cap alone.
+	rampBefore := m.mergeRamp
+	mergeExecFaultHook = func(subCall int) (int, error) {
+		return 0, errors.New("connection refused")
+	}
+	_, err = m.runBoundedMerge(ctx)
+	require.Error(t, err, "a non-OOM error must fail the cycle")
+	assert.False(t, isOutOfMemory(err))
+	assert.Equal(t, rampBefore, m.mergeRamp, "a non-OOM error must not move the ramp")
+}
+
+// The merge ceiling is what bounds a sub-call's working set to the memory budget.
+// Pin the three regimes: explicit pin wins, a real budget derives a finite ceiling
+// no larger than the hard cap, and a missing budget falls back — never unbounded.
+func TestMaintainer_MergeCeiling(t *testing.T) {
+	t.Parallel()
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+	// Land some files so maxAvgFileBytes has a real average to divide into.
+	ts := time.Date(2026, 6, 3, 10, 0, 0, 0, time.UTC)
+	for b := range 3 {
+		var bundle []cloudevent.StoredEvent
+		for i := range 20 {
+			bundle = append(bundle, testEvent(fmt.Sprintf("c%d-%d", b, i), "dimo.status", "did:1", ts))
+		}
+		require.NoError(t, w.WriteBundle(ctx, bundle))
+	}
+
+	// An explicit pin wins outright and is clamped to the hard ceiling.
+	pinned := NewMaintainer(l, MaintConfig{MergeMaxFilesPerCall: 7}, zerolog.Nop())
+	assert.Equal(t, 7, pinned.mergeCeiling(ctx))
+	pinnedHigh := NewMaintainer(l, MaintConfig{MergeMaxFilesPerCall: 999999}, zerolog.Nop())
+	assert.Equal(t, mergeMaxFilesHardCeiling, pinnedHigh.mergeCeiling(ctx))
+
+	// No budget string ⇒ fallback (never the old unbounded behavior).
+	nobudget := NewMaintainer(l, MaintConfig{}, zerolog.Nop())
+	assert.Equal(t, mergeMaxFilesFallback, nobudget.mergeCeiling(ctx))
+
+	// A real budget derives a finite, in-range ceiling, and a larger budget never
+	// yields a smaller ceiling (monotonic in memory).
+	small := NewMaintainer(l, MaintConfig{MemoryLimit: "64MB"}, zerolog.Nop())
+	big := NewMaintainer(l, MaintConfig{MemoryLimit: "4GB"}, zerolog.Nop())
+	cSmall, cBig := small.mergeCeiling(ctx), big.mergeCeiling(ctx)
+	assert.GreaterOrEqual(t, cSmall, mergeMinFilesPerCall)
+	assert.LessOrEqual(t, cBig, mergeMaxFilesHardCeiling)
+	assert.GreaterOrEqual(t, cBig, cSmall, "a larger memory budget must not derive a smaller merge ceiling")
+}
+
+// The cold-start guarantee: a maintainer with no explicit cap starts its ramp small
+// (so a cold, uncompacted lake's first sub-call always fits) and ramps UP after a
+// sub-call commits, converging toward the ceiling instead of attacking the whole
+// backlog in call #1 (issue #11).
+func TestMaintainer_MergeRampStartsSmallAndClimbs(t *testing.T) {
+	t.Parallel()
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+
+	// A default maintainer (no pin, no budget → fallback ceiling well above the start).
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: 72 * time.Hour}, zerolog.Nop())
+	assert.Equal(t, mergeRampStartFiles, m.mergeRamp, "the ramp must start small on boot")
+	assert.Greater(t, m.mergeCeiling(ctx), mergeRampStartFiles,
+		"ceiling must exceed the start so the ramp has room to climb")
+
+	// Land enough small files that at least one sub-call merges real work.
+	total := 0
+	for d := range 4 {
+		ts := time.Date(2026, 6, 1+d, 10, 0, 0, 0, time.UTC)
+		for b := range 3 {
+			var bundle []cloudevent.StoredEvent
+			for i := range 20 {
+				bundle = append(bundle, testEvent(fmt.Sprintf("r%d-%d-%d", d, b, i), "dimo.status", "did:1", ts))
+				total++
+			}
+			require.NoError(t, w.WriteBundle(ctx, bundle))
+		}
+	}
+
+	subCalls, err := m.runBoundedMerge(ctx)
+	require.NoError(t, err)
+	require.Positive(t, subCalls, "expected the merge to do real work")
+	assert.Greater(t, m.mergeRamp, mergeRampStartFiles,
+		"a committed sub-call must ramp the per-call cap UP toward the ceiling")
+	assert.LessOrEqual(t, m.mergeRamp, m.mergeCeiling(ctx), "the ramp must never exceed the ceiling")
 }
 
 // A full cycle must publish the small-file-backlog gauge so a compaction stall

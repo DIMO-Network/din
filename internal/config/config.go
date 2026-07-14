@@ -118,6 +118,14 @@ type Settings struct {
 	// writer round-robins bundles across, so several bundles' S3 uploads overlap.
 	// >1 raises per-partition write throughput; the DuckDB pool is sized for it.
 	LakeWriterConnections int // LAKE_WRITER_CONNECTIONS
+	// LakeMergeMaxFilesPerCall is an explicit ceiling on how many files one
+	// compaction sub-call rewrites (ducklake_merge_adjacent_files'
+	// max_compacted_files) — the memory-batching lever. Zero (the default) lets
+	// the maintainer derive a memory-safe ceiling from DUCKDB_MEMORY_LIMIT and
+	// the observed average file size, and ramp up to it from a small first
+	// sub-call. Set a positive value only to pin the ceiling by hand. See
+	// lake.MaintConfig.MergeMaxFilesPerCall and issue #11.
+	LakeMergeMaxFilesPerCall int // LAKE_MERGE_MAX_FILES_PER_CALL
 
 	// Sink (ingest batching). Zero takes the sink package default. Exposed to
 	// tune flush size vs latency — e.g. raise SinkMaxAgeHard to cut tiny Parquet
@@ -268,6 +276,11 @@ func Load() (Settings, error) {
 	if err != nil {
 		return s, err
 	}
+	mergeMaxFiles, err := envUint("LAKE_MERGE_MAX_FILES_PER_CALL", 0)
+	if err != nil {
+		return s, err
+	}
+	s.LakeMergeMaxFilesPerCall = int(mergeMaxFiles)
 	s.LakeWriterConnections = max(int(writerConns), 1) // keep the pool-size math consistent with the writer
 
 	// Sink knobs default to 0 → the sink package applies its own defaults.

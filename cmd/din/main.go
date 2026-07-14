@@ -201,10 +201,14 @@ func lakeConfig(settings config.Settings) lake.Config {
 // expiry before its cursor range is reclaimed (SR-2).
 func maintConfig(settings config.Settings) lake.MaintConfig {
 	return lake.MaintConfig{
-		Interval:          settings.LakeMaintInterval,
-		SnapshotKeep:      settings.LakeSnapshotKeep,
-		ConsumerStaleness: settings.LakeConsumerStaleness,
-		OrphanRetention:   settings.LakeOrphanRetention,
+		Interval:             settings.LakeMaintInterval,
+		SnapshotKeep:         settings.LakeSnapshotKeep,
+		ConsumerStaleness:    settings.LakeConsumerStaleness,
+		OrphanRetention:      settings.LakeOrphanRetention,
+		MergeMaxFilesPerCall: settings.LakeMergeMaxFilesPerCall,
+		// The maintainer derives its memory-safe merge ceiling from the same
+		// DUCKDB_MEMORY_LIMIT the DuckDB pool runs under (issue #11).
+		MemoryLimit: settings.LakeMemoryLimit,
 	}
 }
 

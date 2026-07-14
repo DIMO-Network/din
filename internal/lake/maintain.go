@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -28,6 +30,17 @@ type Maintainer struct {
 	lake *Lake
 	cfg  MaintConfig
 	log  zerolog.Logger
+	// mergeRamp is the current per-call merge file cap. It starts at
+	// mergeRampStartFiles, doubles after each committed sub-call and halves on a
+	// graceful DuckDB OOM, clamped to the effective ceiling. Persisting it across
+	// cycles lets a healthy process reach its steady-state cap once and stay there;
+	// resetting it only on process boot (a fresh Maintainer) is what makes an
+	// uncatchable cgroup OOMKill self-correct. Touched only from the single-threaded
+	// Run→Cycle→runBoundedMerge path, so no lock is needed. See issue #11.
+	mergeRamp int
+	// memBudgetBytes is DUCKDB_MEMORY_LIMIT parsed to bytes (0 if empty/unparseable),
+	// the input to the derived merge ceiling.
+	memBudgetBytes int64
 }
 
 // MaintConfig tunes the maintenance cadence. Zero values take defaults.
@@ -53,6 +66,17 @@ type MaintConfig struct {
 	// LAKE_ORPHAN_RETENTION=-1s while re-registering restored-era files).
 	// See docs/catalog-backup-restore.md.
 	OrphanRetention time.Duration
+	// MergeMaxFilesPerCall is an explicit ceiling on how many files one merge
+	// sub-call rewrites (max_compacted_files). Zero (the default) derives a
+	// memory-safe ceiling from MemoryLimit and the observed average file size;
+	// runBoundedMerge ramps up to whichever ceiling applies from a small first
+	// sub-call so a cold, uncompacted lake never attempts a merge too big for
+	// the pod's memory budget (issue #11). Positive pins the ceiling by hand.
+	MergeMaxFilesPerCall int
+	// MemoryLimit is DUCKDB_MEMORY_LIMIT verbatim (e.g. "1GB"), the same value
+	// the DuckDB pool runs under. The maintainer parses it to derive the merge
+	// ceiling above; unparseable/empty falls back to mergeMaxFilesFallback.
+	MemoryLimit string
 }
 
 func (c *MaintConfig) applyDefaults() {
@@ -93,14 +117,47 @@ const (
 	mergeCycleBudget = maintStepTimeout
 )
 
-// mergeMaxFilesPerCall bounds how many files one merge CALL rewrites, passed as
-// ducklake_merge_adjacent_files' max_compacted_files. Without it, one CALL
-// rewrites every mergeable file in a single transaction; a lake too large to
-// merge inside maintStepTimeout then times out and rolls back ALL of it, so
-// compaction can never converge (load review #10). Bounding the work per CALL
-// makes each CALL its own committed, durable unit of progress. A var, not a
-// const, only so tests can lower it to force multiple sub-calls.
-var mergeMaxFilesPerCall = 1000
+// The merge sub-call file cap (ducklake_merge_adjacent_files' max_compacted_files)
+// is DuckLake's documented memory-batching lever — "compacting data files can be
+// very memory intensive... perform this operation in batches by specifying this
+// parameter." Bounding the work per CALL also makes each CALL its own committed,
+// durable unit of progress against the maintStepTimeout (load review #10). But a
+// fixed cap is unbounded in MEMORY: on a cold, uncompacted lake one CALL can rewrite
+// enough small files to blow the pod's cgroup before it commits, so maintenance
+// OOMKills every cycle and never converges — a death spiral where the first unit of
+// progress is too big to fit (issue #11).
+//
+// runBoundedMerge instead RAMPS the cap: it starts each process at mergeRampStartFiles
+// (small enough to fit any sane budget), doubles after every sub-call that commits, and
+// clamps to a ceiling that is either MaintConfig.MergeMaxFilesPerCall (an explicit pin)
+// or derived from DUCKDB_MEMORY_LIMIT ÷ observed average file size. The ramp resets on
+// every process boot, so a cgroup OOMKill — which is uncatchable in-process — is handled
+// structurally: the restarted pod's first sub-call is tiny again. A GRACEFUL DuckDB OOM
+// (memory_limit hit before the cgroup, surfaced as a query error) is caught and halves
+// the ramp in-process, no crash.
+const (
+	// mergeRampStartFiles is the per-call cap for the first merge sub-call of a
+	// process's life, and the value the ramp resets to on each boot. Small enough
+	// that a single sub-call fits any realistic memory budget with or without a
+	// DuckDB spill volume, so a cold-start first cycle always makes durable progress.
+	mergeRampStartFiles = 32
+	// mergeMinFilesPerCall is the floor the graceful-OOM backoff descends toward: a
+	// single-file cap always fits, so the ramp can always find a size that commits.
+	mergeMinFilesPerCall = 1
+	// mergeMaxFilesHardCeiling is the absolute upper clamp on any derived or ramped
+	// cap — matches din's historical fixed cap and bounds a single transaction's S3
+	// churn even on a very large memory budget.
+	mergeMaxFilesHardCeiling = 1000
+	// mergeMaxFilesFallback is the ceiling used when MergeMaxFilesPerCall is 0 AND
+	// DUCKDB_MEMORY_LIMIT is empty/unparseable (e.g. a "80%" percentage form) or the
+	// catalog has no file-size stats yet — conservative, since we can't size to the pod.
+	mergeMaxFilesFallback = 256
+	// mergeMemoryBudgetFraction is the share of DUCKDB_MEMORY_LIMIT a single merge
+	// sub-call's rewrite (avg file size × cap) is allowed to touch. The remainder is
+	// headroom for DuckDB's baseline, read/decompression buffers, and the metadata
+	// commit — a merge reads inputs while it writes outputs, so it needs well under 1.
+	mergeMemoryBudgetFraction = 0.5
+)
 
 // The din_lake_* maintenance metrics below are maintainer-OWNED: only the
 // Maintainer's Cycle/reportConsumerHealth/expireSQL paths ever write them, and
@@ -177,6 +234,21 @@ var (
 		Name: "din_lake_avg_data_file_bytes",
 		Help: "Average DuckLake data file size per table; falling alongside rising din_lake_data_files confirms small-file fragmentation.",
 	}, []string{"table"})
+	// mergeOOMBackoffs counts merge sub-calls that hit the DuckDB memory limit and
+	// triggered a per-call file-cap backoff (issue #11). Non-zero means the merge is
+	// running at the edge of the budget: the ramp self-corrects, but sustained growth
+	// says the pod is undersized for LAKE_TARGET_FILE_SIZE / the backlog.
+	mergeOOMBackoffs = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "din_lake_merge_oom_backoff_total",
+		Help: "Merge sub-calls that hit the DuckDB memory limit and backed off the per-call file cap.",
+	})
+	// mergeFilesPerCall is the current ramped per-call file cap — the SLI that shows
+	// the cold-start ramp climbing to its ceiling (rising) or the OOM backoff pulling
+	// it down (falling). Set at the end of every merge pass.
+	mergeFilesPerCall = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "din_lake_merge_files_per_call",
+		Help: "Current ramped max_compacted_files cap for merge sub-calls.",
+	})
 )
 
 // registerMaintenanceMetricsOnce guards registerMaintenanceMetrics: NewMaintainer
@@ -193,7 +265,7 @@ func registerMaintenanceMetrics() {
 		prometheus.MustRegister(
 			maintCycles, maintErrors, maintStepSeconds, maintOldestSnapshotAge,
 			maintLastSuccess, maintFloorBinding, staleConsumers, consumerDropped,
-			maintDataFiles, maintAvgDataFileBytes,
+			maintDataFiles, maintAvgDataFileBytes, mergeOOMBackoffs, mergeFilesPerCall,
 		)
 	})
 }
@@ -204,7 +276,13 @@ func registerMaintenanceMetrics() {
 func NewMaintainer(l *Lake, cfg MaintConfig, log zerolog.Logger) *Maintainer {
 	cfg.applyDefaults()
 	registerMaintenanceMetrics()
-	return &Maintainer{lake: l, cfg: cfg, log: log.With().Str("component", "lake-maintainer").Logger()}
+	return &Maintainer{
+		lake:           l,
+		cfg:            cfg,
+		log:            log.With().Str("component", "lake-maintainer").Logger(),
+		mergeRamp:      mergeRampStartFiles,
+		memBudgetBytes: parseByteSize(cfg.MemoryLimit),
+	}
 }
 
 // Run cycles until ctx is canceled. Step failures are logged and counted,
@@ -370,6 +448,12 @@ func (m *Maintainer) runStep(ctx context.Context, step maintStep) (int, error) {
 	return n, nil
 }
 
+// mergeExecFaultHook, when non-nil, replaces a merge sub-call's execution so a
+// test can force its (rowCount, error) — used to exercise the graceful-OOM backoff
+// path, which real memory pressure can't reproduce deterministically in a unit
+// test. Nil in production; the argument is the zero-based sub-call index.
+var mergeExecFaultHook func(subCall int) (int, error)
+
 // runBoundedMerge compacts small files in bounded, independently-committed
 // sub-calls until nothing is left to merge, the per-cycle wall-clock budget is
 // spent, or ctx is canceled. Each CALL passes max_compacted_files so it rewrites
@@ -380,30 +464,62 @@ func (m *Maintainer) runStep(ctx context.Context, step maintStep) (int, error) {
 // sub-calls that merged work and the first error.
 func (m *Maintainer) runBoundedMerge(ctx context.Context) (int, error) {
 	deadline := time.Now().Add(mergeCycleBudget)
-	query := fmt.Sprintf(
-		"CALL ducklake_merge_adjacent_files('lake', max_compacted_files => %d)", mergeMaxFilesPerCall)
+	ceiling := m.mergeCeiling(ctx)
+	// A smaller ceiling than last cycle (e.g. the pod restarted with a lower
+	// DUCKDB_MEMORY_LIMIT, or the average file grew) must pull the ramp down now,
+	// not only via a future OOM.
+	m.mergeRamp = min(m.mergeRamp, ceiling)
+	defer func() { mergeFilesPerCall.Set(float64(m.mergeRamp)) }()
 	subCalls := 0
 	for {
 		if ctx.Err() != nil {
 			return subCalls, ctx.Err()
 		}
 		if !time.Now().Before(deadline) {
-			m.log.Info().Int("sub_calls", subCalls).
+			m.log.Info().Int("sub_calls", subCalls).Int("files_per_call", m.mergeRamp).
 				Msg("merge budget for this cycle spent; remaining small files merge next cycle")
 			return subCalls, nil
 		}
+		filesCap := min(max(m.mergeRamp, mergeMinFilesPerCall), ceiling)
+		query := fmt.Sprintf(
+			"CALL ducklake_merge_adjacent_files('lake', max_compacted_files => %d)", filesCap)
 		// Each sub-call is its own committed transaction, bounded by its own
 		// timeout; a wedged sub-call rolls back only its chunk, leaving the earlier
-		// committed sub-calls intact.
-		stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
+		// committed sub-calls intact. Retry the transient commit-conflict class but
+		// NOT a graceful OOM — retrying an OOM would just burn the budget hitting the
+		// same wall three times before we can shrink the cap.
 		var n int
-		err := retryCatalog(stepCtx, func() error {
-			var e error
-			n, e = m.execCount(stepCtx, query)
-			return e
-		})
-		cancel()
+		var err error
+		if mergeExecFaultHook != nil {
+			// Test-only: force a sub-call result (a graceful DuckDB OOM in
+			// particular) that is impractical to reproduce with real memory
+			// pressure in a unit test. nil lets the real merge run.
+			n, err = mergeExecFaultHook(subCalls)
+		} else {
+			stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
+			err = retryCatalogIf(stepCtx, func() error {
+				var e error
+				n, e = m.execCount(stepCtx, query)
+				return e
+			}, func(e error) bool { return !isOutOfMemory(e) })
+			cancel()
+		}
 		if err != nil {
+			if isOutOfMemory(err) {
+				// The cap was too big for the budget. Halve it (floor-bounded) and defer
+				// the remaining files to the next cycle — the earlier sub-calls already
+				// committed, so this is durable partial progress, not a lost cycle. It is
+				// NOT counted a cycle failure: it is expected backpressure the ramp
+				// corrects for, and treating it as a failure would march the pod toward
+				// the 4-strike restart backstop while it is in fact making progress.
+				prev := filesCap
+				m.mergeRamp = max(filesCap/2, mergeMinFilesPerCall)
+				mergeOOMBackoffs.Inc()
+				m.log.Warn().Err(err).Int("from_files", prev).Int("to_files", m.mergeRamp).
+					Int("sub_calls", subCalls).
+					Msg("merge sub-call hit the DuckDB memory limit; halving per-call file cap, remaining files merge next cycle")
+				return subCalls, nil
+			}
 			return subCalls, err
 		}
 		if n == 0 {
@@ -411,7 +527,52 @@ func (m *Maintainer) runBoundedMerge(ctx context.Context) (int, error) {
 			return subCalls, nil
 		}
 		subCalls++
+		// A full sub-call committed without OOM: ramp up toward the ceiling so a
+		// healthy process converges on its steady-state throughput.
+		m.mergeRamp = min(filesCap*2, ceiling)
 	}
+}
+
+// mergeCeiling resolves this cycle's upper clamp on the per-call merge file cap.
+// An explicit MergeMaxFilesPerCall wins (an operator pinning the value by hand);
+// otherwise it derives a memory-safe ceiling from the memory budget and the largest
+// average file size in the lake, so a single sub-call's rewrite (avg × cap) stays
+// within mergeMemoryBudgetFraction of DUCKDB_MEMORY_LIMIT regardless of backlog
+// depth (issue #11). Falls back to mergeMaxFilesFallback when neither the budget nor
+// the file-size stats are available.
+func (m *Maintainer) mergeCeiling(ctx context.Context) int {
+	if m.cfg.MergeMaxFilesPerCall > 0 {
+		return min(m.cfg.MergeMaxFilesPerCall, mergeMaxFilesHardCeiling)
+	}
+	if m.memBudgetBytes <= 0 {
+		return mergeMaxFilesFallback
+	}
+	avg := m.maxAvgFileBytes(ctx)
+	if avg <= 0 {
+		return mergeMaxFilesFallback
+	}
+	budget := int64(float64(m.memBudgetBytes) * mergeMemoryBudgetFraction)
+	derived := int(budget / avg)
+	return min(max(derived, mergeMinFilesPerCall), mergeMaxFilesHardCeiling)
+}
+
+// maxAvgFileBytes returns the largest per-table average data-file size in the lake,
+// in bytes, or 0 if the catalog has no files yet or the read fails. The MAX across
+// tables is deliberately conservative: max_compacted_files is a per-table cap and one
+// CALL runs over every table, so sizing the ceiling to the table with the largest
+// files keeps the sub-call within budget for all of them.
+func (m *Maintainer) maxAvgFileBytes(ctx context.Context) int64 {
+	var avg sql.NullFloat64
+	err := m.lake.db.QueryRowContext(ctx,
+		"SELECT max(file_size_bytes / file_count) FROM ducklake_table_info('lake') WHERE file_count > 0").Scan(&avg)
+	if err != nil {
+		m.log.Warn().Err(err).Msg("reading average file size for merge ceiling failed; using fallback")
+		return 0
+	}
+	if !avg.Valid || avg.Float64 <= 0 {
+		return 0
+	}
+	return int64(avg.Float64)
 }
 
 // recordDataFileCounts refreshes the small-file-backlog gauges from the catalog:
@@ -569,6 +730,56 @@ func (m *Maintainer) expireSQL(ctx context.Context) (string, error) {
 	// and matches the floor-binding branch above.
 	return fmt.Sprintf(
 		"CALL ducklake_expire_snapshots('lake', older_than => to_timestamp(%f))", cutoff), nil
+}
+
+// isOutOfMemory reports whether err is a graceful DuckDB out-of-memory error —
+// DUCKDB_MEMORY_LIMIT hit before the cgroup, surfaced as a query error like
+// "Out of Memory Error: could not allocate block of size ...". This is the ONLY
+// OOM class we can react to in-process; a cgroup OOMKill (SIGKILL) never reaches
+// here — the process is gone — and is handled instead by the ramp resetting on
+// boot (issue #11). Matched on message text because the DuckDB Go driver surfaces
+// it as an opaque error, mirroring isCommitConflict's approach.
+func isOutOfMemory(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "out of memory") || strings.Contains(msg, "could not allocate")
+}
+
+// parseByteSize parses a DuckDB-style byte-size string ("512MB", "1GB", "2GiB",
+// "1073741824") to bytes. Suffixes are case-insensitive and treated as powers of
+// 1024 (the difference from SI is well within mergeMemoryBudgetFraction's headroom).
+// A bare number is bytes. Anything it can't parse — empty, a "%" percentage form,
+// junk — returns 0, which callers read as "no budget; use the fallback ceiling".
+func parseByteSize(s string) int64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	lower := strings.ToLower(s)
+	type unit struct {
+		suffix string
+		mult   int64
+	}
+	// Longest suffixes first so "kib" matches before "kb"/"b".
+	units := []unit{
+		{"tib", 1 << 40}, {"gib", 1 << 30}, {"mib", 1 << 20}, {"kib", 1 << 10},
+		{"tb", 1 << 40}, {"gb", 1 << 30}, {"mb", 1 << 20}, {"kb", 1 << 10}, {"b", 1},
+	}
+	num, mult := lower, int64(1)
+	for _, u := range units {
+		if strings.HasSuffix(lower, u.suffix) {
+			num = strings.TrimSpace(strings.TrimSuffix(lower, u.suffix))
+			mult = u.mult
+			break
+		}
+	}
+	v, err := strconv.ParseFloat(num, 64)
+	if err != nil || v < 0 {
+		return 0
+	}
+	return int64(v * float64(mult))
 }
 
 // execCount runs a maintenance CALL and drains its result rows; the row

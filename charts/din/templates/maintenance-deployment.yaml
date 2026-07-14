@@ -56,7 +56,7 @@ spec:
               name: {{ include "din.fullname" . }}-config
           - secretRef:
               name: {{ include "din.fullname" . }}-secret
-          {{- if or .Values.maintenance.memoryLimit .Values.maintenance.threads }}
+          {{- if or .Values.maintenance.memoryLimit .Values.maintenance.threads .Values.maintenance.mergeMaxFilesPerCall }}
           # Explicit env overrides the shared configmap's DuckDB sizing so the
           # maintainer's DuckDB can use the larger merge budget and its own CPU
           # limit's worth of threads (CHD-20), not the ingest pod's values.
@@ -68,6 +68,12 @@ spec:
             {{- if .Values.maintenance.threads }}
             - name: DUCKDB_THREADS
               value: {{ .Values.maintenance.threads | quote }}
+            {{- end }}
+            {{- if .Values.maintenance.mergeMaxFilesPerCall }}
+            # Pin the per-call merge file cap; empty lets the maintainer derive it
+            # from DUCKDB_MEMORY_LIMIT and ramp up to it (issue #11).
+            - name: LAKE_MERGE_MAX_FILES_PER_CALL
+              value: {{ .Values.maintenance.mergeMaxFilesPerCall | quote }}
             {{- end }}
           {{- end }}
           ports:

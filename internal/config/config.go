@@ -126,6 +126,13 @@ type Settings struct {
 	// sub-call. Set a positive value only to pin the ceiling by hand. See
 	// lake.MaintConfig.MergeMaxFilesPerCall and issue #11.
 	LakeMergeMaxFilesPerCall int // LAKE_MERGE_MAX_FILES_PER_CALL
+	// LakeRewriteDeleteThreshold is the deleted-row fraction at which
+	// maintenance rewrites a data file live-rows-only
+	// (ducklake_rewrite_data_files' delete_threshold), un-blocking
+	// merge_adjacent_files on delete-churned tables. Zero takes the default
+	// (0.5); negative disables the rewrite step. See
+	// lake.MaintConfig.RewriteDeleteThreshold.
+	LakeRewriteDeleteThreshold float64 // LAKE_REWRITE_DELETE_THRESHOLD
 
 	// Sink (ingest batching). Zero takes the sink package default. Exposed to
 	// tune flush size vs latency — e.g. raise SinkMaxAgeHard to cut tiny Parquet
@@ -281,6 +288,9 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	s.LakeMergeMaxFilesPerCall = int(mergeMaxFiles)
+	if s.LakeRewriteDeleteThreshold, err = envFloat("LAKE_REWRITE_DELETE_THRESHOLD", 0); err != nil {
+		return s, err
+	}
 	s.LakeWriterConnections = max(int(writerConns), 1) // keep the pool-size math consistent with the writer
 
 	// Sink knobs default to 0 → the sink package applies its own defaults.
@@ -409,6 +419,18 @@ func envUint(key string, def uint64) (uint64, error) {
 		return 0, fmt.Errorf("parsing %s: %w", key, err)
 	}
 	return n, nil
+}
+
+func envFloat(key string, def float64) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return def, nil
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parsing %s: %w", key, err)
+	}
+	return f, nil
 }
 
 func envBool(key string, def bool) bool {

@@ -93,6 +93,86 @@ func TestMaintainer_MergePreservesChangeFeed(t *testing.T) {
 	assert.Equal(t, total, inserted, "merge must not rewrite the change feed")
 }
 
+// writeDeleteHeavyPartition writes 4 file-backed bundles into one (type, day)
+// partition and deletes 60% of each bundle's rows, so every data file carries a
+// delete file and sits past the default rewrite threshold (0.5). Returns the
+// surviving row count and a closure counting current-snapshot data files that
+// still carry a delete file.
+func writeDeleteHeavyPartition(t *testing.T, l *Lake) (int, func() int) {
+	t.Helper()
+	ctx := context.Background()
+
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+
+	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
+	keep := 0
+	for b := range 4 {
+		var bundle []cloudevent.StoredEvent
+		for i := range 30 {
+			prefix := "del"
+			if i >= 18 {
+				prefix = "keep"
+				keep++
+			}
+			bundle = append(bundle, testEvent(fmt.Sprintf("%s-%d-%d", prefix, b, i), "dimo.status", "did:1", ts))
+		}
+		require.NoError(t, w.WriteBundle(ctx, bundle))
+	}
+
+	res, err := l.DB().ExecContext(ctx, "DELETE FROM lake.raw_events WHERE id LIKE 'del-%'")
+	require.NoError(t, err)
+	deleted, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.EqualValues(t, 4*18, deleted)
+
+	deleteCarrying := func() int {
+		var n int
+		require.NoError(t, l.DB().QueryRowContext(ctx,
+			"SELECT count(*) FROM ducklake_list_files('lake', 'raw_events') WHERE delete_file IS NOT NULL").Scan(&n))
+		return n
+	}
+	require.Positive(t, deleteCarrying(), "deletes must land as merge-on-read delete files for this test to bite")
+	return keep, deleteCarrying
+}
+
+// The 2026-07-17 read-mirror incident regression: merge_adjacent_files never
+// compacts a file that carries a delete file, so DELETE+INSERT-churned tables
+// (dq's signals_latest/events_latest rollups) fragment without bound unless
+// maintenance first rewrites delete-heavy files live-rows-only. This pins that
+// the rewrite step reclaims every past-threshold file and keeps surviving rows
+// intact.
+func TestMaintainer_RewriteReclaimsDeleteHeavyFiles(t *testing.T) {
+	t.Parallel()
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	keep, deleteCarrying := writeDeleteHeavyPartition(t, l)
+
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: 72 * time.Hour}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+
+	assert.Zero(t, deleteCarrying(), "every file was past the threshold; all must be rewritten live-rows-only")
+	var rows int
+	require.NoError(t, l.DB().QueryRowContext(ctx,
+		"SELECT count(*) FROM lake.raw_events").Scan(&rows))
+	assert.Equal(t, keep, rows)
+}
+
+// A negative threshold disables the rewrite step (mirrors the OrphanRetention
+// disable contract), leaving delete-carrying files in place.
+func TestMaintainer_RewriteDisabledByNegativeThreshold(t *testing.T) {
+	t.Parallel()
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	_, deleteCarrying := writeDeleteHeavyPartition(t, l)
+
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: 72 * time.Hour, RewriteDeleteThreshold: -1}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+
+	assert.Positive(t, deleteCarrying(), "rewrite disabled: delete files must survive the cycle")
+}
+
 // The load review #10 fix: merge runs as bounded, independently-committed
 // sub-calls, so partial progress survives a timeout instead of rolling back the
 // whole compaction. This pins that each sub-call commits its own snapshot, the

@@ -77,7 +77,25 @@ type MaintConfig struct {
 	// the DuckDB pool runs under. The maintainer parses it to derive the merge
 	// ceiling above; unparseable/empty falls back to mergeMaxFilesFallback.
 	MemoryLimit string
+	// RewriteDeleteThreshold is ducklake_rewrite_data_files' delete_threshold:
+	// a data file whose deleted-row fraction is at or above it is rewritten to a
+	// live-rows-only file. Merge-on-read deletes leave the original file in
+	// place with a delete file attached, and merge_adjacent_files never touches
+	// such files — so delete-churned tables (dq's DELETE+INSERT-flushed
+	// signals_latest/events_latest rollups) fragment without bound unless this
+	// step reclaims them first; the rewritten outputs are what the merge pass
+	// can then compact. Zero takes the default (0.5); negative disables the
+	// step. DuckLake's own default (0.95) is too lax for the rollup churn: a
+	// multi-subject flush file accretes deletes a few subjects at a time and
+	// would sit fragmented for a long tail of flushes before crossing 0.95.
+	RewriteDeleteThreshold float64
 }
+
+// defaultRewriteDeleteThreshold rewrites a file once at least half its rows are
+// deleted: early enough that rollup-flush files (tiny, quickly delete-ridden)
+// are reclaimed within a cycle or two, while a big decoded-table file is only
+// rewritten when the rewrite at most halves its size.
+const defaultRewriteDeleteThreshold = 0.5
 
 func (c *MaintConfig) applyDefaults() {
 	if c.Interval == 0 {
@@ -91,6 +109,9 @@ func (c *MaintConfig) applyDefaults() {
 	}
 	if c.OrphanRetention == 0 {
 		c.OrphanRetention = 7 * 24 * time.Hour
+	}
+	if c.RewriteDeleteThreshold == 0 {
+		c.RewriteDeleteThreshold = defaultRewriteDeleteThreshold
 	}
 }
 
@@ -366,6 +387,25 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	_, err := m.runStep(ctx, maintStep{"flush_inlined_data", "CALL ducklake_flush_inlined_data('lake')"})
 	recordErr("flush_inlined_data", err)
 
+	// Rewrite delete-heavy files BEFORE the merge pass: merge_adjacent_files
+	// never compacts a file that has a delete file attached, so the DELETE+
+	// INSERT-churned rollup tables (dq's signals_latest/events_latest) are
+	// ineligible for merging until this step rewrites them live-rows-only —
+	// without it their KB-sized flush files accumulate without bound and every
+	// point-read pays the planning cost (2026-07-17 read-mirror incident).
+	// Running first also lets this same cycle's merge compact the outputs.
+	if m.cfg.RewriteDeleteThreshold >= 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// execCountTxn, not execCount: the rewrite scan must run inside an
+		// explicit transaction (see execCountTxn).
+		_, err := m.runStepWith(ctx, maintStep{"rewrite_data_files",
+			fmt.Sprintf("CALL ducklake_rewrite_data_files('lake', delete_threshold => %g)",
+				m.cfg.RewriteDeleteThreshold)}, m.execCountTxn)
+		recordErr("rewrite_data_files", err)
+	}
+
 	// Bounded, independently-committed merge (load review #10): each sub-call
 	// commits its own snapshot, so hitting a timeout or the per-cycle budget
 	// leaves earlier merges durable instead of rolling back the whole compaction.
@@ -428,13 +468,17 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 // expiry/orphan-delete stop running (S5). The per-step timeout bounds the whole
 // retry loop.
 func (m *Maintainer) runStep(ctx context.Context, step maintStep) (int, error) {
+	return m.runStepWith(ctx, step, m.execCount)
+}
+
+func (m *Maintainer) runStepWith(ctx context.Context, step maintStep, exec func(context.Context, string) (int, error)) (int, error) {
 	start := time.Now()
 	stepCtx, cancel := context.WithTimeout(ctx, maintStepTimeout)
 	defer cancel()
 	var n int
 	err := retryCatalog(stepCtx, func() error {
 		var e error
-		n, e = m.execCount(stepCtx, step.sql)
+		n, e = exec(stepCtx, step.sql)
 		return e
 	})
 	maintStepSeconds.WithLabelValues(step.name).Observe(time.Since(start).Seconds())
@@ -795,4 +839,37 @@ func (m *Maintainer) execCount(ctx context.Context, q string) (int, error) {
 		n++
 	}
 	return n, rows.Err()
+}
+
+// execCountTxn is execCount inside an explicit transaction. Required for
+// ducklake_rewrite_data_files (DuckLake d318a545): whenever the call selects
+// candidate files it scans them lazily, and under autocommit that scan outlives
+// the statement's own transaction — "Not implemented Error: Scanning a DuckLake
+// table after the transaction has ended". An explicit transaction held open
+// across the CALL (and committed after the rows are drained) is the documented-
+// workaround shape; a no-op rewrite succeeds either way, which is why the bug
+// only bites once there are delete-heavy files to reclaim.
+func (m *Maintainer) execCountTxn(ctx context.Context, q string) (int, error) {
+	tx, err := m.lake.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck
+	rows, err := tx.QueryContext(ctx, q)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close() //nolint:errcheck
+		return n, err
+	}
+	// database/sql requires the result set closed before Commit.
+	if err := rows.Close(); err != nil {
+		return n, err
+	}
+	return n, tx.Commit()
 }

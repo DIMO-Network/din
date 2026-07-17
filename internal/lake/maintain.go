@@ -855,21 +855,24 @@ func (m *Maintainer) execCountTxn(ctx context.Context, q string) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback() //nolint:errcheck
+	// Drained in a helper so its deferred Close runs before Commit —
+	// database/sql requires the result set closed first.
+	n, err := drainCount(ctx, tx, q)
+	if err != nil {
+		return n, err
+	}
+	return n, tx.Commit()
+}
+
+func drainCount(ctx context.Context, tx *sql.Tx, q string) (int, error) {
 	rows, err := tx.QueryContext(ctx, q)
 	if err != nil {
 		return 0, err
 	}
+	defer rows.Close() //nolint:errcheck
 	n := 0
 	for rows.Next() {
 		n++
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close() //nolint:errcheck
-		return n, err
-	}
-	// database/sql requires the result set closed before Commit.
-	if err := rows.Close(); err != nil {
-		return n, err
-	}
-	return n, tx.Commit()
+	return n, rows.Err()
 }

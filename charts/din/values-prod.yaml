@@ -37,6 +37,9 @@ env:
   # so it also applies to the already-created prod catalog going forward.
   LAKE_PARQUET_VERSION: '2'
   LAKE_TARGET_FILE_SIZE: 512MB
+  # Rows per Parquet row group (full note in values.yaml): bounds what a by-id
+  # read pays, since parquet is fetched at row-group granularity. New files only.
+  LAKE_ROW_GROUP_SIZE: '16384'
   # At-rest encryption (full note in values.yaml). On from the first write; the
   # Postgres catalog holds the per-file keys, so its backup is data-critical.
   # The catalog DSN secret should also use sslmode=verify-full now that the

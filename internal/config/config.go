@@ -87,6 +87,7 @@ type Settings struct {
 	LakeMemoryLimit    string // DUCKDB_MEMORY_LIMIT, e.g. "1GB"
 	LakeThreads        int    // DUCKDB_THREADS
 	LakeTargetFileSize string // LAKE_TARGET_FILE_SIZE, e.g. "512MB"
+	LakeRowGroupSize   int    // LAKE_ROW_GROUP_SIZE: parquet rows per row group (default 16384)
 	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
 	LakeCompression    string // LAKE_COMPRESSION: snappy (default) | zstd | lz4 | uncompressed
 	LakeExtensionDir   string // DUCKDB_EXTENSION_DIR: pre-baked DuckDB extensions
@@ -283,6 +284,14 @@ func Load() (Settings, error) {
 	if err != nil {
 		return s, err
 	}
+	// 16384 rows per row group instead of DuckDB's 122,880: parquet is read at
+	// column-chunk granularity, so the default makes a 50-row point read pull
+	// tens of MB of the `data` column. Set to 0 to keep DuckDB's default.
+	rowGroupSize, err := envUint("LAKE_ROW_GROUP_SIZE", 16384)
+	if err != nil {
+		return s, err
+	}
+	s.LakeRowGroupSize = int(rowGroupSize)
 	mergeMaxFiles, err := envUint("LAKE_MERGE_MAX_FILES_PER_CALL", 0)
 	if err != nil {
 		return s, err

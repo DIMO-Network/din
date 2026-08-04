@@ -187,6 +187,7 @@ func lakeConfig(settings config.Settings) lake.Config {
 		MemoryLimit:       settings.LakeMemoryLimit,
 		Threads:           settings.LakeThreads,
 		TargetFileSize:    settings.LakeTargetFileSize,
+		RowGroupSize:      settings.LakeRowGroupSize,
 		ParquetVersion:    settings.LakeParquetVersion,
 		Compression:       settings.LakeCompression,
 		ExtensionDir:      settings.LakeExtensionDir,

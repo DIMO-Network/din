@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -59,6 +60,20 @@ type Config struct {
 	// TargetFileSize is DuckLake's target Parquet file size for writes
 	// and compaction (e.g. "512MB"); empty keeps the DuckLake default.
 	TargetFileSize string
+	// RowGroupSize is how many rows DuckLake packs into one Parquet row group;
+	// zero keeps the DuckDB default of 122,880. Parquet is read at row-group /
+	// column-chunk granularity, so this sets the floor on what a point read
+	// costs: at the default, a `data` column chunk is ~30MB, and dq fetching 50
+	// events by id pulled 15.68MB over httpfs to return ~12KB of payload.
+	// Shrinking the group cuts that near-proportionally (2.47MB at 8192, a 6.3x
+	// reduction, measured). The cost is footer growth — more groups means more
+	// column-chunk entries, read per file on every query — which lands on the
+	// per-query planning floor, so this trades one against the other rather
+	// than being free. DuckDB flushes row groups at vector boundaries, so the
+	// value is rounded up to a multiple of 2048 and can never go below it
+	// (TestWriter_RowGroupSize_VectorGranularity); din's default of 16384 is an
+	// exact multiple. Applies to newly written files only — see tryAssertOptions.
+	RowGroupSize int
 	// Compression is the Parquet compression codec for writes/compaction:
 	// "snappy" (default — fastest write, the throughput choice for this
 	// write-heavy ingest node), "zstd" (~1.6x smaller files but ~30% slower
@@ -300,6 +315,14 @@ func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 	}
 	if cfg.TargetFileSize != "" {
 		opts = append(opts, struct{ name, valueSQL string }{"target_file_size", sqlString(cfg.TargetFileSize)})
+	}
+	// Rows per row group. Applies to newly written files only: existing files keep
+	// their layout until a rewrite touches them, so a changed value arrives
+	// gradually as new data lands and as ducklake_merge_adjacent_files and the
+	// maintenance rewrite path compact old partitions. That is fine — dq's payload
+	// reads concentrate on recent data, which is written under the new value first.
+	if cfg.RowGroupSize > 0 {
+		opts = append(opts, struct{ name, valueSQL string }{"parquet_row_group_size", strconv.Itoa(cfg.RowGroupSize)})
 	}
 	for _, o := range opts {
 		q := fmt.Sprintf("CALL lake.set_option(%s, %s)", sqlString(o.name), o.valueSQL)

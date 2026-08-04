@@ -76,6 +76,14 @@ env:
   # is compatibility-safe. target_file_size is DuckLake's compaction target.
   LAKE_PARQUET_VERSION: '2'
   LAKE_TARGET_FILE_SIZE: 512MB
+  # Rows per Parquet row group. Parquet is read at row-group granularity, so
+  # DuckDB's 122,880-row default makes a by-id point read pull the whole ~30MB
+  # `data` column chunk (measured: 15.68MB fetched to return ~12KB of payload).
+  # 16384 cuts that several-fold; the cost is footer growth, which is read per
+  # file on every query, so do not shrink it much further. Rounded up to a
+  # multiple of DuckDB's 2048-row vector size. Applies to newly written files —
+  # existing ones improve as compaction rewrites them.
+  LAKE_ROW_GROUP_SIZE: '16384'
   # At-rest encryption. LAKE_ENCRYPTION_ENABLED turns on DuckLake's ENCRYPTED
   # mode: every Parquet data file is AES-GCM encrypted and its per-file key is
   # kept in the catalog, so the DATA_PATH bucket is useless ciphertext without

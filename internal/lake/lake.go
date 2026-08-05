@@ -60,19 +60,28 @@ type Config struct {
 	// TargetFileSize is DuckLake's target Parquet file size for writes
 	// and compaction (e.g. "512MB"); empty keeps the DuckLake default.
 	TargetFileSize string
-	// RowGroupSize is how many rows DuckLake packs into one Parquet row group;
-	// zero keeps the DuckDB default of 122,880. Parquet is read at row-group /
-	// column-chunk granularity, so this sets the floor on what a point read
-	// costs: at the default, a `data` column chunk is ~30MB, and dq fetching 50
-	// events by id pulled 15.68MB over httpfs to return ~12KB of payload.
-	// Shrinking the group cuts that near-proportionally (2.47MB at 8192, a 6.3x
-	// reduction, measured). The cost is footer growth — more groups means more
-	// column-chunk entries, read per file on every query — which lands on the
-	// per-query planning floor, so this trades one against the other rather
-	// than being free. DuckDB flushes row groups at vector boundaries, so the
-	// value is rounded up to a multiple of 2048 and can never go below it
-	// (TestWriter_RowGroupSize_VectorGranularity); din's default of 16384 is an
-	// exact multiple. Applies to newly written files only — see tryAssertOptions.
+	// RowGroupSize is how many rows DuckLake packs into one Parquet row group
+	// for raw_events ONLY; zero keeps the DuckDB default of 122,880. Parquet is
+	// read at row-group / column-chunk granularity, so this sets the floor on
+	// what a point read costs: at the default, a `data` column chunk is ~30MB,
+	// and dq fetching 50 events by id pulled 15.68MB over httpfs to return
+	// ~12KB of payload. Shrinking the group cuts that near-proportionally
+	// (2.47MB at 8192, a 6.3x reduction, measured). The cost is footer growth —
+	// more groups means more column-chunk entries, read per file on every query
+	// — which lands on the per-query planning floor, so this trades one against
+	// the other rather than being free. DuckDB flushes row groups at vector
+	// boundaries, so the value is rounded up to a multiple of 2048 and can
+	// never go below it (TestWriter_RowGroupSize_VectorGranularity); din's
+	// default of 16384 is an exact multiple.
+	//
+	// Scoped to raw_events because the tradeoff only pays where reads are point
+	// reads. When #15 set it catalog-global it also governed dq's scan-heavy
+	// decoded tables (signals especially), and 7.5x more row groups per file
+	// meant ~4x slower materializer rescans of the current-day partition — bad
+	// enough to put the decode cursor behind ingest (#17). The catalog-global
+	// value is therefore pinned back to the DuckDB default on every boot, which
+	// also converges catalogs that #15 already switched. Applies to newly
+	// written files only — see tryAssertOptions.
 	RowGroupSize int
 	// Compression is the Parquet compression codec for writes/compaction:
 	// "snappy" (default — fastest write, the throughput choice for this
@@ -291,16 +300,26 @@ func (l *Lake) assertOptions(ctx context.Context, cfg Config) error {
 	return retryCatalog(ctx, func() error { return l.tryAssertOptions(ctx, cfg) })
 }
 
-// tryAssertOptions sets the catalog-global write options. DuckLake keeps these
-// as catalog metadata (not data): the most recent value applies to new writes
-// across every table — din's raw_events and dq's decoded tables alike — and
-// re-setting an unchanged value mints no snapshot (TestOpen_BootstrapIdempotent
-// guards that). Asserting them on every boot, rather than only when raw_events
-// is first created, is what lets a changed option (e.g. raising parquet_version)
-// reach a catalog that already exists.
+// duckdbDefaultRowGroupSize is DuckDB's parquet_row_group_size default,
+// asserted as the catalog-global value on every boot. Pinning it (rather than
+// leaving the global unset) is what un-sets the catalog-global 16384 that #15
+// wrote into deployed catalogs — DuckLake options persist in catalog metadata,
+// so only another set_option can move one back.
+const duckdbDefaultRowGroupSize = 122880
+
+// tryAssertOptions sets the DuckLake write options. DuckLake keeps these as
+// catalog metadata (not data): the most recent value applies to new writes —
+// catalog-global options across every table, din's raw_events and dq's decoded
+// tables alike; table-scoped options (table_name =>) to that table only,
+// overriding the global — and re-setting an unchanged value mints no snapshot
+// (TestOpen_BootstrapIdempotent guards that). Asserting them on every boot,
+// rather than only when raw_events is first created, is what lets a changed
+// option (e.g. raising parquet_version) reach a catalog that already exists.
 func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
-	// name → already-SQL-formatted value (a quoted string or a bare literal).
-	opts := []struct{ name, valueSQL string }{
+	// name → already-SQL-formatted value (a quoted string or a bare literal);
+	// empty table means catalog-global.
+	type option struct{ name, valueSQL, table string }
+	opts := []option{
 		// snappy is the default: the parquet write is CPU-bound on the codec, and
 		// snappy sustains ~30% higher materialize throughput than zstd on this
 		// sorted time-series (at ~1.6x the file size). zstd remains available via
@@ -308,24 +327,32 @@ func (l *Lake) tryAssertOptions(ctx context.Context, cfg Config) error {
 		// writes bloom filters on dictionary-encoded columns (subject), so subject
 		// pruning is preserved; backfilled DIS bundles keep their own (zstd) codec
 		// since compression is a per-file Parquet property.
-		{"parquet_compression", sqlString(compressionLiteral(cfg.Compression))},
+		{name: "parquet_compression", valueSQL: sqlString(compressionLiteral(cfg.Compression))},
+		// The global row group size stays at the DuckDB default: scan-heavy tables
+		// (dq's signals) regressed ~4x on rescans when #15 shrank it globally, and
+		// deployed catalogs still carry that global 16384 until this overwrites it.
+		{name: "parquet_row_group_size", valueSQL: strconv.Itoa(duckdbDefaultRowGroupSize)},
 	}
 	if v := parquetVersionLiteral(cfg.ParquetVersion); v != "" {
-		opts = append(opts, struct{ name, valueSQL string }{"parquet_version", v})
+		opts = append(opts, option{name: "parquet_version", valueSQL: v})
 	}
 	if cfg.TargetFileSize != "" {
-		opts = append(opts, struct{ name, valueSQL string }{"target_file_size", sqlString(cfg.TargetFileSize)})
+		opts = append(opts, option{name: "target_file_size", valueSQL: sqlString(cfg.TargetFileSize)})
 	}
-	// Rows per row group. Applies to newly written files only: existing files keep
+	// Rows per row group for the point-read table only (see Config.RowGroupSize
+	// for why the scope). Applies to newly written files only: existing files keep
 	// their layout until a rewrite touches them, so a changed value arrives
 	// gradually as new data lands and as ducklake_merge_adjacent_files and the
 	// maintenance rewrite path compact old partitions. That is fine — dq's payload
 	// reads concentrate on recent data, which is written under the new value first.
 	if cfg.RowGroupSize > 0 {
-		opts = append(opts, struct{ name, valueSQL string }{"parquet_row_group_size", strconv.Itoa(cfg.RowGroupSize)})
+		opts = append(opts, option{name: "parquet_row_group_size", valueSQL: strconv.Itoa(cfg.RowGroupSize), table: RawTable})
 	}
 	for _, o := range opts {
 		q := fmt.Sprintf("CALL lake.set_option(%s, %s)", sqlString(o.name), o.valueSQL)
+		if o.table != "" {
+			q = fmt.Sprintf("CALL lake.set_option(%s, %s, table_name => %s)", sqlString(o.name), o.valueSQL, sqlString(o.table))
+		}
 		if _, err := l.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("lake set_option %s: %w", o.name, err)
 		}

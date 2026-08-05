@@ -209,6 +209,121 @@ func TestRowGroupSize_CompactionAdoptsNewSize(t *testing.T) {
 	assert.Equal(t, int64(36000), total, "compaction must not lose rows")
 }
 
+// tableFileLayout returns the row group count and largest row group of the
+// single live data file backing the given DuckLake table.
+func tableFileLayout(t *testing.T, l *Lake, dataPath, table string) (groups, maxRows int64) {
+	t.Helper()
+	ctx := context.Background()
+	var path string
+	require.NoError(t, l.DB().QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT data_file FROM ducklake_list_files('lake', %s)", sqlString(table))).Scan(&path))
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(dataPath, path)
+	}
+	require.NoError(t, l.DB().QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT num_row_groups FROM parquet_file_metadata(%s)", sqlString(path))).Scan(&groups))
+	require.NoError(t, l.DB().QueryRowContext(ctx, fmt.Sprintf(
+		"SELECT max(row_group_num_rows) FROM parquet_metadata(%s)", sqlString(path))).Scan(&maxRows))
+	return groups, maxRows
+}
+
+// TestRowGroupSize_ScopedToRawEvents pins the #17 fix: RowGroupSize governs
+// raw_events only. When #15 set it catalog-global it also governed dq's
+// scan-heavy decoded tables (the catalog is shared), and 7.5x more row groups
+// per file slowed the materializer's current-day signals rescans ~4x — enough
+// to put the decode cursor behind ingest. Point reads want small groups; scans
+// want the default; only raw_events is point-read.
+func TestRowGroupSize_ScopedToRawEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dataPath := filepath.Join(dir, "data")
+	cfg := Config{
+		CatalogDSN:   filepath.Join(dir, "meta.ducklake"),
+		DataPath:     dataPath,
+		RowGroupSize: 16384,
+	}
+	l, err := Open(ctx, cfg)
+	require.NoError(t, err)
+	defer l.Close() //nolint:errcheck
+
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+	base := time.Date(2026, 6, 8, 0, 0, 0, 0, time.UTC)
+	var bundle []cloudevent.StoredEvent
+	for i := range 20000 {
+		bundle = append(bundle, testEvent(fmt.Sprintf("evt-%05d", i), "dimo.status",
+			fmt.Sprintf("did:erc721:137:0xVeh:%d", i%64), base.Add(time.Duration(i)*time.Second)))
+	}
+	require.NoError(t, w.WriteBundle(ctx, bundle))
+
+	// A second table in the same catalog, standing in for dq's decoded tables
+	// (dq writes them through this same shared catalog, outside din's code).
+	_, err = l.DB().ExecContext(ctx,
+		"CREATE TABLE lake.scans AS SELECT range AS i, md5(range::VARCHAR) AS v FROM range(20000)")
+	require.NoError(t, err)
+
+	_, rawMax := tableFileLayout(t, l, dataPath, RawTable)
+	assert.Equal(t, int64(16384), rawMax, "raw_events must get the configured row group size")
+	scanGroups, scanMax := tableFileLayout(t, l, dataPath, "scans")
+	assert.Equal(t, int64(1), scanGroups, "other tables must keep DuckDB's default layout")
+	assert.Equal(t, int64(20000), scanMax)
+
+	// The scoped set_option must stay boot-idempotent like the global ones:
+	// re-asserting an unchanged value on reboot must not mint snapshots.
+	require.NoError(t, l.Close())
+	l2, err := Open(ctx, cfg)
+	require.NoError(t, err)
+	var snapshotsBefore int
+	require.NoError(t, l2.DB().QueryRowContext(ctx,
+		"SELECT count(*) FROM lake.snapshots()").Scan(&snapshotsBefore))
+	require.NoError(t, l2.Close())
+	l3, err := Open(ctx, cfg)
+	require.NoError(t, err)
+	defer l3.Close() //nolint:errcheck
+	var snapshotsAfter int
+	require.NoError(t, l3.DB().QueryRowContext(ctx,
+		"SELECT count(*) FROM lake.snapshots()").Scan(&snapshotsAfter))
+	assert.Equal(t, snapshotsBefore, snapshotsAfter, "reboot must not mint snapshots")
+}
+
+// TestRowGroupSize_RestoresGlobalDefault pins the deployed-catalog recovery
+// path: a catalog that #15 already switched carries parquet_row_group_size as
+// a catalog-GLOBAL option, and DuckLake options persist in catalog metadata —
+// merely scoping the new value would leave the old global governing every
+// other table forever. Boot must pin the global back to DuckDB's default so
+// files written to other tables (and maintenance rewrites of them) recover.
+func TestRowGroupSize_RestoresGlobalDefault(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dataPath := filepath.Join(dir, "data")
+	cfg := Config{
+		CatalogDSN:   filepath.Join(dir, "meta.ducklake"),
+		DataPath:     dataPath,
+		RowGroupSize: 16384,
+	}
+
+	// Simulate a catalog #15 booted against: the option set with no scope.
+	l0, err := Open(ctx, cfg)
+	require.NoError(t, err)
+	_, err = l0.DB().ExecContext(ctx, "CALL lake.set_option('parquet_row_group_size', '16384')")
+	require.NoError(t, err)
+	require.NoError(t, l0.Close())
+
+	l, err := Open(ctx, cfg)
+	require.NoError(t, err)
+	defer l.Close() //nolint:errcheck
+
+	_, err = l.DB().ExecContext(ctx,
+		"CREATE TABLE lake.scans AS SELECT range AS i, md5(range::VARCHAR) AS v FROM range(20000)")
+	require.NoError(t, err)
+	groups, maxRows := tableFileLayout(t, l, dataPath, "scans")
+	assert.Equal(t, int64(1), groups, "boot must restore the catalog-global default so other tables recover")
+	assert.Equal(t, int64(20000), maxRows)
+}
+
 // TestWriter_RowGroupSize_VectorGranularity pins the rounding DuckDB applies:
 // row groups flush at vector boundaries, so the option is rounded UP to a
 // multiple of the 2048-row vector size and can never go below it. Asking for

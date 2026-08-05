@@ -66,6 +66,21 @@ type MaintConfig struct {
 	// LAKE_ORPHAN_RETENTION=-1s while re-registering restored-era files).
 	// See docs/catalog-backup-restore.md.
 	OrphanRetention time.Duration
+	// FileCleanupGrace is the ducklake_cleanup_old_files older_than window:
+	// a file scheduled for deletion (merged away, rewritten, or released by
+	// snapshot expiry) survives at least this long before the bytes are
+	// removed. The catalog commit that supersedes a file is transactional,
+	// but readers are not: a DuckDB transaction plans its file list against
+	// a pinned snapshot and then reads object storage for minutes — deleting
+	// a superseded file inside that window 404s the read mid-transaction
+	// (the dq materializer's 3–6 min spans lost 2–4 passes/hour to this,
+	// 2026-08-05). Must exceed the slowest reader TRANSACTION, not the
+	// slowest consumer cursor — ad-hoc readers (dq's query pods) never
+	// report progress, so no floor can protect them; only time can. The
+	// cost of a generous window is superseded files sitting in the data
+	// path one extra window. Negative restores immediate cleanup
+	// (cleanup_all — the pre-grace behavior, for tests and recovery).
+	FileCleanupGrace time.Duration
 	// MergeMaxFilesPerCall is an explicit ceiling on how many files one merge
 	// sub-call rewrites (max_compacted_files). Zero (the default) derives a
 	// memory-safe ceiling from MemoryLimit and the observed average file size;
@@ -97,6 +112,13 @@ type MaintConfig struct {
 // rewritten when the rewrite at most halves its size.
 const defaultRewriteDeleteThreshold = 0.5
 
+// defaultFileCleanupGrace must exceed the longest reader transaction against
+// the lake. The dq materializer's decode spans run 3–6 minutes and its query
+// pods' worst fetches tens of seconds; 30 minutes clears both with margin at
+// the cost of superseded rollup-churn files (KB-scale) lingering one extra
+// window.
+const defaultFileCleanupGrace = 30 * time.Minute
+
 func (c *MaintConfig) applyDefaults() {
 	if c.Interval == 0 {
 		c.Interval = 15 * time.Minute
@@ -109,6 +131,9 @@ func (c *MaintConfig) applyDefaults() {
 	}
 	if c.OrphanRetention == 0 {
 		c.OrphanRetention = 7 * 24 * time.Hour
+	}
+	if c.FileCleanupGrace == 0 {
+		c.FileCleanupGrace = defaultFileCleanupGrace
 	}
 	if c.RewriteDeleteThreshold == 0 {
 		c.RewriteDeleteThreshold = defaultRewriteDeleteThreshold
@@ -425,8 +450,18 @@ func (m *Maintainer) Cycle(ctx context.Context) error {
 	if expireErr == nil {
 		postSteps = append(postSteps, maintStep{"expire_snapshots", expireStep})
 	}
-	postSteps = append(postSteps,
-		maintStep{"cleanup_old_files", "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"})
+	// Deletion is deferred by FileCleanupGrace: the merge/rewrite commits above
+	// superseded files transactionally, but an in-flight reader that planned its
+	// file list before that commit still fetches the old files from object
+	// storage for the rest of its transaction. Deleting them immediately 404s
+	// those reads (see MaintConfig.FileCleanupGrace).
+	cleanupSQL := "CALL ducklake_cleanup_old_files('lake', cleanup_all => true)"
+	if m.cfg.FileCleanupGrace >= 0 {
+		cleanupSQL = fmt.Sprintf(
+			"CALL ducklake_cleanup_old_files('lake', older_than => now() - INTERVAL '%d seconds')",
+			int64(m.cfg.FileCleanupGrace.Seconds()))
+	}
+	postSteps = append(postSteps, maintStep{"cleanup_old_files", cleanupSQL})
 	// Orphan deletion is IRREVERSIBLE byte destruction and, with the catalog
 	// holding the per-file encryption keys, the step that turns a catalog
 	// restore into permanent data loss (B6) — see MaintConfig.OrphanRetention

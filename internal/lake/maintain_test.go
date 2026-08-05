@@ -480,8 +480,9 @@ func TestMaintainer_RetentionReleasesFiles(t *testing.T) {
 	require.GreaterOrEqual(t, filesBefore, 4)
 
 	// Zero retention: everything but the current snapshot expires, and
-	// the pre-merge files get deleted from disk.
-	m := NewMaintainer(l, MaintConfig{SnapshotKeep: time.Nanosecond}, zerolog.Nop())
+	// the pre-merge files get deleted from disk. Negative grace opts out of
+	// the reader-protection window so release is immediate.
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: time.Nanosecond, FileCleanupGrace: -time.Second}, zerolog.Nop())
 	require.NoError(t, m.Cycle(ctx))
 
 	filesAfter := countParquetFiles(t, dataPath)
@@ -491,6 +492,47 @@ func TestMaintainer_RetentionReleasesFiles(t *testing.T) {
 	require.NoError(t, l.DB().QueryRowContext(ctx,
 		"SELECT count(*) FROM lake.raw_events").Scan(&n))
 	assert.Equal(t, total, n, "current snapshot survives expiry")
+}
+
+// TestMaintainer_CleanupGraceKeepsSupersededFiles pins the reader-protection
+// window (2026-08-05 incident): a file superseded by merge/expiry moments ago
+// must survive cleanup for FileCleanupGrace, because an in-flight reader
+// transaction that planned its file list before the merge commit is still
+// fetching those bytes from object storage. Only a negative grace (the
+// escape hatch) may delete them immediately.
+func TestMaintainer_CleanupGraceKeepsSupersededFiles(t *testing.T) {
+	t.Parallel()
+	l, dataPath := openTestLake(t)
+	ctx := context.Background()
+
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+
+	ts := time.Date(2026, 6, 8, 10, 0, 0, 0, time.UTC)
+	for b := range 4 {
+		var bundle []cloudevent.StoredEvent
+		for i := range 30 {
+			bundle = append(bundle, testEvent(fmt.Sprintf("g%d-%d", b, i), "dimo.status", "did:1", ts))
+		}
+		require.NoError(t, w.WriteBundle(ctx, bundle))
+	}
+	filesBefore := countParquetFiles(t, dataPath)
+	require.GreaterOrEqual(t, filesBefore, 4)
+
+	// Aggressive expiry, default-shaped grace: the merge supersedes the
+	// small files and expiry releases them, but their bytes must survive
+	// the cycle — a concurrent reader may still hold the pre-merge plan.
+	m := NewMaintainer(l, MaintConfig{SnapshotKeep: time.Nanosecond}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+	assert.GreaterOrEqual(t, countParquetFiles(t, dataPath), filesBefore,
+		"files inside the cleanup grace window must survive on disk")
+
+	// The same cycle with the grace opted out reclaims them.
+	m = NewMaintainer(l, MaintConfig{SnapshotKeep: time.Nanosecond, FileCleanupGrace: -time.Second}, zerolog.Nop())
+	require.NoError(t, m.Cycle(ctx))
+	assert.Less(t, countParquetFiles(t, dataPath), filesBefore,
+		"negative grace restores immediate cleanup")
 }
 
 // TestMaintainer_OrphanSweepWindowAndDisable pins the B6 disaster-recovery

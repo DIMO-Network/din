@@ -115,6 +115,13 @@ type Settings struct {
 	// than this survive the sweep. Negative disables the sweep (post-restore
 	// guard). Default 7 days (lake.MaintConfig).
 	LakeOrphanRetention time.Duration // LAKE_ORPHAN_RETENTION
+	// LakeCleanupGrace is how long a superseded data file (merged away,
+	// rewritten, or released by expiry) survives before its bytes are
+	// deleted. Must exceed the slowest reader transaction against the lake —
+	// readers plan file lists against a pinned snapshot and then read object
+	// storage for minutes; immediate deletion 404s them mid-transaction.
+	// Negative restores immediate cleanup. Default 30m (lake.MaintConfig).
+	LakeCleanupGrace time.Duration // LAKE_CLEANUP_GRACE
 	// LakeWriterConnections is how many pinned DuckDB connections each sink's
 	// writer round-robins bundles across, so several bundles' S3 uploads overlap.
 	// >1 raises per-partition write throughput; the DuckDB pool is sized for it.
@@ -278,6 +285,9 @@ func Load() (Settings, error) {
 		return s, err
 	}
 	if s.LakeOrphanRetention, err = envDuration("LAKE_ORPHAN_RETENTION", 7*24*time.Hour); err != nil {
+		return s, err
+	}
+	if s.LakeCleanupGrace, err = envDuration("LAKE_CLEANUP_GRACE", 30*time.Minute); err != nil {
 		return s, err
 	}
 	writerConns, err := envUint("LAKE_WRITER_CONNECTIONS", 2)

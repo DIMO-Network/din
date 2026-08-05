@@ -206,6 +206,7 @@ func maintConfig(settings config.Settings) lake.MaintConfig {
 		SnapshotKeep:           settings.LakeSnapshotKeep,
 		ConsumerStaleness:      settings.LakeConsumerStaleness,
 		OrphanRetention:        settings.LakeOrphanRetention,
+		FileCleanupGrace:       settings.LakeCleanupGrace,
 		MergeMaxFilesPerCall:   settings.LakeMergeMaxFilesPerCall,
 		RewriteDeleteThreshold: settings.LakeRewriteDeleteThreshold,
 		// The maintainer derives its memory-safe merge ceiling from the same

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/DIMO-Network/cloudevent"
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -168,13 +169,17 @@ func appendAll(ctx context.Context, conn *sql.Conn, table string, events []cloud
 		// the call and never retains it, so refilling it per row avoids ~100k slice
 		// allocations on a full bundle.
 		args := make([]driver.Value, rawEventColumnCount)
+		// One now() per bundle (not per row) for the broken-clock partition clamp: a bundle
+		// is written in one appender pass, so a shared reference is exact and avoids ~100k
+		// time.Now() syscalls on a full bundle.
+		now := time.Now().UTC()
 		for i := range events {
 			// fillRowArgs (marshal) and AppendRow (DuckDB rejecting bad
 			// UTF-8/precision) are deterministic per-row rejections: tag them
 			// ErrPoisonRow so the sink isolates/terminates the row instead of
 			// treating it like a transient outage. The flush below (Close) is the
 			// only I/O here and is deliberately left untagged (transient).
-			if err := fillRowArgs(args, &events[i]); err != nil {
+			if err := fillRowArgs(args, &events[i], now); err != nil {
 				_ = appender.CloseWithCancel(ctx)
 				return fmt.Errorf("lake row %d: %w: %w", i, ErrPoisonRow, err)
 			}

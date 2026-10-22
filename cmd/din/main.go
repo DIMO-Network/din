@@ -191,6 +191,7 @@ func lakeConfig(settings config.Settings) lake.Config {
 		ParquetVersion:    settings.LakeParquetVersion,
 		Compression:       settings.LakeCompression,
 		ExtensionDir:      settings.LakeExtensionDir,
+		DuckLakeVersion:   settings.LakeVersion,
 		TempDirectory:     settings.LakeTempDirectory,
 		MaxConns:          settings.NATSStreamPartitions*settings.LakeWriterConnections + 2,
 	}

@@ -100,6 +100,9 @@ type Config struct {
 	// ExtensionDir overrides where DuckDB looks for/installs extensions
 	// (pre-baked in the container image); empty uses the default.
 	ExtensionDir string
+	// DuckLakeVersion is the DuckLake catalog format version requested on
+	// ATTACH; empty means DefaultDuckLakeVersion. Must match dq's DUCKLAKE_VERSION.
+	DuckLakeVersion string
 	// TempDirectory is where DuckDB spills data that exceeds MemoryLimit
 	// (large maintenance merges/compaction especially). Empty uses the
 	// DuckDB default (the working directory) — point it at a sized spill
@@ -110,6 +113,20 @@ type Config struct {
 	// a small default; size to writer count + maintenance.
 	MaxConns int
 }
+
+// DefaultDuckLakeVersion is the DuckLake catalog format version din attaches
+// with when DUCKLAKE_VERSION is unset.
+//
+// DuckDB 2.0's ducklake extension reads and writes 1.0 catalogs unchanged and
+// never migrates one unless asked (AUTOMATIC_MIGRATION), but it CREATES new
+// catalogs at 1.1, which DuckDB 1.5 clients refuse to attach ("catalog version
+// is 1.1, but the extension requires version 1.0"). Pinning 1.0 keeps a fresh
+// catalog (dev wipe, e2e harness, a new node) attachable by any din/dq still on
+// 1.5 during a rollout. The pin is also a guard after migration: attaching a 1.1
+// catalog while requesting 1.0 fails at boot ("Cannot downgrade"), so moving to
+// 1.1 means migrating the catalog and setting DUCKLAKE_VERSION=1.1 on din and
+// dq in the same change.
+const DefaultDuckLakeVersion = "1.0"
 
 // Lake is one embedded DuckDB instance with the catalog attached as "lake".
 type Lake struct {
@@ -215,7 +232,11 @@ func (l *Lake) bootstrap(ctx context.Context, cfg Config) error {
 	catalogDSN := withCatalogConnectTimeout(cfg.CatalogDSN)
 	// Same parts/Join shape as s3SecretSQL so adding a third ATTACH option later
 	// can't trip on a hand-managed separator.
-	attachParts := []string{"DATA_PATH " + sqlString(cfg.DataPath)}
+	version := cfg.DuckLakeVersion
+	if version == "" {
+		version = DefaultDuckLakeVersion
+	}
+	attachParts := []string{"DATA_PATH " + sqlString(cfg.DataPath), "DUCKLAKE_VERSION " + sqlString(version)}
 	if cfg.Encrypted {
 		// ENCRYPTED makes DuckLake write every data file with Parquet AES-GCM
 		// encryption and keep its per-file key in the catalog. Pass it on every

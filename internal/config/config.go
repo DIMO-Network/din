@@ -91,6 +91,7 @@ type Settings struct {
 	LakeParquetVersion string // LAKE_PARQUET_VERSION: "1" or "2" (default 2)
 	LakeCompression    string // LAKE_COMPRESSION: snappy (default) | zstd | lz4 | uncompressed
 	LakeExtensionDir   string // DUCKDB_EXTENSION_DIR: pre-baked DuckDB extensions
+	LakeVersion        string // DUCKLAKE_VERSION: catalog format version requested on ATTACH (default lake.DefaultDuckLakeVersion)
 	// LakeEncryptionEnabled turns on DuckLake's ENCRYPTED mode: every data file
 	// is written with Parquet AES-GCM encryption and its per-file key is kept in
 	// the catalog, so a leaked DataPath bucket is useless ciphertext without
@@ -188,6 +189,7 @@ func Load() (Settings, error) {
 		LakeParquetVersion:     env("LAKE_PARQUET_VERSION", "2"),
 		LakeCompression:        env("LAKE_COMPRESSION", "snappy"),
 		LakeExtensionDir:       os.Getenv("DUCKDB_EXTENSION_DIR"),
+		LakeVersion:            os.Getenv("DUCKLAKE_VERSION"),
 		S3Region:               os.Getenv("S3_AWS_REGION"),
 		S3AccessKeyID:          os.Getenv("S3_AWS_ACCESS_KEY_ID"),
 		S3SecretAccessKey:      os.Getenv("S3_AWS_SECRET_ACCESS_KEY"),

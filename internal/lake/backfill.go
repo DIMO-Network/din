@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -60,6 +61,7 @@ func (l *Lake) Backfill(ctx context.Context, files []string, log zerolog.Logger)
 		// coverage of the backfilled data.
 		log.Warn().Msg("backfilling into an ENCRYPTED catalog: registered legacy files stay unencrypted at their source until the maintainer compacts them")
 	}
+	files = canonicalPaths(files)
 	existing, err := l.registeredFiles(ctx)
 	if err != nil {
 		return res, err
@@ -258,8 +260,33 @@ func groupParquetByPrefix(files []string) (map[string][]string, []string) {
 	return groups, order
 }
 
+// canonicalPath resolves symlinks in a local path; URLs (s3://...) and paths that
+// don't resolve pass through unchanged. DuckDB 2.0's ducklake_add_data_files
+// stores the resolved path (on macOS /tmp/x is recorded as /private/tmp/x) where
+// 1.5 stored the path as given, so the rerun skip-set must compare resolved
+// forms or a rerun re-registers every file and duplicates its rows.
+func canonicalPath(p string) string {
+	if strings.Contains(p, "://") {
+		return p
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
+func canonicalPaths(files []string) []string {
+	out := make([]string, len(files))
+	for i, f := range files {
+		out[i] = canonicalPath(f)
+	}
+	return out
+}
+
 // registeredFiles returns every data-file path the catalog tracks for
-// raw_events — the idempotence set for reruns.
+// raw_events — the idempotence set for reruns. Each path is recorded both as
+// stored and resolved (canonicalPath), so files a DuckDB 1.5 run registered under
+// a symlinked path still match the resolved paths Backfill now compares.
 func (l *Lake) registeredFiles(ctx context.Context) (map[string]bool, error) {
 	rows, err := l.db.QueryContext(ctx, fmt.Sprintf(
 		"SELECT data_file FROM ducklake_list_files('lake', %s)", sqlString(RawTable)))
@@ -274,6 +301,7 @@ func (l *Lake) registeredFiles(ctx context.Context) (map[string]bool, error) {
 			return nil, err
 		}
 		out[path] = true
+		out[canonicalPath(path)] = true
 	}
 	return out, rows.Err()
 }

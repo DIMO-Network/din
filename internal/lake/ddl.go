@@ -22,9 +22,11 @@ const rawEventsCreate = `CREATE TABLE IF NOT EXISTS lake.raw_events (
 		data VARCHAR,
 		data_base64 BLOB,
 		data_index_key VARCHAR,
-		voids_id VARCHAR)`
+		voids_id VARCHAR)
+	PARTITIONED BY ` + rawEventsPartitionSpec + `
+	SORTED BY ` + rawEventsSortSpec
 
-// rawEventsLayout is the partition + sort layout.
+// rawEventsLayout is the partition + sort layout as repair ALTERs.
 //
 // The time partition is the year/month/day TRIPLE: DuckLake's year()/month()/
 // day() are component extractions (day(x) alone is day-of-month 1-31, NOT a
@@ -34,21 +36,32 @@ const rawEventsCreate = `CREATE TABLE IF NOT EXISTS lake.raw_events (
 // within one partition, so a low-volume type (a few events/day) keeps one tiny
 // per-day file forever; accepted for layout legibility.
 //
-// It is kept separate from the CREATE so it can be re-asserted when a crashed
-// backfill left it RESET. Backfill RESETs
-// partitioning for its registration window and restores it in a defer; a SIGKILL
-// skips the defer, so re-asserting is what stops a crash from leaving raw_events
-// permanently unpartitioned (CHD-23).
+// The ALTER form is kept for repair: reassertLayout re-applies it when a crashed
+// backfill left it RESET. Backfill RESETs partitioning for its registration window
+// and restores it in a defer; a SIGKILL skips the defer, so re-asserting is what
+// stops a crash from leaving raw_events permanently unpartitioned (CHD-23).
 //
 // These ALTERs are NOT idempotent: DuckLake bumps schema_version on every SET even
-// when the spec is unchanged, which churns the catalog (and renames inline-data
-// tables — the dq materializer crash). So they must NOT run blindly on every boot:
-// tryEnsureSchema applies them only on first creation, and reassertLayout re-applies
-// them only when isPartitioned reports the layout is currently missing.
+// when the spec is unchanged (still true of SET SORTED BY on DuckDB 2.0), which
+// churns the catalog (and renames inline-data tables — the dq materializer crash).
+// So they must NOT run blindly on every boot: first creation declares the layout
+// in rawEventsCreate, and reassertLayout re-applies an ALTER only when
+// isPartitioned/isSorted report that piece of the layout is currently missing.
 var rawEventsLayout = []string{
-	`ALTER TABLE lake.raw_events SET PARTITIONED BY (type, year("time"), month("time"), day("time"))`,
-	`ALTER TABLE lake.raw_events SET SORTED BY (subject, "time")`,
+	`ALTER TABLE lake.raw_events SET PARTITIONED BY ` + rawEventsPartitionSpec,
+	`ALTER TABLE lake.raw_events SET SORTED BY ` + rawEventsSortSpec,
 }
 
-// rawEventsDDL is the full first-boot DDL: create then apply the layout.
-var rawEventsDDL = append([]string{rawEventsCreate}, rawEventsLayout...)
+// rawEventsPartitionSpec and rawEventsSortSpec are shared by the CREATE and the
+// repair ALTERs so the two can never describe different layouts.
+const (
+	rawEventsPartitionSpec = `(type, year("time"), month("time"), day("time"))`
+	rawEventsSortSpec      = `(subject, "time")`
+)
+
+// rawEventsDDL is the full first-boot DDL. The layout is declared in the CREATE
+// (DuckLake 1.1 DDL), so the table and its layout commit as one statement: the
+// old CREATE-then-two-ALTERs sequence auto-committed each statement on its own,
+// and a failure between them left the table partitioned but unsorted (or bare)
+// until reassertLayout noticed.
+var rawEventsDDL = []string{rawEventsCreate}

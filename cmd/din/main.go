@@ -344,6 +344,7 @@ func run(log zerolog.Logger) error {
 			DauthURL:     settings.SourcesDauthURL,
 			DID:          settings.SourcesDID,
 			KeyFile:      settings.SourcesKeyFile,
+			GrantTTL:     settings.SourcesGrantTTL,
 		})
 		if err != nil {
 			return err

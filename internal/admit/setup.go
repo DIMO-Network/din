@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/DIMO-Network/did-directory/pkg/client"
 	"github.com/DIMO-Network/did-directory/pkg/dpop"
@@ -25,6 +26,8 @@ type Config struct {
 	// din because DID is one of its issuers.
 	DID     string
 	KeyFile string
+	// GrantTTL is Admitter.GrantTTL.
+	GrantTTL time.Duration
 }
 
 // New builds an Admitter over the directory and org host in cfg.
@@ -47,6 +50,7 @@ func New(cfg Config) (*Admitter, error) {
 	return &Admitter{
 		Keys:       provenance.DIDKeys{Directory: client.New(cfg.DirectoryURL)},
 		Authorizer: &OrgHost{BaseURL: cfg.OrgHostURL, Identity: identity.Token, Key: key},
+		GrantTTL:   cfg.GrantTTL,
 	}, nil
 }
 

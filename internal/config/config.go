@@ -40,6 +40,9 @@ type Settings struct {
 	SourcesDauthURL     string // SOURCES_DAUTH_URL: where din signs in
 	SourcesDID          string // SOURCES_DID: din's own DID, an issuer on the host
 	SourcesKeyFile      string // SOURCES_KEY_FILE: PEM P-256 key for SourcesDID#signing
+	// SourcesGrantTTL is how long a grant answer is reused per (source,
+	// vehicle); it bounds how late a revocation takes effect.
+	SourcesGrantTTL time.Duration // SOURCES_GRANT_TTL, default 1m
 
 	// Chain / module registry.
 	ChainID               uint64 // DIMO_REGISTRY_CHAIN_ID
@@ -350,6 +353,9 @@ func Load() (Settings, error) {
 		return s, err
 	}
 
+	if s.SourcesGrantTTL, err = time.ParseDuration(env("SOURCES_GRANT_TTL", "1m")); err != nil || s.SourcesGrantTTL <= 0 {
+		return s, fmt.Errorf("SOURCES_GRANT_TTL must be a positive duration: %q", os.Getenv("SOURCES_GRANT_TTL"))
+	}
 	skew := env("ALLOWABLE_TIME_SKEW", "5m")
 	if s.AllowableTimeSkew, err = time.ParseDuration(skew); err != nil {
 		return s, fmt.Errorf("parsing ALLOWABLE_TIME_SKEW: %w", err)

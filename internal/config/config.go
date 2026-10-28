@@ -33,6 +33,17 @@ type Settings struct {
 	TokenExchangeIssuer    string
 	TokenExchangeKeySetURL string
 
+	// Sources: relays whose certificate names their DID (did-directory
+	// docs/2026-10-24-sources.md). Empty SourcesOrgHostURL turns them away.
+	SourcesOrgHostURL   string // SOURCES_ORG_HOST_URL: asked whether a source may write
+	SourcesDirectoryURL string // SOURCES_DIRECTORY_URL: resolves signing keys
+	SourcesDauthURL     string // SOURCES_DAUTH_URL: where din signs in
+	SourcesDID          string // SOURCES_DID: din's own DID, an issuer on the host
+	SourcesKeyFile      string // SOURCES_KEY_FILE: PEM P-256 key for SourcesDID#signing
+	// SourcesGrantTTL is how long a grant answer is reused per (source,
+	// vehicle); it bounds how late a revocation takes effect.
+	SourcesGrantTTL time.Duration // SOURCES_GRANT_TTL, default 1m
+
 	// Chain / module registry.
 	ChainID               uint64 // DIMO_REGISTRY_CHAIN_ID
 	VehicleNFTAddress     common.Address
@@ -174,6 +185,11 @@ func Load() (Settings, error) {
 		TokenExchangeIssuer:    os.Getenv("TOKEN_EXCHANGE_ISSUER_URL"),
 		TokenExchangeKeySetURL: os.Getenv("TOKEN_EXCHANGE_JWK_KEY_SET_URL"),
 		RPCURL:                 os.Getenv("RPC_URL"),
+		SourcesOrgHostURL:      os.Getenv("SOURCES_ORG_HOST_URL"),
+		SourcesDirectoryURL:    os.Getenv("SOURCES_DIRECTORY_URL"),
+		SourcesDauthURL:        os.Getenv("SOURCES_DAUTH_URL"),
+		SourcesDID:             os.Getenv("SOURCES_DID"),
+		SourcesKeyFile:         os.Getenv("SOURCES_KEY_FILE"),
 		NATSMode:               env("NATS_MODE", "external"),
 		NATSURL:                env("NATS_URL", "nats://localhost:4222"),
 		NATSStoreDir:           env("NATS_STORE_DIR", "/data/nats"),
@@ -337,6 +353,9 @@ func Load() (Settings, error) {
 		return s, err
 	}
 
+	if s.SourcesGrantTTL, err = time.ParseDuration(env("SOURCES_GRANT_TTL", "1m")); err != nil || s.SourcesGrantTTL <= 0 {
+		return s, fmt.Errorf("SOURCES_GRANT_TTL must be a positive duration: %q", os.Getenv("SOURCES_GRANT_TTL"))
+	}
 	skew := env("ALLOWABLE_TIME_SKEW", "5m")
 	if s.AllowableTimeSkew, err = time.ParseDuration(skew); err != nil {
 		return s, fmt.Errorf("parsing ALLOWABLE_TIME_SKEW: %w", err)

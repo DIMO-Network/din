@@ -319,6 +319,11 @@ func (b *Bridge) ack(msg jetstream.Msg) {
 }
 
 func (b *Bridge) isVehicleSignalMessage(rawEvent *cloudevent.RawEvent) bool {
+	// A did:dimo subject comes from a source, and admit only lets a source
+	// write about a vehicle it holds a grant for.
+	if strings.HasPrefix(rawEvent.Subject, "did:dimo:") {
+		return true
+	}
 	did, err := cloudevent.DecodeERC721DID(rawEvent.Subject)
 	if err != nil {
 		return false

@@ -18,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/DIMO-Network/din/internal/admit"
 	"github.com/DIMO-Network/din/internal/attest"
 	"github.com/DIMO-Network/din/internal/blobcrypt"
 	"github.com/DIMO-Network/din/internal/config"
@@ -335,8 +336,25 @@ func run(log zerolog.Logger) error {
 		return err
 	}
 
+	var admitter handler.Admitter
+	if settings.SourcesOrgHostURL != "" {
+		a, err := admit.New(admit.Config{
+			OrgHostURL:   settings.SourcesOrgHostURL,
+			DirectoryURL: settings.SourcesDirectoryURL,
+			DauthURL:     settings.SourcesDauthURL,
+			DID:          settings.SourcesDID,
+			KeyFile:      settings.SourcesKeyFile,
+			GrantTTL:     settings.SourcesGrantTTL,
+		})
+		if err != nil {
+			return err
+		}
+		admitter = a
+	}
+
 	handlers := &handler.Handlers{
 		Converter:           converter,
+		Admitter:            admitter,
 		Attest:              verifier,
 		Splitter:            split.New(blobStore, settings.BlobPrefix, settings.DocumentSizeLimit),
 		Publisher:           stream.NewPublisher(js, settings.NATSStreamPartitions),

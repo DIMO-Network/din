@@ -108,6 +108,47 @@ func TestBridge_StatusToPerNameSignalSubjects(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
+// An event from a source (a relay DID) about a did:dimo vehicle decodes like
+// any other: the relay's DID has no module, so the default one reads it.
+func TestBridge_DecodesSourceEvents(t *testing.T) {
+	t.Parallel()
+	js := setup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bridge := decodestream.New(decodestream.Config{ChainID: 137, VehicleNFTAddress: vehicleNFT}, js, zerolog.Nop())
+	require.NoError(t, bridge.EnsureStreams(ctx))
+	done := make(chan error, 1)
+	go func() { done <- bridge.Run(ctx) }()
+
+	ts := time.Now().UTC().Add(-time.Minute).Truncate(time.Millisecond)
+	ev := rawStatus("evt-src", "did:dimo:car1", ts, map[string]any{"name": "speed", "timestamp": ts.Format(time.RFC3339Nano), "value": 61.0})
+	ev.Source = "did:dimo:flespi"
+	ev.Producer = "imei:356938035643809"
+	require.NoError(t, stream.NewPublisher(js, 1).Publish(ctx, ev))
+
+	sigStream, err := js.Stream(ctx, decodestream.SignalsStreamName)
+	require.NoError(t, err)
+	cons, err := sigStream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		AckPolicy:     jetstream.AckExplicitPolicy,
+		FilterSubject: "dimo.signals.speed",
+	})
+	require.NoError(t, err)
+	msg, err := cons.Next(jetstream.FetchMaxWait(10 * time.Second))
+	require.NoError(t, err)
+
+	var signalCE vss.SignalCloudEvent
+	require.NoError(t, json.Unmarshal(msg.Data(), &signalCE))
+	assert.Equal(t, "did:dimo:car1", signalCE.Subject)
+	assert.Equal(t, "did:dimo:flespi", signalCE.Source)
+	signals := vss.UnpackSignals(signalCE)
+	require.Len(t, signals, 1)
+	assert.Equal(t, 61.0, signals[0].Data.ValueNumber)
+
+	cancel()
+	require.NoError(t, <-done)
+}
+
 // A single fetched batch carrying many raw events must decode every one of
 // them. The batch is now decoded + submitted async up front and its acks
 // awaited together (load review #2); this pins that no message is dropped or

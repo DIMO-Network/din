@@ -10,6 +10,7 @@ import (
 	"encoding/pem"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"testing"
@@ -56,6 +57,12 @@ func newTestCA(t *testing.T, commonName string) *testCA {
 // ExtKeyUsage and the loopback SANs.
 func (ca *testCA) issue(t *testing.T, commonName string, server bool) tls.Certificate {
 	t.Helper()
+	return ca.issueWithURIs(t, commonName, server)
+}
+
+// issueWithURIs is issue with URI SANs, such as a relay's DID.
+func (ca *testCA) issueWithURIs(t *testing.T, commonName string, server bool, uris ...*url.URL) tls.Certificate {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
@@ -66,6 +73,7 @@ func (ca *testCA) issue(t *testing.T, commonName string, server bool) tls.Certif
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
+		URIs:         uris,
 	}
 	if server {
 		tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}

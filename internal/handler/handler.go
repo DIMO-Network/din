@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 
 	"github.com/DIMO-Network/cloudevent"
+	"github.com/DIMO-Network/din/internal/admit"
 	"github.com/DIMO-Network/din/internal/attest"
 	"github.com/DIMO-Network/din/internal/convert"
 	"github.com/DIMO-Network/din/internal/fpvalidate"
@@ -39,6 +41,12 @@ type AttestationParser interface {
 	Parse(ctx context.Context, jwtAddress common.Address, body []byte) (*attest.Attestation, error)
 }
 
+// Admitter checks events sent by a source (a relay whose certificate names
+// its DID) and stamps them; implemented by admit.Admitter.
+type Admitter interface {
+	Admit(ctx context.Context, source string, body []byte) ([]cloudevent.RawEvent, error)
+}
+
 // Splitter externalizes oversized payloads.
 type Splitter interface {
 	MaybeSplit(ctx context.Context, event cloudevent.RawEvent) (cloudevent.StoredEvent, error)
@@ -46,7 +54,9 @@ type Splitter interface {
 
 // Handlers builds the connection and attestation http.Handlers.
 type Handlers struct {
-	Converter           Converter
+	Converter Converter
+	// Admitter takes events from DID sources; nil refuses them.
+	Admitter            Admitter
 	Attest              AttestationParser
 	Splitter            Splitter
 	Publisher           Publisher
@@ -54,8 +64,10 @@ type Handlers struct {
 	Log                 zerolog.Logger
 }
 
-// Connection handles mTLS device/oracle ingest. Source identity comes from
-// the client certificate CN injected by the server middleware.
+// Connection handles mTLS ingest. Source identity comes from the client
+// certificate, injected by the server middleware. A source that is a DID is a
+// relay sending signed CloudEvents, which go to the Admitter unchanged; any
+// other source is a connection license whose payloads the Converter rewrites.
 func (h *Handlers) Connection() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		source, ok := server.SourceFromContext(r.Context())
@@ -69,7 +81,16 @@ func (h *Handlers) Connection() http.Handler {
 			return
 		}
 
-		events, err := h.Converter.Convert(r.Context(), source, body)
+		var events []cloudevent.RawEvent
+		if strings.HasPrefix(source, "did:") {
+			if h.Admitter == nil {
+				http.Error(w, "this node takes no events from sources", http.StatusForbidden)
+				return
+			}
+			events, err = h.Admitter.Admit(r.Context(), source, body)
+		} else {
+			events, err = h.Converter.Convert(r.Context(), source, body)
+		}
 		if err != nil {
 			h.writeError(w, err)
 			return
@@ -186,6 +207,12 @@ func (h *Handlers) writeError(w http.ResponseWriter, err error) {
 		// retryable 503, so the device doesn't re-send the identical oversized
 		// payload forever.
 		http.Error(w, "event exceeds maximum payload size", http.StatusRequestEntityTooLarge)
+	case errors.Is(err, admit.ErrForbidden):
+		http.Error(w, err.Error(), http.StatusForbidden)
+	case errors.Is(err, admit.ErrUnavailable):
+		h.Log.Warn().Err(err).Msg("source admission unavailable")
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "authorization temporarily unavailable", http.StatusServiceUnavailable)
 	case errors.Is(err, convert.ErrValidation):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, stream.ErrUnavailable):

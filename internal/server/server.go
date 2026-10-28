@@ -88,8 +88,8 @@ type OpsConfig struct {
 
 // NewConnectionServer builds the mTLS ingest server. Clients must present a
 // certificate chaining to one of cfg.ClientCAFiles; the leaf certificate's
-// CommonName (the connection license address) is injected into the request
-// context and is available to handler via SourceFromContext. Start it with
+// source (a relay's did: URI SAN, else the CommonName, a connection license
+// address) is injected into the request context and is available to handler via SourceFromContext. Start it with
 // srv.ListenAndServeTLS("", "") — the certificates are already loaded into
 // srv.TLSConfig.
 func NewConnectionServer(cfg ConnectionConfig, handler http.Handler) (*http.Server, error) {
@@ -124,7 +124,7 @@ func NewConnectionServer(cfg ConnectionConfig, handler http.Handler) (*http.Serv
 
 	h := certSourceHandler(handler)
 	h = maxBytesMiddleware(cfg.MaxBodyBytes)(h)
-	h = rateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, certCNKey)(h)
+	h = rateLimitMiddleware(cfg.RateLimitRPS, cfg.RateLimitBurst, certSourceKey)(h)
 	h = recoverMiddleware(cfg.Logger)(h)
 
 	return &http.Server{

@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -60,17 +61,29 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// certSourceHandler extracts the source address from the verified client
-// certificate's CommonName and injects it into the request context.
+// certSourceHandler extracts the source from the verified client certificate
+// (see certSource) and injects it into the request context.
 func certSourceHandler(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.TLS == nil || len(r.TLS.VerifiedChains) == 0 || len(r.TLS.VerifiedChains[0]) == 0 {
 			http.Error(w, "client certificate required", http.StatusUnauthorized)
 			return
 		}
-		source := r.TLS.VerifiedChains[0][0].Subject.CommonName
+		source := certSource(r.TLS.VerifiedChains[0][0])
 		next.ServeHTTP(w, r.WithContext(WithSource(r.Context(), source)))
 	})
+}
+
+// certSource is who a client certificate names. A source certificate carries
+// the relay's DID as a URI SAN (docs/2026-10-24-sources.md in did-directory);
+// a connection-license certificate has the license address as its CN.
+func certSource(leaf *x509.Certificate) string {
+	for _, u := range leaf.URIs {
+		if u.Scheme == "did" && u.Opaque != "" {
+			return u.String()
+		}
+	}
+	return leaf.Subject.CommonName
 }
 
 // newAttestationAuth builds the JWT validation function for the attestation
@@ -237,12 +250,12 @@ func remoteIPKey(r *http.Request) string {
 	return host
 }
 
-// certCNKey keys rate limiting on the client certificate CommonName so each
-// connection license gets its own bucket; falls back to the remote IP when
-// no verified chain is present.
-func certCNKey(r *http.Request) string {
+// certSourceKey keys rate limiting on the client certificate's source so each
+// relay or connection license gets its own bucket; falls back to the remote IP
+// when no verified chain is present.
+func certSourceKey(r *http.Request) string {
 	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.VerifiedChains[0]) > 0 {
-		return r.TLS.VerifiedChains[0][0].Subject.CommonName
+		return certSource(r.TLS.VerifiedChains[0][0])
 	}
 	return remoteIPKey(r)
 }

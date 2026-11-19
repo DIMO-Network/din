@@ -175,6 +175,37 @@ func TestWriter_RoundTrip(t *testing.T) {
 	assert.Equal(t, "dimo.status", all[2].ceType)
 }
 
+// An event from a source keeps what a later reader needs to check it: the
+// exact data bytes the signatures cover, and the signatures and din's own
+// stamps in extras.
+func TestWriter_SourceEventKeepsSignedBytes(t *testing.T) {
+	t.Parallel()
+	l, _ := openTestLake(t)
+	ctx := context.Background()
+	w, err := l.NewWriter(ctx, RawTable)
+	require.NoError(t, err)
+	defer w.Close() //nolint:errcheck
+
+	const data = `{"signals": [ {"name":"speed","value":42} ]}`
+	ev := testEvent("e-src", "dimo.status", "did:dimo:car1", time.Date(2026, 10, 27, 8, 59, 0, 0, time.UTC))
+	ev.Source = "did:dimo:flespi"
+	ev.Data = []byte(data)
+	ev.Extras = map[string]any{
+		"sourcesignature":   "eyJhbGciOiJFUzI1NiJ9..c2ln",
+		"producersignature": "eyJhbGciOiJFUzI1NiJ9..bWFj",
+		"arrivedat":         "2026-10-27T09:00:00Z",
+		"grant":             "at://did:dimo:owner/dimo.delegation/source",
+	}
+	require.NoError(t, w.WriteBundle(ctx, []cloudevent.StoredEvent{ev}))
+
+	var gotData, extras string
+	require.NoError(t, l.DB().QueryRowContext(ctx,
+		`SELECT data, extras FROM lake.raw_events WHERE id = 'e-src'`).Scan(&gotData, &extras))
+	assert.Equal(t, data, gotData, "byte for byte, whitespace included")
+	assert.JSONEq(t, `{"sourcesignature":"eyJhbGciOiJFUzI1NiJ9..c2ln","producersignature":"eyJhbGciOiJFUzI1NiJ9..bWFj",
+		"arrivedat":"2026-10-27T09:00:00Z","grant":"at://did:dimo:owner/dimo.delegation/source"}`, extras)
+}
+
 func TestWriter_OneSnapshotPerBundle(t *testing.T) {
 	t.Parallel()
 	l, _ := openTestLake(t)

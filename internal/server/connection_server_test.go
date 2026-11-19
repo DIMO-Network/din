@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -92,6 +93,33 @@ func TestConnectionServer_SourceFromClientCert(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.True(t, gotOK, "source should be set in the request context")
 	assert.Equal(t, testConnectionLicense, gotSource, "source must be the client cert CN")
+}
+
+// A source certificate names the relay's DID as a URI SAN, and that is the
+// source, whatever the CN says.
+func TestConnectionServer_SourceDIDFromURISAN(t *testing.T) {
+	t.Parallel()
+	ca, cfg := connectionTestSetup(t)
+
+	var gotSource string
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotSource, _ = SourceFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+	baseURL := startConnectionServer(t, cfg, handler)
+
+	did, err := url.Parse("did:dimo:flespi")
+	require.NoError(t, err)
+	other, err := url.Parse("https://flespi.example")
+	require.NoError(t, err)
+	clientCert := ca.issueWithURIs(t, "Flespi ingest", false, other, did)
+	client := newMTLSClient(ca, &clientCert)
+
+	resp, err := client.Post(baseURL+"/", "application/json", strings.NewReader(`{}`))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "did:dimo:flespi", gotSource)
 }
 
 func TestConnectionServer_RejectsMissingClientCert(t *testing.T) {

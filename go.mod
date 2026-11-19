@@ -4,7 +4,7 @@ go 1.27
 
 require (
 	github.com/DIMO-Network/cloudevent v0.2.13
-	github.com/DIMO-Network/did-directory v0.0.0
+	github.com/DIMO-Network/did-directory v0.0.0-20261118235756-5933372ca981
 	github.com/DIMO-Network/model-garage v1.0.12
 	github.com/DIMO-Network/shared v1.1.9
 	github.com/MicahParks/keyfunc/v3 v3.8.0
@@ -127,5 +127,3 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.4.1 // indirect
 )
-
-replace github.com/DIMO-Network/did-directory => ../did-directory

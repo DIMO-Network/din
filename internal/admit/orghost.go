@@ -52,7 +52,7 @@ type authorizeRequest struct {
 func (h *OrgHost) Authorize(ctx context.Context, source, vehicle string, abilities []string) (string, error) {
 	token, err := h.Identity(ctx)
 	if err != nil {
-		return "", fmt.Errorf("%w: din's identity token: %v", ErrUnavailable, err)
+		return "", fmt.Errorf("%w: din's identity token: %w", ErrUnavailable, err)
 	}
 	body, err := json.Marshal(authorizeRequest{AnyGrant: true, Caller: source, Vehicle: vehicle, Abilities: abilities})
 	if err != nil {
@@ -65,7 +65,7 @@ func (h *OrgHost) Authorize(ctx context.Context, source, vehicle string, abiliti
 	}
 	proof, err := h.Key.Proof(http.MethodPost, url, token, time.Now())
 	if err != nil {
-		return "", fmt.Errorf("%w: DPoP proof: %v", ErrUnavailable, err)
+		return "", fmt.Errorf("%w: DPoP proof: %w", ErrUnavailable, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", dpop.TokenType+" "+token)
@@ -76,7 +76,7 @@ func (h *OrgHost) Authorize(ctx context.Context, source, vehicle string, abiliti
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("%w: org host: %v", ErrUnavailable, err)
+		return "", fmt.Errorf("%w: org host: %w", ErrUnavailable, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))

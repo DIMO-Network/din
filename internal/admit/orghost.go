@@ -81,7 +81,7 @@ func (h *OrgHost) Authorize(ctx context.Context, source, vehicle string, abiliti
 	defer func() { _ = resp.Body.Close() }()
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return "", fmt.Errorf("%w: org host: %v", ErrUnavailable, err)
+		return "", fmt.Errorf("%w: org host: %w", ErrUnavailable, err)
 	}
 
 	var answer struct {
